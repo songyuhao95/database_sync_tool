@@ -1,0 +1,15 @@
+[package]
+name = "mysql_8_4"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mysql-driver.workspace = true
+mysql-common.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+change_event.workspace = true
+mysql_source_contract.workspace = true
+mysql_5_7 = { path = "../mysql_5_7" }
+sha2.workspace = true

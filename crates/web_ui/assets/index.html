@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CDC Console</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/icons.css">
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/tasks.js" defer></script>
+  <script src="/assets/app.js" defer></script>
+</head>
+<body class="dark">
+<div class="shell">
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-brand"><div class="brand-title">CDC</div><small>数据库变更同步</small></div>
+    <nav aria-label="主导航">
+      <a class="nav" data-path="/" href="/"><i class="ph ph-database"></i>数据库总览</a>
+      <a class="nav" data-path="/tasks" href="/tasks"><i class="ph ph-arrows-left-right"></i>同步任务</a>
+      <a class="nav" data-path="/add" href="/add"><i class="ph ph-plus-square"></i>添加任务</a>
+      <a class="nav" data-path="/settings" href="/settings"><i class="ph ph-gear"></i>设置</a>
+    </nav>
+    <div class="sidebar-foot"><button id="logout" class="nav"><i class="ph ph-sign-out"></i>退出登录</button></div>
+  </aside>
+  <div class="workspace">
+    <header class="top"><button id="menu" class="icon mobile" aria-label="打开导航"><i class="ph ph-list"></i></button><span id="top-title"></span><div class="top-right"><span id="top-status" class="top-stats"></span><button id="theme-toggle" class="icon" aria-label="切换主题"><i class="ph ph-circle-half"></i></button><span class="avatar"><i class="ph ph-user"></i></span><span id="current-user"></span></div></header>
+    <main id="content" class="main" tabindex="-1"></main>
+  </div>
+</div>
+<div id="toast" class="toast" role="status"></div>
+</body>
+</html>

@@ -1,0 +1,11 @@
+[package]
+name = "change_event"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true

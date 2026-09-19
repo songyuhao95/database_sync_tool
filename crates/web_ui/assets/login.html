@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>登录 · CDC</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/icons.css">
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/login.js" defer></script>
+</head>
+<body class="dark">
+<main class="login">
+  <section class="login-left">
+    <form id="login-form" class="login-card">
+      <div class="brand-title">CDC</div>
+      <h1>登录控制台</h1>
+      <p class="muted">账号由平台管理员创建。</p>
+      <div class="field"><label for="username">账号</label><input id="username" name="username" class="input" autocomplete="username" maxlength="64" required autofocus></div>
+      <div class="field"><label for="password">密码</label><input id="password" name="password" class="input" type="password" autocomplete="current-password" maxlength="128" required></div>
+      <p id="login-error" class="danger" role="alert"></p>
+      <button class="btn primary" type="submit">登录平台</button>
+    </form>
+  </section>
+  <section class="login-art" aria-hidden="true">
+    <div><p class="muted">数据库变更同步</p><h2>管理数据<br>正在去往哪里</h2><p>实例配置、复制链路与目的端写入。</p></div>
+    <dl class="login-facts"><div><dt>变更来源</dt><dd>Replication Protocol</dd></div><div><dt>统一事件</dt><dd>ChangeEvent</dd></div><div><dt>控制数据</dt><dd>SQLite</dd></div></dl>
+  </section>
+</main>
+</body>
+</html>

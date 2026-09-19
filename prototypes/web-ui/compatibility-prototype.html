@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>兼容选项原型 · CDC</title>
+  <style>
+    /* Throwaway prototype: three variants of the target-column compatibility flow.
+       Switch with ?variant=a|b|c. No API calls or persistence are intended. */
+    :root {
+      --bg: #0d1117; --surface: #151c25; --surface-2: #1b2530; --surface-3: #202d39;
+      --line: #2d3d4a; --line-strong: #456070; --text: #ecf3f7; --muted: #9baab4;
+      --faint: #6e7e89; --cyan: #48c8dd; --cyan-dark: #0c7484; --green: #5ed49a;
+      --amber: #f0bf63; --orange: #f09b65; --red: #f27676; --shadow: 0 18px 46px #0008;
+      color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.45; }
+    button, input, select { font: inherit; }
+    button { color: inherit; }
+    code, .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .appbar { min-height: 70px; padding: 0 34px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 24px; background: #111820; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 250px; }
+    .brand-mark { width: 31px; height: 31px; display: grid; place-items: center; border: 1px solid var(--cyan); color: var(--cyan); font-weight: 800; letter-spacing: -.08em; }
+    .brand small, .eyebrow, .muted { color: var(--muted); }
+    .brand strong { display: block; font-size: 14px; letter-spacing: .08em; }
+    .brand small { display: block; font-size: 11px; margin-top: 2px; }
+    .bar-title { padding-left: 24px; border-left: 1px solid var(--line); }
+    .bar-title strong { display: block; font-size: 15px; }
+    .bar-title small { color: var(--muted); font-size: 12px; }
+    .bar-actions { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+    .select, .input { border: 1px solid var(--line-strong); background: var(--surface); color: var(--text); border-radius: 5px; padding: 9px 11px; min-height: 38px; }
+    .select:focus, .input:focus, button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    .select.route { min-width: 245px; }
+    .button { border: 1px solid var(--line-strong); background: var(--surface-2); border-radius: 5px; padding: 9px 13px; cursor: pointer; }
+    .button:hover:not(:disabled) { border-color: var(--cyan); background: #1e3540; }
+    .button.primary { background: var(--cyan-dark); border-color: #2aa6b8; color: white; }
+    .button.danger { color: var(--red); border-color: #814545; }
+    .button:disabled { cursor: not-allowed; opacity: .45; }
+    .button.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+    main { max-width: 1500px; margin: 0 auto; padding: 25px 34px 112px; }
+    .context-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+    .context-row h1 { margin: 0; font-size: 23px; letter-spacing: -.02em; }
+    .context-row p { margin: 4px 0 0; color: var(--muted); }
+    .context-copy { flex: 1; min-width: 300px; }
+    .freshness { display: inline-flex; align-items: center; gap: 7px; padding: 6px 10px; border: 1px solid #315a64; border-radius: 999px; color: var(--cyan); background: #112931; font-size: 12px; }
+    .freshness.stale { color: var(--red); border-color: #713f48; background: #28191e; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .banner { border: 1px solid #7e4e32; background: #2b201a; color: #f8c692; padding: 13px 15px; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 18px; border-radius: 5px; }
+    .banner strong { display: block; color: #ffd3a9; }
+    .banner p { margin: 2px 0 0; color: #e9b98e; }
+    .hidden { display: none !important; }
+    .panel { border: 1px solid var(--line); background: var(--surface); border-radius: 6px; }
+    .panel-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; padding: 17px 18px 13px; border-bottom: 1px solid var(--line); }
+    .panel-head h2, .panel-head h3 { margin: 0; font-size: 15px; }
+    .panel-head p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+    .risk { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; border: 1px solid currentColor; border-radius: 4px; padding: 4px 7px; font-size: 11px; font-weight: 700; }
+    .risk.exact { color: var(--green); background: #142a23; }
+    .risk.range { color: var(--amber); background: #2a2418; }
+    .risk.explicit { color: var(--orange); background: #2b2119; }
+    .risk.blocked { color: var(--red); background: #2d1b20; }
+    .risk.mini { font-size: 10px; padding: 2px 5px; }
+    .field-table { width: 100%; border-collapse: collapse; }
+    .field-table th { text-align: left; color: var(--muted); font-size: 11px; font-weight: 500; letter-spacing: .04em; padding: 11px 13px; background: #121920; }
+    .field-table td { padding: 13px; border-top: 1px solid var(--line); vertical-align: middle; }
+    .field-table tr.selected td { background: #162e37; }
+    .field-table tr.locked td { opacity: .55; }
+    .field-table tr:hover:not(.locked) td { background: #192832; }
+    .field-select { width: 100%; border: 0; background: transparent; padding: 0; text-align: left; cursor: pointer; }
+    .field-select:disabled { cursor: not-allowed; }
+    .field-name { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+    .field-name small { color: var(--muted); font-weight: 400; }
+    .field-name .key { color: var(--cyan); font-size: 11px; }
+    .type-pair { display: flex; align-items: center; gap: 7px; min-width: 250px; }
+    .type-pair span { display: block; }
+    .type-pair small { display: block; color: var(--muted); font-size: 11px; }
+    .arrow { color: var(--faint); }
+    .option-link { border: 1px solid #386b77; color: var(--cyan); background: #132e36; border-radius: 4px; padding: 6px 8px; cursor: pointer; white-space: nowrap; }
+    .option-link:hover { background: #1c4651; }
+    .option-link:disabled { color: var(--faint); border-color: var(--line); background: transparent; cursor: not-allowed; }
+    .cell-note { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }
+    .empty-state { padding: 28px; color: var(--muted); text-align: center; }
+    .meta-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; padding: 17px 18px; }
+    .meta-grid div { min-width: 0; }
+    .meta-grid dt { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+    .meta-grid dd { margin: 0; overflow-wrap: anywhere; }
+    .meta-grid dd code { color: #dceaf0; font-size: 12px; }
+    .meta-grid .wide { grid-column: 1 / -1; }
+    .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { padding: 3px 7px; border: 1px solid var(--line-strong); border-radius: 3px; font-size: 11px; color: var(--muted); }
+    .tag.good { color: var(--green); border-color: #326b54; }
+    .tag.warn { color: var(--amber); border-color: #78633c; }
+    .tag.bad { color: var(--red); border-color: #79424a; }
+    .option-card { border: 1px solid var(--line); margin: 0 18px 18px; border-radius: 5px; overflow: hidden; }
+    .option-card-head { padding: 13px 14px; display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; background: var(--surface-2); }
+    .option-card-head h3 { margin: 0; font-size: 14px; }
+    .option-card-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+    .option-card-body { padding: 14px; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .form-field { min-width: 0; }
+    .form-field.full { grid-column: 1 / -1; }
+    .form-field label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+    .form-field .input, .form-field .select { width: 100%; }
+    .input[readonly] { color: var(--muted); background: #121920; }
+    .helper { color: var(--muted); font-size: 11px; margin-top: 5px; }
+    .validation { margin-top: 14px; border-left: 2px solid var(--orange); padding: 9px 11px; background: #281e18; color: #efbd8e; font-size: 12px; }
+    .validation.ok { border-color: var(--green); background: #14261f; color: #a8e8c7; }
+    .confirm-row { display: flex; gap: 9px; align-items: flex-start; padding: 12px; background: #241d18; border: 1px solid #6a4c32; color: #e8c4a1; margin-top: 13px; }
+    .confirm-row input { margin-top: 3px; accent-color: var(--orange); }
+    .confirm-row strong { color: #ffd3aa; }
+    .sample { margin-top: 14px; border: 1px solid var(--line); background: #10171d; border-radius: 5px; padding: 12px; }
+    .sample-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; margin-bottom: 8px; }
+    .sample-head strong { font-size: 12px; }
+    .sample-grid { display: grid; grid-template-columns: 1fr auto 1fr; gap: 9px; align-items: center; }
+    .sample-value { border: 1px solid var(--line); background: #151e26; border-radius: 4px; padding: 9px; min-width: 0; }
+    .sample-value small { display: block; color: var(--muted); margin-bottom: 3px; }
+    .sample-value code { display: block; overflow-wrap: anywhere; color: #e9f5f7; font-size: 12px; }
+    .sample-arrow { color: var(--orange); font-size: 18px; }
+    .source-target { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .definition { padding: 15px; min-height: 163px; }
+    .definition.source { border-top: 2px solid #55798a; }
+    .definition.target { border-top: 2px solid var(--cyan); }
+    .definition h3 { margin: 0 0 9px; font-size: 13px; }
+    .definition .headline { font-size: 20px; font-weight: 700; letter-spacing: -.03em; }
+    .definition .headline code { color: var(--cyan); font-size: 15px; }
+    .definition dl { display: grid; grid-template-columns: 100px 1fr; gap: 5px 8px; margin: 12px 0 0; font-size: 12px; }
+    .definition dt { color: var(--muted); }
+    .definition dd { margin: 0; overflow-wrap: anywhere; }
+    .definition .changed { color: var(--orange); }
+    .audit-line { display: flex; gap: 7px; flex-wrap: wrap; color: var(--muted); font-size: 11px; padding-top: 13px; }
+    .audit-line code { color: #d4e4e9; }
+    .layout-a { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(350px, .8fr); gap: 18px; align-items: start; }
+    .layout-a .inspector { position: sticky; top: 16px; }
+    .layout-b > .source-target { margin-bottom: 18px; }
+    .layout-b .configuration { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 18px; }
+    .layout-b .config-main { min-width: 0; }
+    .review-rail { padding: 15px; position: sticky; top: 16px; align-self: start; }
+    .review-rail h3 { margin: 0 0 12px; font-size: 14px; }
+    .review-item { display: flex; gap: 9px; padding: 10px 0; border-top: 1px solid var(--line); }
+    .review-item:first-of-type { border-top: 0; padding-top: 0; }
+    .review-item .icon { color: var(--green); }
+    .review-item.pending .icon { color: var(--amber); }
+    .review-item.blocked .icon { color: var(--red); }
+    .review-item strong { display: block; font-size: 12px; }
+    .review-item span { color: var(--muted); font-size: 11px; }
+    .layout-c { display: grid; grid-template-columns: minmax(0, 1fr) 315px; gap: 18px; align-items: start; }
+    .steps { padding: 18px; }
+    .step { display: grid; grid-template-columns: 35px minmax(0, 1fr); gap: 13px; padding: 0 0 20px; position: relative; }
+    .step:last-child { padding-bottom: 0; }
+    .step:not(:last-child)::after { content: ""; position: absolute; left: 16px; top: 31px; bottom: 0; border-left: 1px dashed var(--line-strong); }
+    .step-number { width: 33px; height: 33px; border: 1px solid var(--line-strong); border-radius: 50%; display: grid; place-items: center; color: var(--muted); background: var(--surface-2); z-index: 1; }
+    .step.active .step-number { color: var(--cyan); border-color: var(--cyan); background: #13303a; }
+    .step.done .step-number { color: var(--green); border-color: #3e8768; background: #152c25; }
+    .step h3 { margin: 3px 0 4px; font-size: 14px; }
+    .step > div > p { margin: 0 0 11px; color: var(--muted); font-size: 12px; }
+    .compact-field-list { display: grid; gap: 7px; }
+    .compact-field { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 11px; border: 1px solid var(--line); background: #131b22; border-radius: 4px; text-align: left; cursor: pointer; }
+    .compact-field.selected { border-color: var(--cyan); background: #152f38; }
+    .compact-field.locked { opacity: .55; cursor: not-allowed; }
+    .compact-field strong { font-size: 12px; }
+    .compact-field small { display: block; color: var(--muted); margin-top: 2px; }
+    .step-option { padding: 12px; border: 1px solid var(--line); background: #131b22; border-radius: 4px; }
+    .step-option + .step-option { margin-top: 8px; }
+    .step-option strong { display: block; font-size: 12px; }
+    .step-option p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+    .step-option.selected { border-color: var(--cyan); background: #15313a; }
+    .review-rail .sample-grid { grid-template-columns: 1fr; }
+    .review-rail .sample-arrow { transform: rotate(90deg); justify-self: center; }
+    .footer-bar { position: fixed; z-index: 9; bottom: 16px; left: 50%; transform: translateX(-50%); width: min(620px, calc(100% - 30px)); background: #17242d; border: 1px solid #456574; box-shadow: var(--shadow); border-radius: 7px; display: flex; align-items: center; gap: 10px; padding: 9px 11px; }
+    .footer-bar .status-copy { flex: 1; min-width: 0; }
+    .footer-bar strong { display: block; font-size: 12px; }
+    .footer-bar small { color: var(--muted); display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .footer-bar .variant-name { text-align: center; width: 160px; border-left: 1px solid var(--line); border-right: 1px solid var(--line); padding: 0 10px; }
+    .footer-bar .variant-name strong { color: var(--cyan); }
+    .toast { position: fixed; z-index: 20; top: 82px; left: 50%; transform: translateX(-50%) translateY(-12px); opacity: 0; pointer-events: none; background: #23343e; border: 1px solid var(--cyan); color: white; padding: 11px 14px; border-radius: 4px; transition: .18s ease; box-shadow: var(--shadow); }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    @media (max-width: 1100px) {
+      .layout-a, .layout-b .configuration, .layout-c { grid-template-columns: 1fr; }
+      .layout-a .inspector, .review-rail { position: static; }
+      .layout-c .review-rail { order: -1; }
+    }
+    @media (max-width: 760px) {
+      .appbar { padding: 14px 16px; align-items: flex-start; flex-wrap: wrap; gap: 13px; }
+      .brand { min-width: 0; flex: 1; }
+      .bar-title { order: 3; flex-basis: 100%; padding-left: 0; border-left: 0; }
+      .bar-actions { margin-left: auto; }
+      .bar-actions .button { display: none; }
+      main { padding: 20px 14px 114px; }
+      .context-row h1 { font-size: 20px; }
+      .source-target { grid-template-columns: 1fr; }
+      .field-table { min-width: 710px; }
+      .table-scroll { overflow-x: auto; }
+      .meta-grid { grid-template-columns: 1fr; }
+      .meta-grid .wide { grid-column: auto; }
+      .sample-grid { grid-template-columns: 1fr; }
+      .sample-arrow { transform: rotate(90deg); justify-self: center; }
+      .footer-bar { bottom: 8px; }
+      .footer-bar .variant-name { width: 120px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="appbar">
+    <div class="brand"><span class="brand-mark">C</span><span><strong>CDC CONSOLE</strong><small>目的端字段兼容 · 交互样稿</small></span></div>
+    <div class="bar-title"><strong>订单实时同步 / 字段兼容</strong><small>MySQL 5.7.44 → MySQL 8.4.2 · CDC_test.orders</small></div>
+    <div class="bar-actions"><select class="select route" id="route-select" aria-label="选择示例同步路线"><option value="orders">订单实时同步 · MySQL 5.7 → 8.4</option><option value="users">用户中心同步 · PostgreSQL 15 → MySQL 8.0</option></select><button class="button" data-stale="1">模拟元数据变化</button></div>
+  </header>
+
+  <main>
+    <div class="context-row">
+      <div class="context-copy"><span class="eyebrow">ROUTE PROJECTION / COMPATIBILITY PREVIEW</span><h1>目的端字段兼容选项</h1><p>每个计划只绑定一组源/目的字段、能力证据和 Schema Fingerprint；运行时不重新选型。</p></div>
+      <span class="freshness" id="freshness"><i class="dot"></i><span>预览基于当前元数据</span></span>
+    </div>
+    <div id="state-banner" class="banner hidden" role="alert"></div>
+    <div id="prototype-root"></div>
+  </main>
+
+  <nav class="footer-bar" aria-label="原型变体切换">
+    <button class="button ghost" data-variant-step="-1" aria-label="上一个原型方案">←</button>
+    <div class="variant-name"><strong id="variant-key">A</strong><small id="variant-label">字段清单 + 右侧检查器</small></div>
+    <button class="button ghost" data-variant-step="1" aria-label="下一个原型方案">→</button>
+    <div class="status-copy"><strong id="footer-status">选择一列查看兼容选项</strong><small id="footer-detail">兼容选项只来自目的端 Capability Manifest。</small></div>
+    <button class="button primary" id="footer-save" disabled>保存并允许同步</button>
+  </nav>
+  <div id="toast" class="toast" role="status"></div>
+
+  <script>
+    'use strict';
+    const variants = [
+      {key:'a', label:'字段清单 + 右侧检查器'},
+      {key:'b', label:'双栏对照 + 配置工作台'},
+      {key:'c', label:'三步配置 + 影响复核'}
+    ];
+    const routes = {
+      orders: {
+        title:'订单实时同步', source:'MySQL 5.7.44', sink:'MySQL 8.4.2', table:'CDC_test.orders',
+        sourceFp:'src:7bd0…a24e', targetFp:'sink:2c91…9af0',
+        fields:[
+          {id:'id', label:'id', key:true, source:'BIGINT UNSIGNED', target:'BIGINT', logical:'Integer<64 bit, unsigned>', level:'range', reason:'目的端 BIGINT 不能覆盖源端完整 unsigned 域', code:'RANGE_DOMAIN_NARROW', selectable:true, meta:{sourceParams:'width=64 · signedness=unsigned', targetParams:'width=64 · signedness=signed', sourceExtra:'PRIMARY KEY · NOT NULL', targetExtra:'PRIMARY KEY · NOT NULL', sourceLineage:'el:orders.id:01', targetLineage:'el:orders.id:93', charset:'—', collation:'—', timezone:'—'}, config:{targetType:'DECIMAL', precision:'20', scale:'0', charset:'utf8mb4', collation:'—', timezone:'UTC', action:'范围失败即回滚', ready:true}, sample:{from:'18446744073709551615', to:'18446744073709551615', note:'目标使用 DECIMAL(20,0) 保留完整声明域；运行时超界即回滚。'}},
+          {id:'amount', label:'amount', source:'DECIMAL(12,4)', target:'DECIMAL(10,2)', logical:'Decimal<precision=12, scale=4>', level:'explicit', reason:'目标 scale 更小，必须明确舍入策略', code:'DECIMAL_SCALE_ROUNDING', selectable:true, meta:{sourceParams:'precision=12 · scale=4 · signed scale', targetParams:'precision=10 · scale=2', sourceExtra:'NULLABLE · materialized value', targetExtra:'NULLABLE · materialized value', sourceLineage:'el:orders.amount:02', targetLineage:'el:orders.amount:94', charset:'—', collation:'—', timezone:'—'}, config:{targetType:'DECIMAL', precision:'10', scale:'2', charset:'utf8mb4', collation:'—', timezone:'UTC', action:'HALF_UP 舍入 · 溢出回滚', ready:true}, sample:{from:'1234567890.1234', to:'1234567890.12', note:'示例只解释已选规则，不代表用样本推导安全范围。'}},
+          {id:'status', label:'status', source:'VARCHAR(32)', target:'VARCHAR(32)', logical:'Text<utf8mb4, max=32 chars>', level:'exact', reason:'编码、长度、填充和比较语义均有等价证明', code:'TEXT_EXACT', selectable:true, meta:{sourceParams:'max=32 chars · variable', targetParams:'max=32 chars · variable', sourceExtra:'NOT NULL', targetExtra:'NOT NULL', sourceLineage:'el:orders.status:03', targetLineage:'el:orders.status:95', charset:'utf8mb4 → utf8mb4', collation:'utf8mb4_bin → utf8mb4_bin', timezone:'—'}, config:{targetType:'VARCHAR', precision:'32', scale:'—', charset:'utf8mb4', collation:'utf8mb4_bin', timezone:'UTC', action:'保持原值', ready:true}, sample:{from:'PAID', to:'PAID', note:'无损计划自动放行，不需要额外风险确认。'}},
+          {id:'created_at', label:'created_at', source:'TIMESTAMP', target:'DATETIME(3)', logical:'Instant<precision=0>', level:'explicit', reason:'从带时区语义的 Instant 写入无时区 DATETIME，需要固定会话时区', code:'TEMPORAL_TIMEZONE', selectable:true, meta:{sourceParams:'precision=0 · Instant · source session UTC', targetParams:'precision=3 · LocalDatetime · session Asia/Shanghai', sourceExtra:'NOT NULL', targetExtra:'NOT NULL', sourceLineage:'el:orders.created_at:04', targetLineage:'el:orders.created_at:96', charset:'—', collation:'—', timezone:'UTC → Asia/Shanghai'}, config:{targetType:'DATETIME', precision:'3', scale:'—', charset:'utf8mb4', collation:'—', timezone:'Asia/Shanghai', action:'固定 tzdata · DST 歧义阻断', ready:true}, sample:{from:'2026-09-17 09:30:00Z', to:'2026-09-17 17:30:00', note:'计划固定 Sink Session Profile 与 tzdata 版本；歧义时间直接阻断。'}},
+          {id:'labels', label:'labels', source:"SET('vip','trial')", target:'VARCHAR(64)', logical:'Set<labels=[vip, trial]>', level:'blocked', reason:'目标无已资格化的集合语义；不能压成逗号字符串', code:'SET_NO_QUALIFIED_TARGET', selectable:false, meta:{sourceParams:"labels=[vip, trial] · label bytes preserved", targetParams:'max=64 chars · ordinary text', sourceExtra:'NULLABLE', targetExtra:'NULLABLE', sourceLineage:'el:orders.labels:05', targetLineage:'el:orders.labels:97', charset:'utf8mb4 → utf8mb4', collation:'utf8mb4_bin → utf8mb4_bin', timezone:'—'}, config:null, sample:null}
+        ]
+      },
+      users: {
+        title:'用户中心同步', source:'PostgreSQL 15.6', sink:'MySQL 8.0.36', table:'identity.users', sourceFp:'src:91d2…4c10', targetFp:'sink:73a0…e12c',
+        fields:[
+          {id:'id', label:'id', key:true, source:'BIGINT', target:'BIGINT', logical:'Integer<64 bit, signed>', level:'exact', reason:'有符号 64 bit 与主键比较语义等价', code:'INTEGER_EXACT', selectable:true, meta:{sourceParams:'width=64 · signedness=signed', targetParams:'width=64 · signedness=signed', sourceExtra:'PRIMARY KEY · NOT NULL', targetExtra:'PRIMARY KEY · NOT NULL', sourceLineage:'el:users.id:11', targetLineage:'el:users.id:81', charset:'—', collation:'—', timezone:'—'}, config:{targetType:'BIGINT', precision:'—', scale:'—', charset:'utf8mb4', collation:'—', timezone:'UTC', action:'保持原值', ready:true}, sample:{from:'92001', to:'92001', note:'主键无需兼容选项。'}},
+          {id:'display_name', label:'display_name', source:'TEXT COLLATE und-x-icu', target:'VARCHAR(120) utf8mb4_0900_ai_ci', logical:'Text<database encoding, unbounded>', level:'explicit', reason:'长度上限和排序规则变化可能影响比较结果', code:'TEXT_COLLATION_CHANGE', selectable:true, meta:{sourceParams:'unbounded · ICU collation und-x-icu', targetParams:'max=120 chars · utf8mb4_0900_ai_ci', sourceExtra:'NULLABLE', targetExtra:'NULLABLE', sourceLineage:'el:users.name:12', targetLineage:'el:users.name:82', charset:'UTF-8 → utf8mb4', collation:'und-x-icu → utf8mb4_0900_ai_ci', timezone:'—'}, config:{targetType:'VARCHAR', precision:'120', scale:'—', charset:'utf8mb4', collation:'utf8mb4_0900_ai_ci', timezone:'UTC', action:'不可表示字符阻断 · 截断阻断', ready:true}, sample:{from:'Zoë · 山田', to:'Zoë · 山田', note:'示例未覆盖所有比较/长度边界；主键或唯一列上的排序变化仍禁止。'}},
+          {id:'profile', label:'profile', source:'JSONB', target:'JSON', logical:'Normalized JSON Document', level:'exact', reason:'数组顺序、数值精度和规范化键策略均已证明', code:'JSON_NORMALIZED_EXACT', selectable:true, meta:{sourceParams:'jsonb · typed number', targetParams:'JSON · normalized document', sourceExtra:'NULLABLE', targetExtra:'NULLABLE', sourceLineage:'el:users.profile:13', targetLineage:'el:users.profile:83', charset:'UTF-8 → utf8mb4', collation:'—', timezone:'—'}, config:{targetType:'JSON', precision:'—', scale:'—', charset:'utf8mb4', collation:'—', timezone:'UTC', action:'保持规范化文档', ready:true}, sample:{from:'{"age":30,"tags":["vip"]}', to:'{"age":30,"tags":["vip"]}', note:'JSON 文本空白与键顺序不属于保证范围。'}}
+        ]
+      }
+    };
+    const state = {variant:new URLSearchParams(location.search).get('variant') || 'a', route:'orders', selected:'amount', stale:false, acknowledged:{}, configs:{}};
+    function currentRoute(){ return routes[state.route]; }
+    function currentField(){ return currentRoute().fields.find(f=>f.id===state.selected) || currentRoute().fields[0]; }
+    function escapeHtml(value){ return String(value ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function label(level){ return ({exact:'无损 · 自动放行',range:'范围检查 · 可配置',explicit:'显式转换 · 需确认',blocked:'禁止同步'})[level]; }
+    function risk(level, mini=false){ return '<span class="risk '+level+(mini?' mini':'')+'"><i class="dot"></i>'+label(level)+'</span>'; }
+    function configFor(field){
+      if(!field.config) return null;
+      state.configs[field.id] ||= {...field.config};
+      return state.configs[field.id];
+    }
+    function definitionCard(field, side){
+      const isSource=side==='source', value=isSource?field.source:field.target;
+      const params=isSource?field.meta.sourceParams:field.meta.targetParams;
+      return '<article class="panel definition '+side+'"><span class="eyebrow">'+(isSource?'源端字段':'目的端字段')+'</span><h3>'+escapeHtml(currentRoute().table)+'.'+escapeHtml(field.label)+'</h3><div class="headline"><code>'+escapeHtml(value)+'</code></div><dl><dt>定义参数</dt><dd>'+escapeHtml(params)+'</dd><dt>列约束</dt><dd>'+escapeHtml(isSource?field.meta.sourceExtra:field.meta.targetExtra)+'</dd><dt>Lineage ID</dt><dd><code>'+escapeHtml(isSource?field.meta.sourceLineage:field.meta.targetLineage)+'</code></dd></dl></article>';
+    }
+    function metadataPanel(field){
+      return '<section class="panel"><div class="panel-head"><div><h2>字段元数据</h2><p>显示参与计划 digest 的完整输入，不隐藏关键语义。</p></div>'+risk(field.level)+'</div><dl class="meta-grid"><div><dt>LogicalType</dt><dd><code>'+escapeHtml(field.logical)+'</code></dd></div><div><dt>稳定原因 code</dt><dd><code>'+escapeHtml(field.code)+'</code></dd></div><div><dt>源端定义</dt><dd><code>'+escapeHtml(field.meta.sourceParams)+'</code></dd></div><div><dt>目的端定义</dt><dd><code>'+escapeHtml(field.meta.targetParams)+'</code></dd></div><div><dt>字符集</dt><dd>'+escapeHtml(field.meta.charset)+'</dd></div><div><dt>排序规则</dt><dd>'+escapeHtml(field.meta.collation)+'</dd></div><div><dt>时区 / Session</dt><dd>'+escapeHtml(field.meta.timezone)+'</dd></div><div><dt>字段身份</dt><dd><code>'+escapeHtml(field.meta.sourceLineage)+' → '+escapeHtml(field.meta.targetLineage)+'</code></dd></div><div class="wide"><dt>为什么是这个等级</dt><dd>'+escapeHtml(field.reason)+'</dd></div><div class="wide"><dt>当前指纹</dt><dd class="tag-row"><span class="tag">Source '+escapeHtml(currentRoute().sourceFp)+'</span><span class="tag">Target '+escapeHtml(currentRoute().targetFp)+'</span><span class="tag">Capability Manifest cm:8.4.2:19ae</span></dd></div></dl></section>';
+    }
+    function fieldRows(compact=false){
+      return currentRoute().fields.map(field=>{
+        const disabled=state.stale || !field.selectable;
+        const selected=field.id===state.selected;
+        if(compact) return '<button class="compact-field '+(selected?'selected ':'')+(disabled?'locked':'')+'" data-field="'+field.id+'" '+(disabled?'disabled':'')+'><span><strong>'+escapeHtml(field.label)+(field.key?' <small class="key">PK</small>':'')+'</strong><small>'+escapeHtml(field.source)+' → '+escapeHtml(field.target)+'</small></span>'+risk(field.level,true)+'</button>';
+        return '<tr class="'+(selected?'selected ':'')+(disabled?'locked':'')+'"><td><button class="field-select" data-field="'+field.id+'" '+(disabled?'disabled':'')+'><span class="field-name"><span>'+escapeHtml(field.label)+'</span>'+(field.key?'<small class="key">PK / Row Locator</small>':'')+'</span><small class="cell-note">'+(disabled?(state.stale?'元数据已变化 · 需刷新预览':'结构不满足，不能绑定'):'点击查看计划')+'</small></button></td><td><div class="type-pair"><span><code>'+escapeHtml(field.source)+'</code><small>源端</small></span><span class="arrow">→</span><span><code>'+escapeHtml(field.target)+'</code><small>目的端</small></span></div></td><td><code>'+escapeHtml(field.logical)+'</code></td><td>'+risk(field.level)+'</td><td><button class="option-link" data-field="'+field.id+'" '+(disabled?'disabled':'')+'>'+((field.level==='exact')?'查看计划':(field.level==='blocked'?'无可用选项':'兼容选项'))+'</button></td></tr>';
+      }).join('');
+    }
+    function optionsPanel(field){
+      if(field.level==='blocked') return '<section class="panel"><div class="panel-head"><div><h2>兼容选项不可用</h2><p>禁止同步不是待确认的风险，而是没有可证明的目标表示。</p></div>'+risk('blocked')+'</div><div class="empty-state"><strong>'+escapeHtml(field.code)+'</strong><p>'+escapeHtml(field.reason)+'。不能通过普通文本、隐式 cast 或“忽略错误”绕过。</p><button class="button" disabled>选择兼容方案</button></div></section>';
+      const c=configFor(field), explicit=field.level==='explicit';
+      const valid=!state.stale && c && c.ready && (!explicit || !!state.acknowledged[field.id]);
+      return '<section class="panel"><div class="panel-head"><div><h2>兼容选项</h2><p>候选来自版本化 Capability Manifest；仅可收窄，不可扩大能力。</p></div>'+risk(field.level)+'</div><div class="option-card"><div class="option-card-head"><div><h3>'+escapeHtml(c.targetType)+' · '+escapeHtml(field.target)+'</h3><p>ConversionRule <code>cr.'+escapeHtml(field.code.toLowerCase())+'.v2</code> · 参数 schema 已校验</p></div><span class="tag '+(explicit?'warn':'good')+'">'+(explicit?'需要逐字段确认':'计划可生成')+'</span></div><div class="option-card-body"><div class="form-grid"><div class="form-field"><label for="target-type">目标类型</label><select class="select" id="target-type" data-config-key="targetType">'+(field.id==='id'?'<option>DECIMAL</option><option>BIGINT</option>':field.id==='created_at'?'<option>DATETIME</option><option>TIMESTAMP</option>':field.id==='display_name'?'<option>VARCHAR</option><option>TEXT</option>':'<option>DECIMAL</option><option>NUMERIC</option>')+'</select></div><div class="form-field"><label for="action">转换动作 / 失败策略</label><select class="select" id="action" data-config-key="action"><option>'+escapeHtml(c.action)+'</option><option>拒绝所有不可表示值并回滚</option></select></div><div class="form-field"><label for="precision">精度 / 长度</label><input class="input" id="precision" data-config-key="precision" value="'+escapeHtml(c.precision)+'"></div><div class="form-field"><label for="scale">Scale / 长度单位</label><input class="input" id="scale" data-config-key="scale" value="'+escapeHtml(c.scale)+'"></div><div class="form-field"><label for="charset">字符集 / 编码</label><select class="select" id="charset" data-config-key="charset"><option>'+escapeHtml(c.charset)+'</option><option>utf8mb4</option><option>UTF-8</option><option>不适用</option></select></div><div class="form-field"><label for="collation">排序规则</label><select class="select" id="collation" data-config-key="collation"><option>'+escapeHtml(c.collation)+'</option><option>utf8mb4_bin</option><option>utf8mb4_0900_ai_ci</option><option>不适用</option></select></div><div class="form-field full"><label for="timezone">时区 / tzdata / Session Profile</label><select class="select" id="timezone" data-config-key="timezone"><option>'+escapeHtml(c.timezone)+'</option><option>UTC</option><option>Asia/Shanghai · tzdata 2026a</option><option>不适用</option></select><div class="helper">时间语义不能靠浏览器本地时区推断；计划必须固定完整 Sink Session Profile。</div></div></div>'+(!explicit?'':'<label class="confirm-row"><input type="checkbox" data-confirm="'+field.id+'" '+(state.acknowledged[field.id]?'checked':'')+'><span><strong>我确认该字段的语义变化</strong><br>我接受“'+escapeHtml(field.reason)+'”；失败时必须回滚完整 Sink Apply Transaction，不能推进 checkpoint。</span></label>')+'<div class="validation '+(valid?'ok':'')+'">'+(valid?'计划输入完整，可以生成 ColumnConversionPlan digest。':(state.stale?'计划已失效：源/目的 Schema Fingerprint 发生变化。':(!c.ready?'还缺少有效的目标参数或失败策略。':explicit?'保存前必须完成逐字段风险确认。':'请先完成此字段的兼容参数。')))+'</div></div></div>'+(field.sample?'<div class="sample"><div class="sample-head"><strong>示例转换结果</strong><span class="muted">仅解释计划，不用于推断安全范围</span></div><div class="sample-grid"><div class="sample-value"><small>源端 LogicalValue</small><code>'+escapeHtml(field.sample.from)+'</code></div><span class="sample-arrow">→</span><div class="sample-value"><small>目的端 LogicalValue</small><code>'+escapeHtml(field.sample.to)+'</code></div></div><p class="helper">'+escapeHtml(field.sample.note)+'</p></div>':'')+'</section>';
+    }
+    function renderA(){
+      const f=currentField();
+      return '<div class="layout-a"><section class="panel"><div class="panel-head"><div><h2>字段绑定 / 目的端风险字段</h2><p>风险字段显式显示“兼容选项”；硬禁止字段保持不可选。</p></div><span class="muted">'+currentRoute().fields.length+' 个字段</span></div><div class="table-scroll"><table class="field-table"><thead><tr><th>字段</th><th>源端 → 目的端</th><th>LogicalType</th><th>资格等级</th><th>操作</th></tr></thead><tbody>'+fieldRows()+'</tbody></table></div><div class="audit-line"><span>源指纹 <code>'+currentRoute().sourceFp+'</code></span><span>目的指纹 <code>'+currentRoute().targetFp+'</code></span><span>预览只读 · 未接入服务端</span></div></section><aside class="inspector">'+metadataPanel(f)+'<div style="height:18px"></div>'+optionsPanel(f)+'</aside></div>';
+    }
+    function renderB(){
+      const f=currentField();
+      return '<div class="layout-b"><div class="source-target">'+definitionCard(f,'source')+definitionCard(f,'target')+'</div><div class="configuration"><div class="config-main">'+metadataPanel(f)+'<div style="height:18px"></div>'+optionsPanel(f)+'</div><aside class="panel review-rail"><h3>保存前检查</h3>'+reviewItems(f)+'</aside></div></div>';
+    }
+    function reviewItems(field){
+      const c=configFor(field), explicit=field.level==='explicit', valid=!state.stale && field.level!=='blocked' && c && c.ready && (!explicit || state.acknowledged[field.id]);
+      return '<div class="review-item '+(field.level==='blocked'?'blocked':'')+'"><span class="icon">'+(field.level==='blocked'?'×':'✓')+'</span><div><strong>字段绑定</strong><span>'+ (field.level==='blocked'?'目的端能力不满足':'Lineage ID 已锁定')+'</span></div></div><div class="review-item '+(state.stale?'blocked':'')+'"><span class="icon">'+(state.stale?'×':'✓')+'</span><div><strong>元数据指纹</strong><span>'+ (state.stale?'预览已失效':'Source / Target Fingerprint 一致')+'</span></div></div><div class="review-item '+(explicit&&!state.acknowledged[field.id]?'pending':'')+'"><span class="icon">'+(explicit&&!state.acknowledged[field.id]?'!':'✓')+'</span><div><strong>风险确认</strong><span>'+ (explicit&&!state.acknowledged[field.id]?'等待逐字段确认':'不需要额外确认')+'</span></div></div><div class="review-item '+(!valid?'pending':'')+'"><span class="icon">'+(valid?'✓':'!')+'</span><div><strong>ColumnConversionPlan</strong><span>'+ (valid?'digest 可生成':'保存按钮保持禁用')+'</span></div></div>';
+    }
+    function renderC(){
+      const f=currentField(), c=configFor(f), valid=!state.stale && f.level!=='blocked' && c && c.ready && (f.level!=='explicit'||state.acknowledged[f.id]);
+      return '<div class="layout-c"><section class="panel steps"><div class="panel-head"><div><h2>兼容方案配置向导</h2><p>按“选择字段 → 选定表示 → 复核影响”逐步推进；没有完整方案就不能选中或保存。</p></div><span class="tag '+(valid?'good':'warn')+'">'+(valid?'可生成计划':'尚未完成')+'</span></div><div style="padding:18px 18px 4px"><div class="step '+(f?'active':'')+'"><span class="step-number">1</span><div><h3>选择目的端风险字段</h3><p>无主键/Row Locator、无绑定或元数据过期的字段不能选中。</p><div class="compact-field-list">'+fieldRows(true)+'</div></div></div><div class="step active"><span class="step-number">2</span><div><h3>确定目标表示与约束</h3><p>配置项只来自目标端已发布的 Capability Manifest。</p>'+optionsPanel(f)+'</div></div><div class="step '+(valid?'done':'active')+'"><span class="step-number">3</span><div><h3>复核风险并允许同步</h3><p>保存会绑定计划输入、确认人和 digest；示例结果不会替代能力证明。</p><div class="tag-row"><span class="tag">资格：'+label(f.level)+'</span><span class="tag">规则：cr.'+escapeHtml(f.code.toLowerCase())+'.v2</span><span class="tag">'+(state.stale?'需重新预览':'计划输入已锁定')+'</span></div></div></div></div></section><aside class="review-rail panel"><h3>当前影响复核</h3>'+definitionCard(f,'source')+definitionCard(f,'target')+reviewItems(f)+'</aside></div>';
+    }
+    function saveReady(){ const f=currentField(), c=configFor(f); return !state.stale && !!f.selectable && f.level!=='blocked' && !!c && c.ready && (f.level!=='explicit'||!!state.acknowledged[f.id]); }
+    function render(){
+      const route=currentRoute(), f=currentField();
+      if(!variants.some(v=>v.key===state.variant)) state.variant='a';
+      document.body.dataset.variant=state.variant;
+      document.querySelector('#route-select').value=state.route;
+      const freshness=document.querySelector('#freshness'); freshness.classList.toggle('stale',state.stale); freshness.innerHTML='<i class="dot"></i><span>'+(state.stale?'预览已失效 · 目标元数据变化':'预览基于当前元数据')+'</span>';
+      const banner=document.querySelector('#state-banner'); banner.classList.toggle('hidden',!state.stale); banner.innerHTML=state.stale?'<span>⚠</span><div><strong>目的端元数据已变化，旧字段不能继续选中</strong><p>目的端 Schema Fingerprint 与旧 ColumnConversionPlan 不一致。为避免静默复用旧确认，字段选择、配置和“保存并允许同步”均已锁定；请刷新兼容性预览后重新确认。</p><button class="button" data-refresh="1">刷新兼容性预览</button></div>':'';
+      document.querySelector('#prototype-root').innerHTML=state.variant==='a'?renderA():state.variant==='b'?renderB():renderC();
+      const vi=variants.find(v=>v.key===state.variant); document.querySelector('#variant-key').textContent=vi.key.toUpperCase(); document.querySelector('#variant-label').textContent=vi.label;
+      const ready=saveReady(); document.querySelector('#footer-save').disabled=!ready; document.querySelector('#footer-status').textContent=ready?'可以保存并允许同步':state.stale?'需要刷新元数据预览':f.level==='blocked'?'该字段禁止同步':f.level==='explicit'&&!state.acknowledged[f.id]?'等待风险确认':'选择一列查看兼容选项'; document.querySelector('#footer-detail').textContent=ready?'完整计划输入、参数与风险记录将绑定到本次 Route Configuration Revision。':f.level==='blocked'?f.reason:'保存按钮只在配置完成、指纹一致且所需风险确认完成后可用。';
+      const c=configFor(f); if(c){ document.querySelectorAll('[data-config-key]').forEach(el=>{el.value=c[el.dataset.configKey] ?? '';}); }
+    }
+    function toast(message){ const el=document.querySelector('#toast'); el.textContent=message; el.classList.add('show'); clearTimeout(toast.timer); toast.timer=setTimeout(()=>el.classList.remove('show'),2600); }
+    function setVariant(index){ state.variant=variants[(index+variants.length)%variants.length].key; const params=new URLSearchParams(location.search); params.set('variant',state.variant); history.replaceState(null,'','?'+params.toString()); render(); }
+    document.addEventListener('click', event=>{
+      const variant=event.target.closest('[data-variant-step]'); if(variant){ setVariant(variants.findIndex(v=>v.key===state.variant)+Number(variant.dataset.variantStep)); return; }
+      const fieldButton=event.target.closest('[data-field]'); if(fieldButton && !fieldButton.disabled){ state.selected=fieldButton.dataset.field; render(); return; }
+      if(event.target.closest('[data-stale]')){ state.stale=true; render(); toast('已模拟目标端元数据变化：旧计划现在不可选中'); return; }
+      if(event.target.closest('[data-refresh]')){ state.stale=false; state.acknowledged={}; render(); toast('兼容性预览已刷新，请重新检查计划输入'); return; }
+      const confirm=event.target.closest('[data-confirm]'); if(confirm){ state.acknowledged[confirm.dataset.confirm]=confirm.checked; render(); return; }
+      if(event.target.closest('#footer-save')){ if(saveReady()) toast('样稿：已生成新的 ColumnConversionPlan（未写入服务端）'); else toast('保存被阻止：请完成所有配置与风险确认'); return; }
+    });
+    document.addEventListener('change', event=>{
+      if(event.target.id==='route-select'){ state.route=event.target.value; state.selected=currentRoute().fields[0].id; state.stale=false; state.acknowledged={}; render(); return; }
+      const key=event.target.dataset.configKey; if(key){ const c=configFor(currentField()); c[key]=event.target.value; c.ready=!!c.targetType && !!c.precision && !!c.action; render(); }
+    });
+    document.addEventListener('keydown', event=>{ if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName)) return; if(event.key==='ArrowLeft')setVariant(variants.findIndex(v=>v.key===state.variant)-1); if(event.key==='ArrowRight')setVariant(variants.findIndex(v=>v.key===state.variant)+1); });
+    render();
+  </script>
+</body>
+</html>

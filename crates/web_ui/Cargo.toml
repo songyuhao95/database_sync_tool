@@ -1,0 +1,31 @@
+[package]
+name = "web_ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cdc-web"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+argon2 = "0.5.3"
+aes-gcm = "0.10.3"
+sha2 = "0.10.9"
+subtle = "2.6"
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mysql-driver.workspace = true
+change_event.workspace = true
+mysql_5_7 = { path = "../mysql_5_7" }
+mysql_8_0 = { path = "../mysql_8_0" }
+mysql_8_4 = { path = "../mysql_8_4" }
+postgresql_15 = { path = "../postgresql_15" }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,14 @@
+[package]
+name = "mysql_5_7"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+serde_json.workspace = true
+change_event.workspace = true
+mysql_source_contract.workspace = true
+mysql-driver.workspace = true
+mysql-common.workspace = true
+sha2.workspace = true
