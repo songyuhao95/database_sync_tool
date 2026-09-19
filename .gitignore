@@ -1,0 +1,10 @@
+/target/
+node_modules/
+.env
+/scripts/test.txt
+*.log
+/data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.key

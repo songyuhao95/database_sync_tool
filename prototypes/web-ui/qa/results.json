@@ -1,0 +1,177 @@
+{
+  "checks": [
+    {
+      "name": "Direct task URL shows demo login when signed out",
+      "pass": true
+    },
+    {
+      "name": "Wrong password shows inline error",
+      "pass": true
+    },
+    {
+      "name": "Login preserves task deep link",
+      "pass": true
+    },
+    {
+      "name": "Users task has its own tables",
+      "pass": true
+    },
+    {
+      "name": "Users task has its own transaction logs",
+      "pass": true
+    },
+    {
+      "name": "Users error tab has a real empty state",
+      "pass": true
+    },
+    {
+      "name": "Home lists all three instances",
+      "pass": true
+    },
+    {
+      "name": "Home has no single-task topology",
+      "pass": true
+    },
+    {
+      "name": "8.0 instance can have both roles",
+      "pass": true
+    },
+    {
+      "name": "No duplicate add-task buttons on home or task list",
+      "pass": true
+    },
+    {
+      "name": "Inspector derives each associated task role",
+      "pass": true
+    },
+    {
+      "name": "Desktop hides mobile navigation toggle",
+      "pass": true
+    },
+    {
+      "name": "Instance link filters task list",
+      "pass": true
+    },
+    {
+      "name": "Associated list contains the correct routes",
+      "pass": true
+    },
+    {
+      "name": "Clear filter restores all tasks",
+      "pass": true
+    },
+    {
+      "name": "Order detail shows 5.7 to 8.4",
+      "pass": true
+    },
+    {
+      "name": "Order detail does not reuse users mapping",
+      "pass": true
+    },
+    {
+      "name": "Selecting endpoint updates configuration inspector",
+      "pass": true
+    },
+    {
+      "name": "Selecting a table highlights both sides",
+      "pass": true
+    },
+    {
+      "name": "Error tab filters order rollback",
+      "pass": true
+    },
+    {
+      "name": "Runtime tab filters connection events",
+      "pass": true
+    },
+    {
+      "name": "Log tabs support keyboard selection",
+      "pass": true
+    },
+    {
+      "name": "Pause updates global mock count",
+      "pass": true
+    },
+    {
+      "name": "Resume restores global mock count",
+      "pass": true
+    },
+    {
+      "name": "Switching to inventory uses 8.0 source",
+      "pass": true
+    },
+    {
+      "name": "Inventory has independent mappings",
+      "pass": true
+    },
+    {
+      "name": "Inventory has independent file-position logs",
+      "pass": true
+    },
+    {
+      "name": "Reload keeps selected task",
+      "pass": true
+    },
+    {
+      "name": "Browser back restores selected task",
+      "pass": true
+    },
+    {
+      "name": "Unknown task does not leak stale detail",
+      "pass": true
+    },
+    {
+      "name": "Draft has a dedicated empty state",
+      "pass": true
+    },
+    {
+      "name": "Instance search empty state",
+      "pass": true
+    },
+    {
+      "name": "Light theme activates",
+      "pass": true
+    },
+    {
+      "name": "700px home has no document overflow",
+      "pass": true
+    },
+    {
+      "name": "390px detail has no document overflow",
+      "pass": true
+    },
+    {
+      "name": "Mobile detail keeps source configuration accessible",
+      "pass": true
+    },
+    {
+      "name": "Mobile navigation opens",
+      "pass": true
+    },
+    {
+      "name": "Mobile navigation closes after routing",
+      "pass": true
+    },
+    {
+      "name": "390px add page has no document overflow",
+      "pass": true
+    },
+    {
+      "name": "Add preview maps selected source tables",
+      "pass": true
+    },
+    {
+      "name": "Logout hides business pages",
+      "pass": true
+    },
+    {
+      "name": "Signed-out hash navigation remains guarded",
+      "pass": true
+    },
+    {
+      "name": "No browser script or resource errors",
+      "pass": true
+    }
+  ],
+  "errors": []
+}

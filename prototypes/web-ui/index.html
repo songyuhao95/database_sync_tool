@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CDC Console</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="node_modules/@phosphor-icons/web/src/regular/style.css">
+  <link rel="stylesheet" href="node_modules/@phosphor-icons/web/src/fill/style.css">
+  <link rel="stylesheet" href="theme-topology.css">
+  <script src="app.js" defer></script>
+</head>
+<body class="dark">
+<section id="login" class="login">
+  <div class="login-left"><form id="login-form" class="login-card">
+    <div class="brand-title">CDC</div>
+    <h1>登录控制台</h1><p class="muted">管理数据库实例与增量同步任务。</p>
+    <div class="field"><label for="user">账号</label><input id="user" class="input" value="admin" autocomplete="username" required></div>
+    <div class="field"><label for="password">密码</label><input id="password" class="input" type="password" autocomplete="current-password" required></div>
+    <p id="login-error" class="danger" role="alert"></p>
+    <button class="btn primary">登录平台</button>
+    <p class="demo-note">交互样稿：<code>admin / cdc-demo</code><br>模拟数据，仅演示页面流程，尚未接入服务端鉴权。</p>
+  </form></div>
+  <div class="login-art"><div><p class="muted">数据库变更同步</p><h2>看清每一条数据<br>正在去往哪里</h2><p>MySQL 5.7、8.0、8.4<br>实例配置、任务链路与事务写入。</p></div>
+    <dl class="login-facts"><div><dt>变更来源</dt><dd>Replication Protocol</dd></div><div><dt>统一事件</dt><dd>ChangeEvent</dd></div><div><dt>目的端写入</dt><dd>事务提交</dd></div></dl>
+  </div>
+</section>
+<div id="app" class="shell hidden">
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-brand"><div class="brand-title">CDC</div><small>数据库变更同步</small></div>
+    <nav aria-label="主导航">
+      <button class="nav" data-page="home"><i class="ph ph-database" aria-hidden="true"></i>数据库总览</button>
+      <button class="nav" data-page="tasks"><i class="ph ph-arrows-left-right" aria-hidden="true"></i>同步任务</button>
+      <button class="nav" data-page="add"><i class="ph ph-plus-square" aria-hidden="true"></i>添加任务</button>
+      <button class="nav" data-page="settings"><i class="ph ph-gear" aria-hidden="true"></i>设置</button>
+    </nav>
+    <div class="sidebar-foot"><span class="demo-label">交互样稿 · 模拟数据</span><button id="logout" class="nav"><i class="ph ph-sign-out" aria-hidden="true"></i>退出登录</button></div>
+  </aside>
+  <div class="workspace">
+    <header class="top">
+      <button id="menu" class="icon mobile" aria-label="打开导航" aria-expanded="false"><i class="ph ph-list"></i></button>
+      <span id="top-title">数据库总览</span>
+      <div class="top-right"><div id="global-status" class="top-stats"></div><button id="theme-toggle" class="icon" aria-label="切换浅色主题"><i class="ph ph-circle-half"></i></button><span class="avatar"><i class="ph ph-user"></i></span><span>admin</span></div>
+    </header>
+    <main class="main">
+      <section id="page-home" class="page">
+        <div class="title-row"><div><h1>数据库总览</h1><p>所有已管理实例的连接状态与 CDC 配置</p></div><button class="btn" data-refresh><i class="ph ph-arrows-clockwise"></i>刷新状态</button></div>
+        <div id="overview-summary" class="overview-summary"></div>
+        <div class="inventory-layout">
+          <div class="inventory-main">
+            <div class="section-heading"><h2>已管理实例 <span class="muted">/ 03</span></h2><span class="muted">点击实例查看配置</span></div>
+            <div class="filters"><label class="search-box"><i class="ph ph-magnifying-glass"></i><input id="instance-search" type="search" placeholder="搜索实例、地址或版本" aria-label="搜索数据库实例"></label><label class="sr-only" for="instance-filter">实例状态</label><select id="instance-filter" class="select"><option value="all">全部状态</option><option value="online">在线</option><option value="offline">离线</option></select></div>
+            <div class="table-wrap"><table class="inventory-table"><thead><tr><th>实例 / 连接地址</th><th>版本</th><th>连接</th><th>采集配置</th><th>任务中的角色</th><th>关联任务</th></tr></thead><tbody id="instance-rows"></tbody></table></div>
+            <p class="context-note"><i class="ph ph-info"></i>同一实例可以在不同任务中承担源端和目的端角色。</p>
+            <div class="section-heading relation-heading"><h2>任务分布</h2><button class="text-button" data-page="tasks">查看全部任务<i class="ph ph-arrow-right"></i></button></div>
+            <div id="route-overview" class="route-overview"></div>
+          </div>
+          <aside id="instance-inspector" class="inspector" aria-label="所选实例详情"></aside>
+        </div>
+      </section>
+      <section id="page-tasks" class="page">
+        <div class="title-row"><div><h1>同步任务</h1><p>每条任务对应一个源端、一个目的端和独立的同步范围</p></div></div>
+        <div class="panel">
+          <div class="filters"><label class="search-box"><i class="ph ph-magnifying-glass"></i><input id="search" type="search" placeholder="搜索任务、实例或库表" aria-label="搜索同步任务"></label><label class="sr-only" for="filter">任务状态</label><select id="filter" class="select"><option value="all">全部状态</option><option value="running">运行中</option><option value="paused">已暂停</option><option value="draft">待配置</option></select><button id="clear-task-filter" class="text-button hidden">清除实例筛选</button></div>
+          <p id="task-filter-context" class="context-note hidden"></p>
+          <div class="table-wrap"><table><thead><tr><th>任务</th><th>源实例</th><th>目的实例</th><th>同步范围</th><th>状态</th><th>延迟</th></tr></thead><tbody id="task-rows"></tbody></table></div>
+        </div>
+      </section>
+      <section id="page-detail" class="page">
+        <div id="detail-content"></div>
+      </section>
+      <section id="page-add" class="page">
+        <div class="title-row"><div><h1>添加同步任务</h1><p>选择源端与目的端的库表映射</p></div></div>
+        <div class="steps panel"><span class="step active">选择数据</span><i class="ph ph-caret-right"></i><span class="step">同步配置</span><i class="ph ph-caret-right"></i><span class="step">检查并创建</span></div>
+        <div class="mapping-layout">
+          <div class="panel"><div class="section-heading"><h2>源端库表</h2><span class="status good">可读取</span></div><div class="picker"><label class="sr-only" for="add-source">源实例</label><select id="add-source" class="select"><option value="source">mysql-source-57 · 192.168.0.10:33061</option></select></div><div class="tree"><h3><i class="ph ph-database"></i>CDC_test</h3><label class="tree-row"><input class="map-check" type="checkbox" value="orders" checked>orders</label><label class="tree-row"><input class="map-check" type="checkbox" value="order_items" checked>order_items</label><label class="tree-row"><input class="map-check" type="checkbox" value="payments">payments</label><label class="tree-row"><input class="map-check" type="checkbox" value="refunds">refunds</label></div></div>
+          <div class="panel"><div class="section-heading"><h2>目的端库表</h2><span class="status good">可写入</span></div><div class="picker"><label class="sr-only" for="add-sink">目的实例</label><select id="add-sink" class="select"><option value="target84">mysql-target-84 · 192.168.0.10:33063</option><option value="target80">mysql-target-80 · 192.168.0.10:33062</option></select></div><div class="tree"><h3><i class="ph ph-database"></i>CDC_test</h3><div id="add-target-tables"></div></div></div>
+        </div>
+        <div class="summary panel"><b><span id="count">2</span> 张表将被同步</b><span id="add-summary" class="muted"></span><button class="btn primary" data-placeholder>下一步：同步配置<i class="ph ph-arrow-right"></i></button></div>
+      </section>
+      <section id="page-settings" class="page">
+        <div class="title-row"><div><h1>设置</h1><p>账号、显示偏好和平台运行参数</p></div></div>
+        <div class="settings">
+          <article class="setting panel"><h2>当前账号</h2><div class="account"><span class="avatar"><i class="ph ph-user"></i></span><div><b>admin</b><p class="muted">平台管理员</p></div><button class="btn" data-placeholder>修改密码</button></div></article>
+          <article class="setting panel"><h2>外观</h2><div class="themes"><button class="theme" data-theme="light"><i class="ph ph-sun"></i>浅色</button><button class="theme" data-theme="dark"><i class="ph ph-moon"></i>深色</button></div></article>
+          <article class="setting panel wide"><div class="section-heading"><h2>登录账号</h2><button class="btn primary" data-placeholder><i class="ph ph-plus"></i>添加账号</button></div><div class="setting-row"><b>admin</b><span class="muted">管理员 / 当前账号</span></div><div class="setting-row"><b>operator</b><span class="muted">运维人员</span><button class="btn danger" data-placeholder>删除</button></div></article>
+          <article class="setting panel wide"><h2>日志与版本</h2><div class="setting-row"><label>binlog 日志目录</label><code>D:\CDC\logs\binlog</code><button class="btn" data-placeholder>修改</button></div><div class="setting-row"><label>ChangeEvent 日志</label><code>D:\CDC\logs\change_event.log</code><button class="btn" data-placeholder>修改</button></div><div class="setting-row"><label>平台版本</label><b>v0.1.0</b></div></article>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+<div id="toast" class="toast" role="status"></div>
+</body>
+</html>
+

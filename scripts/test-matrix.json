@@ -1,0 +1,613 @@
+{
+  "databases": [
+    "mysql_5_7",
+    "mysql_8_0",
+    "mysql_8_4",
+    "postgresql_15"
+  ],
+  "unsupported": [],
+  "suites": [
+    {
+      "id": "connector_matrix.local",
+      "mode": "Local",
+      "databases": [
+        "mysql_5_7",
+        "mysql_8_0",
+        "mysql_8_4",
+        "postgresql_15"
+      ],
+      "stages": [
+        "ChangeEvent",
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_matrix",
+        "local_four_by_four_matrix",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "mysql_5_7.events",
+      "mode": "Local",
+      "databases": [
+        "mysql_5_7"
+      ],
+      "stages": [
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_change_event",
+        "mysql_5_7::local_change_event",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "mysql_5_7.sql",
+      "mode": "Local",
+      "databases": [
+        "mysql_5_7"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_sql",
+        "mysql_5_7::local_sql",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "mysql_5_7.capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": [
+        "mysql_5_7"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_capture",
+        "mysql_5_7::live_capture",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_5_7.apply",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "databases": [
+        "mysql_5_7"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_sql",
+        "mysql_5_7::live_sql",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_WRITER_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_0.events",
+      "mode": "Local",
+      "databases": [
+        "mysql_8_0"
+      ],
+      "stages": [
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_change_event",
+        "mysql_8_0::local_change_event",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "mysql_8_0.sql",
+      "mode": "Local",
+      "databases": [
+        "mysql_8_0"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_sql",
+        "mysql_8_0::local_sql",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "mysql_8_0.capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": [
+        "mysql_8_0"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_capture",
+        "mysql_8_0::live_capture",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_0.apply",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "databases": [
+        "mysql_8_0"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_sql",
+        "mysql_8_0::live_sql",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_WRITER_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_4.events",
+      "mode": "Local",
+      "databases": [
+        "mysql_8_4"
+      ],
+      "stages": [
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_change_event",
+        "mysql_8_4::local_change_event",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "mysql_8_4.sql",
+      "mode": "Local",
+      "databases": [
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_sql",
+        "mysql_8_4::local_sql",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "mysql_8_4.capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": [
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_capture",
+        "mysql_8_4::live_capture",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_4.apply",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "databases": [
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "cdc-binlog-tail",
+        "--test",
+        "connector_sql",
+        "mysql_8_4::live_sql",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_WRITER_PASSWORD"
+      ]
+    },
+    {
+      "id": "change_event.validation",
+      "mode": "Local",
+      "databases": [
+        "mysql_5_7",
+        "mysql_8_0",
+        "mysql_8_4",
+        "postgresql_15"
+      ],
+      "stages": [
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "change_event",
+        "--lib",
+        "--",
+        "--nocapture"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "postgresql_15.types",
+      "mode": "Local",
+      "databases": [
+        "postgresql_15"
+      ],
+      "stages": [
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "postgresql_15",
+        "--lib",
+        "types::tests::",
+        "--",
+        "--nocapture"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "postgresql_15.sql",
+      "mode": "Local",
+      "databases": [
+        "postgresql_15"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "postgresql_15",
+        "--test",
+        "sql_sink",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "postgresql_15.apply",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "databases": [
+        "postgresql_15"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "postgresql_15",
+        "--test",
+        "sql_sink",
+        "postgres15_writes_sql_transaction",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_15.capture_to_mysql",
+      "mode": "Live",
+      "category": "route_smoke",
+      "databases": [
+        "mysql_5_7",
+        "mysql_8_0",
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Read",
+        "Sql",
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "postgresql_15",
+        "--test",
+        "live_capture",
+        "postgres15_capture_and_apply_to_mysql_sinks",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT",
+        "CDC_MYSQL80_PORT",
+        "CDC_MYSQL84_PORT",
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "transaction_recovery.common",
+      "mode": "Recovery",
+      "category": "transaction_recovery",
+      "required_for_live_qualified": true,
+      "databases": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "stages": ["Recovery"],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--lib",
+        "task_worker::qualification_recovery_tests::qualification_recovery_matrix",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "postgresql_15.checkpoint",
+      "mode": "Live",
+      "category": "supporting_live",
+      "required_for_live_qualified": false,
+      "databases": [
+        "postgresql_15"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "postgresql_15",
+        "--test",
+        "sql_sink",
+        "postgres15_checkpoint_and_dml_commit_atomically_across_restart",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_15.capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": [
+        "postgresql_15"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "postgresql_15",
+        "--test",
+        "live_capture",
+        "postgres15_capture_and_replay",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_15.web_sink",
+      "mode": "Live",
+      "category": "route_smoke",
+      "databases": [
+        "postgresql_15"
+      ],
+      "stages": [
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "tests::runtime_tests::live_web_mysql57_to_postgresql15_full_incremental_and_resume",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL57_PORT",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    }
+  ]
+}

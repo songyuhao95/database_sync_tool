@@ -1,0 +1,11 @@
+[package]
+name = "mysql_source_contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+change_event.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

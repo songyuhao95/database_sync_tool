@@ -1,0 +1,85 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>任务页面回归</title><link rel="stylesheet" href="/assets/style.css"><body><div style="position:fixed;top:0;left:0;z-index:50;background:white;padding:10px"><button id="test-scroll">运行滚动回归</button><button id="test-all">运行全部交互回归</button><button id="show-list">查看测试任务列表</button><output id="result">准备就绪</output></div><main id="content" style="padding:70px 24px"></main><script>
+const $=s=>document.querySelector(s);
+function node(tag,css='',text){const n=document.createElement(tag);n.className=css;if(text!==undefined)n.textContent=text;return n;}
+function title(name,sub){const n=node('header');n.append(node('h1','',name),node('p','',sub));return n;}
+function setTitle(){} function toast(s){document.querySelector('#result').textContent=s;}
+function empty(text){return node('p','',text);}
+const state={me:{user:{role:'admin'},task_service_connected:true}};
+const task={id:'qa-task',name:'日志测试任务',source_name:'源端测试',sink_name:'目的端测试',created_at:1789200000,status:'stopped',auto_start:false,start_mode:'auto',mappings:[],runtime:{}};
+let requestCount=0,sourceRequests=0,failAutoSave=false;
+let taskList=[task,{...task,id:'qa-running',name:'运行中测试任务',status:'running'}];
+let sourceLogs=Array.from({length:250},(_,i)=>({id:i+1,timestamp:0,level:'binlog',message:'[SOURCE] 原始 binlog 事件 '+(i+1)}));
+let logs=Array.from({length:200},(_,i)=>({id:i+1,timestamp:1789200000+i,level:'info',message:'测试日志第 '+String(i+1).padStart(3,'0')+' 行 / SELECT row FROM CDC_test.demo'}));
+async function api(url,options={}){
+ requestCount++;const parsed=new URL(url,location.origin),after=Number(parsed.searchParams.get('after')||0);
+ if(parsed.pathname.endsWith('/auto-start')){if(failAutoSave){failAutoSave=false;throw Error('模拟保存失败');}task.auto_start=JSON.parse(options.body).enabled;return {...task};}
+ if(options.method==='DELETE'){taskList=taskList.filter(t=>!parsed.pathname.endsWith('/'+t.id));return null;}
+ if(parsed.pathname.endsWith('/source-logs')){sourceRequests++;const entries=after?sourceLogs.filter(l=>l.id>after).slice(0,200):sourceLogs.slice(-200);return {entries,next:entries.at(-1)?.id||after,generation:'qa',reset:false,has_more:false};}
+ if(parsed.pathname.endsWith('/logs'))return logs.filter(l=>l.id>after).slice(-200);
+ if(parsed.pathname==='/api/tasks')return taskList;
+ return task;
+}
+</script><script src="/assets/tasks.js"></script><script>
+let testRefresh;pollTasks=refresh=>{testRefresh=refresh;};
+document.querySelector('#test-scroll').onclick=async()=>{
+ const result=document.querySelector('#result');
+ try{
+  await renderTaskDetail('qa-task');
+  let output=document.querySelector('.task-write-log');
+  output.scrollTop=350;const before=output.scrollTop;const requests=requestCount;
+  if(before<300)throw Error('fixture not scrollable');
+  await testRefresh();
+  output=document.querySelector('.task-write-log');
+  const after=output.scrollTop;
+  if(requestCount===requests)throw Error('refresh did not execute');
+  result.textContent=(after===before?'PASS':'FAIL')+' before='+before+' after='+after;
+ }catch(e){result.textContent='ERROR '+e.message;}
+};
+const settle=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+const assert=(ok,message)=>{if(!ok)throw Error(message);};
+document.querySelector('#show-list').onclick=()=>renderTasks();
+document.querySelector('#test-all').onclick=async()=>{
+ const result=document.querySelector('#result');
+ try{
+  await renderTaskDetail('qa-task');
+  let checkbox=document.querySelector('.task-auto-start-label input');
+  assert(!checkbox.checked,'auto start must default off');
+  checkbox.click();await settle();assert(task.auto_start&&checkbox.checked,'auto start not saved');
+  task.runtime.applied_rows=9;await testRefresh();assert(document.querySelector('.task-auto-start-label input')===checkbox&&checkbox.checked,'poll replaced or reset checkbox');
+  await renderTaskDetail('qa-task');checkbox=document.querySelector('.task-auto-start-label input');assert(checkbox.checked,'saved preference not restored');
+  failAutoSave=true;checkbox.click();await settle();assert(checkbox.checked&&task.auto_start,'failed save must restore confirmed value');
+  checkbox.click();await settle();assert(!checkbox.checked&&!task.auto_start,'auto start could not be disabled');
+  state.me.user.role='viewer';await renderTaskDetail('qa-task');assert(document.querySelector('.task-auto-start-label input').disabled,'viewer can edit auto start');
+  state.me.user.role='admin';await renderTaskDetail('qa-task');
+  const output=document.querySelector('.task-write-log');
+  output.scrollTop=350;await settle();const sinkTop=output.scrollTop;
+  await testRefresh();assert(document.querySelector('.task-write-log')===output,'log viewport replaced');assert(output.scrollTop===sinkTop,'refresh moved scroll');
+  logs.push({id:201,timestamp:1789201000,level:'sql',message:'INSERT new row'});
+  await testRefresh();assert(output.scrollTop===sinkTop,'new line moved historical scroll');assert(output.textContent.includes('INSERT new row'),'new line missing');
+  document.querySelector('#task-log-tab-source').click();await settle();
+  assert(output.textContent.includes('[SOURCE]'),'source tab is not showing source log');assert(!output.textContent.includes('INSERT new row'),'source tab leaked sink log');
+  output.scrollTop=120;await settle();const sourceTop=output.scrollTop;
+  document.querySelector('#task-log-tab-sink').click();await settle();assert(output.scrollTop===sinkTop,'sink tab lost scroll position');
+  document.querySelector('#task-log-tab-source').click();await settle();assert(output.scrollTop===sourceTop,'source tab lost scroll position');
+  await testRefresh();assert(output.scrollTop===sourceTop,'source refresh moved scroll');
+  sourceLogs.push(...Array.from({length:2100},(_,i)=>({id:251+i,timestamp:0,level:'binlog',message:'[SOURCE] 新事件 '+i})));
+  for(let i=0;i<10;i++)await testRefresh();
+  assert(output.scrollTop===sourceTop,'bounded history moved scroll');
+  assert(document.querySelector('.task-log-hint').textContent.includes('暂停'),'history buffer did not pause');
+  const requests=sourceRequests;await testRefresh();assert(sourceRequests===requests,'paused history still fetched logs');
+  document.querySelector('.task-log-latest').click();await settle();
+  assert(output.scrollHeight-output.clientHeight-output.scrollTop<=3,'latest button did not reach bottom');
+  sourceLogs.push({id:2351,timestamp:0,level:'binlog',message:'[SOURCE] 最新事件'});await testRefresh();
+  assert(output.textContent.includes('最新事件'),'latest source log missing');assert(output.scrollHeight-output.clientHeight-output.scrollTop<=3,'following newest did not stay at bottom');
+  await renderTasks();
+  const disabled=document.querySelector('[aria-label="删除任务 运行中测试任务"]');assert(disabled?.disabled,'running task deletion must be disabled');
+  document.querySelector('[aria-label="删除任务 日志测试任务"]').click();await settle();
+  assert(!document.querySelector('[aria-label="删除任务 日志测试任务"]'),'deleted task still in list');
+  assert(taskList.length===1,'wrong task deleted');
+  taskList[0].status='stopped';await testRefresh();document.querySelector('[aria-label="删除任务 运行中测试任务"]').click();await settle();
+  assert(taskList.length===0 && document.querySelector('#content').textContent.includes('还没有同步任务'),'last-task empty state missing');
+  result.textContent='PASS 自动开始/保存失败/权限/刷新/追加/标签/历史位置/有界缓冲/跟随最新/删除/空列表';
+ }catch(e){result.textContent='FAIL '+e.message;}
+};
+if(location.pathname==='/tasks')renderTasks();else renderTaskDetail('qa-task');
+</script></body></html>
