@@ -648,10 +648,18 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
         LogicalValue::Set { members } => Ok(Value::Bytes(members.join(",").into_bytes())),
         LogicalValue::Spatial { .. }
         | LogicalValue::Array { .. }
+        | LogicalValue::ArrayWithMetadata { .. }
         | LogicalValue::Struct { .. }
         | LogicalValue::Map { .. }
         | LogicalValue::Range { .. }
-        | LogicalValue::MultiRange { .. } => Err(capability_failure(
+        | LogicalValue::MultiRange { .. }
+        | LogicalValue::Null
+        | LogicalValue::LocalTime { .. }
+        | LogicalValue::InvalidTemporal { .. }
+        | LogicalValue::Network { .. }
+        | LogicalValue::Xml { .. }
+        | LogicalValue::Domain { .. }
+        | LogicalValue::Raw { .. } => Err(capability_failure(
             "MySQL 8.4 has no qualified target representation for this structured value",
         )),
         LogicalValue::Json { value } => {

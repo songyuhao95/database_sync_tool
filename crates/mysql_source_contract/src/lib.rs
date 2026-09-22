@@ -192,10 +192,18 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
         LogicalValue::Boolean { .. } | LogicalValue::Uuid { .. } => false,
         LogicalValue::Spatial { .. }
         | LogicalValue::Array { .. }
+        | LogicalValue::ArrayWithMetadata { .. }
         | LogicalValue::Struct { .. }
         | LogicalValue::Map { .. }
         | LogicalValue::Range { .. }
-        | LogicalValue::MultiRange { .. } => false,
+        | LogicalValue::MultiRange { .. }
+        | LogicalValue::Null
+        | LogicalValue::LocalTime { .. }
+        | LogicalValue::InvalidTemporal { .. }
+        | LogicalValue::Network { .. }
+        | LogicalValue::Xml { .. }
+        | LogicalValue::Domain { .. }
+        | LogicalValue::Raw { .. } => false,
     };
     ensure(valid, "MySQL native type does not match LogicalValue")
 }

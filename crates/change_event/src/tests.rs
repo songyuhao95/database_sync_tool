@@ -172,6 +172,193 @@ fn json_reader_returns_only_a_complete_validated_transaction() {
 }
 
 #[test]
+fn raw_value_carrier_requires_stable_source_evidence() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let carrier = RawValueCarrier::new(
+        "postgresql.hstore.v1",
+        "hstore",
+        "sha256:definition-1",
+        "binary",
+        URL_SAFE_NO_PAD.encode([0, 255, 1]),
+        Some("\"a\"=>\"b\""),
+    );
+    carrier
+        .validate()
+        .expect("complete carrier should validate");
+    assert_eq!(carrier.raw_bytes().unwrap(), [0, 255, 1]);
+    let encoded = serde_json::to_vec(&carrier).unwrap();
+    let decoded: RawValueCarrier = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, carrier);
+
+    let mut incomplete = carrier;
+    incomplete.codec_identity.clear();
+    let error = incomplete.validate().unwrap_err();
+    assert_eq!(error.code(), "raw_value_carrier.missing_evidence");
+}
+
+#[test]
+fn recursive_values_preserve_nulls_and_array_shape() {
+    let value = LogicalValue::ArrayWithMetadata {
+        elements: vec![
+            LogicalValue::Null,
+            LogicalValue::Struct {
+                fields: vec![StructuredField {
+                    name: "value".into(),
+                    value: LogicalValue::Integer {
+                        signed: true,
+                        bits: 32,
+                        value: "7".into(),
+                    },
+                }],
+            },
+        ],
+        dimensions: 2,
+        lower_bounds: vec![0, -2],
+    };
+
+    value.validate().expect("recursive value should validate");
+    let roundtrip: LogicalValue =
+        serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(roundtrip, value);
+
+    let duplicate_map = LogicalValue::Map {
+        entries: vec![
+            MapEntry {
+                key: LogicalValue::Text {
+                    charset: "utf8".into(),
+                    bytes_base64url: "YQ".into(),
+                    text: Some("a".into()),
+                },
+                value: LogicalValue::Null,
+            },
+            MapEntry {
+                key: LogicalValue::Text {
+                    charset: "utf8".into(),
+                    bytes_base64url: "YQ".into(),
+                    text: Some("a".into()),
+                },
+                value: LogicalValue::Null,
+            },
+        ],
+    };
+    assert!(validate_value(&duplicate_map).is_err());
+}
+
+#[test]
+fn stable_digests_are_reproducible_and_change_with_semantics() {
+    let first = LogicalValue::Integer {
+        signed: true,
+        bits: 32,
+        value: "7".into(),
+    };
+    let second = first.clone();
+    assert_eq!(first.stable_digest(), second.stable_digest());
+
+    let changed = LogicalValue::Integer {
+        signed: true,
+        bits: 32,
+        value: "8".into(),
+    };
+    assert_ne!(second.stable_digest(), changed.stable_digest());
+
+    let ordered = LogicalValue::Json {
+        value: JsonValue::Object(vec![
+            JsonEntry {
+                key: "b".into(),
+                value: JsonValue::Boolean(true),
+            },
+            JsonEntry {
+                key: "a".into(),
+                value: JsonValue::Boolean(false),
+            },
+        ]),
+    };
+    let reordered = LogicalValue::Json {
+        value: JsonValue::Object(vec![
+            JsonEntry {
+                key: "a".into(),
+                value: JsonValue::Boolean(false),
+            },
+            JsonEntry {
+                key: "b".into(),
+                value: JsonValue::Boolean(true),
+            },
+        ]),
+    };
+    assert_eq!(ordered.stable_digest(), reordered.stable_digest());
+}
+
+#[test]
+fn logical_type_validation_and_matching_are_database_neutral() {
+    let logical = LogicalType::domain(
+        "positive_int",
+        LogicalType::integer(true, 32),
+        vec!["value > 0".into()],
+        true,
+        None,
+        "sha256:domain-1",
+    );
+    logical
+        .validate()
+        .expect("domain definition should validate");
+    assert!(logical.matches_value(&LogicalValue::Domain {
+        value: Box::new(LogicalValue::Integer {
+            signed: true,
+            bits: 32,
+            value: "7".into(),
+        }),
+    }));
+
+    let invalid = LogicalType::array_with_metadata(LogicalType::integer(true, 32), 2, vec![0]);
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn json_v03_replays_raw_and_recursive_values_without_target_metadata() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::io::Cursor;
+
+    let mut transaction = insert_transaction();
+    transaction.changes[0].after.as_mut().unwrap()[0].datum = Datum::Value(LogicalValue::Raw {
+        carrier: RawValueCarrier::new(
+            "custom.codec.v1",
+            "vendor_type",
+            "sha256:source-definition",
+            "binary",
+            URL_SAFE_NO_PAD.encode([1, 2, 3]),
+            Some("010203"),
+        ),
+    });
+    let validated = validate(transaction).expect("raw value with evidence is valid");
+    let encoded = json(&validated).unwrap();
+    assert!(encoded.contains("custom.codec.v1"));
+
+    let mut reader = JsonReader::new(Cursor::new(encoded));
+    let replayed = reader.next_transaction().unwrap().unwrap();
+    reader.finish().unwrap();
+    assert_eq!(
+        replayed.transaction().content_digest(),
+        validated.transaction().content_digest()
+    );
+}
+
+#[test]
+fn contract_errors_expose_stable_categories() {
+    let validation = ChangeEventValidationError::new("bad event");
+    assert_eq!(validation.code(), "change_event.validation_failed");
+    assert_eq!(validation.class(), FailureClass::ChangeEventValidation);
+
+    let source = SourceContractError::new("bad source");
+    assert_eq!(source.code(), "source_contract.invalid");
+    assert_eq!(source.class(), FailureClass::SourceContract);
+
+    let target = TargetCapabilityFailure::new("unsupported target");
+    assert_eq!(target.class(), FailureClass::TargetCapability);
+    assert_eq!(target.stable_code(), "target_capability.unspecified");
+}
+
+#[test]
 fn json_reader_rejects_an_incomplete_transaction() {
     use std::io::{BufReader, Cursor};
 

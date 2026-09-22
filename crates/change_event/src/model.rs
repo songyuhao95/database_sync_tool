@@ -1,10 +1,12 @@
 //! The small, vendor-neutral in-memory model. JSON is its current diagnostic encoding.
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 pub const FORMAT: &str = "cdc.change-event-json.v0.3";
 pub const PREVIOUS_FORMAT: &str = "cdc.change-event-json.v0.2";
 pub const LEGACY_FORMAT: &str = "cdc.change-event-json.v0.1";
 pub const HISTORICAL_FORMAT: &str = "cdc.change-event-json.v0";
+pub const LOGICAL_CONTRACT_FORMAT: &str = "cdc.logical-value.v0.3";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceCursor {
@@ -108,6 +110,8 @@ pub enum Datum {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LogicalValue {
+    /// A nested NULL. Column-level NULL continues to use [`Datum::Null`].
+    Null,
     Boolean {
         value: bool,
     },
@@ -150,6 +154,12 @@ pub enum LogicalValue {
         year: u16,
         month: u8,
         day: u8,
+    },
+    LocalTime {
+        hour: u8,
+        minute: u8,
+        second: u8,
+        microsecond: u32,
     },
     LocalDatetime {
         year: u16,
@@ -214,6 +224,40 @@ pub enum LogicalValue {
     MultiRange {
         ranges: Vec<LogicalValue>,
     },
+    /// An array with PostgreSQL-style structural metadata. The legacy
+    /// `Array` variant remains available for one-dimensional, one-based
+    /// arrays whose source did not expose shape metadata.
+    ArrayWithMetadata {
+        elements: Vec<LogicalValue>,
+        dimensions: u8,
+        lower_bounds: Vec<i32>,
+    },
+    /// A source-invalid temporal value that must not be normalized to NULL.
+    InvalidTemporal {
+        kind: String,
+        raw: String,
+    },
+    Network {
+        family: String,
+        address: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix_length: Option<u8>,
+    },
+    Xml {
+        bytes_base64url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// A domain value retains its underlying value while the domain identity
+    /// and constraints remain part of its LogicalType.
+    Domain {
+        value: Box<LogicalValue>,
+    },
+    /// A value whose native semantics are only available through a verified
+    /// source codec and definition fingerprint.
+    Raw {
+        carrier: RawValueCarrier,
+    },
     Json {
         value: JsonValue,
     },
@@ -273,12 +317,230 @@ pub struct JsonEntry {
     pub value: JsonValue,
 }
 
+/// Evidence-backed carrier for a source value that has no portable logical
+/// representation yet. The byte payload is base64url so the JSON contract is
+/// lossless and does not depend on a text encoding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RawValueCarrier {
+    pub codec_identity: String,
+    pub native_type: String,
+    pub source_definition_digest: String,
+    pub encoding: String,
+    pub raw_bytes_base64url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_text: Option<String>,
+}
+
+impl RawValueCarrier {
+    pub fn new(
+        codec_identity: impl Into<String>,
+        native_type: impl Into<String>,
+        source_definition_digest: impl Into<String>,
+        encoding: impl Into<String>,
+        raw_bytes_base64url: impl Into<String>,
+        canonical_text: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            codec_identity: codec_identity.into(),
+            native_type: native_type.into(),
+            source_definition_digest: source_definition_digest.into(),
+            encoding: encoding.into(),
+            raw_bytes_base64url: raw_bytes_base64url.into(),
+            canonical_text: canonical_text.map(Into::into),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RawValueCarrierError> {
+        for (field, value) in [
+            ("codec_identity", self.codec_identity.as_str()),
+            ("native_type", self.native_type.as_str()),
+            (
+                "source_definition_digest",
+                self.source_definition_digest.as_str(),
+            ),
+            ("encoding", self.encoding.as_str()),
+        ] {
+            if value.trim().is_empty() || value.contains('\0') {
+                return Err(RawValueCarrierError::MissingEvidence { field });
+            }
+        }
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        URL_SAFE_NO_PAD
+            .decode(&self.raw_bytes_base64url)
+            .map_err(|_| RawValueCarrierError::InvalidBytes)
+            .map(|_| ())
+    }
+
+    pub fn stable_digest(&self) -> String {
+        stable_digest(self)
+    }
+
+    pub fn raw_bytes(&self) -> Result<Vec<u8>, RawValueCarrierError> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        self.validate()?;
+        URL_SAFE_NO_PAD
+            .decode(&self.raw_bytes_base64url)
+            .map_err(|_| RawValueCarrierError::InvalidBytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawValueCarrierError {
+    MissingEvidence { field: &'static str },
+    InvalidBytes,
+}
+
+impl RawValueCarrierError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MissingEvidence { .. } => "raw_value_carrier.missing_evidence",
+            Self::InvalidBytes => "raw_value_carrier.invalid_bytes",
+        }
+    }
+}
+
+impl std::fmt::Display for RawValueCarrierError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingEvidence { field } => {
+                write!(formatter, "raw value carrier is missing {field}")
+            }
+            Self::InvalidBytes => {
+                formatter.write_str("raw value carrier bytes are invalid base64url")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RawValueCarrierError {}
+
+impl LogicalValue {
+    pub fn validate(&self) -> Result<(), RawValueValidationError> {
+        crate::validate::validate_value(self)
+            .map_err(|error| RawValueValidationError(error.to_string()))
+    }
+
+    pub fn stable_digest(&self) -> String {
+        stable_digest(&canonicalize_logical_value(self))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawValueValidationError(String);
+
+impl std::fmt::Display for RawValueValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl RawValueValidationError {
+    pub const fn code(&self) -> &'static str {
+        "logical_value.invalid"
+    }
+}
+
+impl std::error::Error for RawValueValidationError {}
+
 /// An ordered, committed batch submitted by a database crate for validation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeTransaction {
     pub source: Source,
     pub id: String,
     pub begin_cursor: SourceCursor,
     pub commit_cursor: SourceCursor,
     pub changes: Vec<RowChange>,
+}
+
+impl ChangeTransaction {
+    pub fn content_digest(&self) -> String {
+        stable_digest(&canonicalize_transaction(self))
+    }
+}
+
+fn canonicalize_transaction(transaction: &ChangeTransaction) -> ChangeTransaction {
+    let mut canonical = transaction.clone();
+    for change in &mut canonical.changes {
+        for image in [&mut change.before, &mut change.after] {
+            if let Some(image) = image {
+                for column in image {
+                    if let Datum::Value(value) = &mut column.datum {
+                        *value = canonicalize_logical_value(value);
+                    }
+                }
+            }
+        }
+    }
+    canonical
+}
+
+fn canonicalize_logical_value(value: &LogicalValue) -> LogicalValue {
+    let mut canonical = value.clone();
+    match &mut canonical {
+        LogicalValue::Set { members } => members.sort(),
+        LogicalValue::Array { elements } | LogicalValue::ArrayWithMetadata { elements, .. } => {
+            for element in elements {
+                *element = canonicalize_logical_value(element);
+            }
+        }
+        LogicalValue::Struct { fields } => {
+            for field in fields {
+                field.value = canonicalize_logical_value(&field.value);
+            }
+        }
+        LogicalValue::Map { entries } => {
+            for entry in entries.iter_mut() {
+                entry.key = canonicalize_logical_value(&entry.key);
+                entry.value = canonicalize_logical_value(&entry.value);
+            }
+            entries.sort_by_key(|entry| entry.key.stable_digest());
+        }
+        LogicalValue::Range { lower, upper, .. } => {
+            if let Some(value) = lower {
+                **value = canonicalize_logical_value(value);
+            }
+            if let Some(value) = upper {
+                **value = canonicalize_logical_value(value);
+            }
+        }
+        LogicalValue::MultiRange { ranges } => {
+            for range in ranges {
+                *range = canonicalize_logical_value(range);
+            }
+        }
+        LogicalValue::Domain { value } => {
+            **value = canonicalize_logical_value(value);
+        }
+        LogicalValue::Json { value } => canonicalize_json_value(value),
+        _ => {}
+    }
+    canonical
+}
+
+fn canonicalize_json_value(value: &mut JsonValue) {
+    match value {
+        JsonValue::Array(items) => {
+            for item in items {
+                canonicalize_json_value(item);
+            }
+        }
+        JsonValue::Object(entries) => {
+            for entry in entries.iter_mut() {
+                canonicalize_json_value(&mut entry.value);
+            }
+            entries.sort_by(|left, right| left.key.cmp(&right.key));
+        }
+        _ => {}
+    }
+}
+
+/// Digest the canonical JSON representation of a contract value. All public
+/// contract types use deterministic struct field order and sequence-preserving
+/// arrays, so the digest is independent of a transport serializer.
+pub fn stable_digest<T: Serialize>(value: &T) -> String {
+    let bytes = serde_json::to_vec(value).expect("contract values must be serializable");
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

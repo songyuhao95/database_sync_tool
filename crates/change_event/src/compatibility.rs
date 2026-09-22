@@ -141,8 +141,21 @@ pub enum LogicalType {
         srid: Option<i32>,
         dimensions: u8,
     },
+    InvalidTemporal {
+        kind: String,
+    },
+    Network {
+        address_family: String,
+        cidr: bool,
+    },
+    Xml,
     Array {
         element: Box<LogicalType>,
+    },
+    ArrayWithMetadata {
+        element: Box<LogicalType>,
+        dimensions: u8,
+        lower_bounds: Vec<i32>,
     },
     Struct {
         fields: Vec<LogicalField>,
@@ -157,9 +170,26 @@ pub enum LogicalType {
     MultiRange {
         element: Box<LogicalType>,
     },
+    Domain {
+        name: String,
+        base: Box<LogicalType>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        constraints: Vec<String>,
+        #[serde(default)]
+        not_null: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collation: Option<String>,
+        definition_digest: String,
+    },
     Opaque {
         source_type: String,
         format: String,
+    },
+    Raw {
+        codec_identity: String,
+        native_type: String,
+        source_definition_digest: String,
+        encoding: String,
     },
 }
 
@@ -209,6 +239,21 @@ impl LogicalType {
         }
     }
 
+    pub fn invalid_temporal(kind: impl Into<String>) -> Self {
+        Self::InvalidTemporal { kind: kind.into() }
+    }
+
+    pub fn network(address_family: impl Into<String>, cidr: bool) -> Self {
+        Self::Network {
+            address_family: address_family.into(),
+            cidr,
+        }
+    }
+
+    pub fn xml() -> Self {
+        Self::Xml
+    }
+
     pub fn date() -> Self {
         Self::Date
     }
@@ -241,6 +286,189 @@ impl LogicalType {
         }
     }
 
+    pub fn array_with_metadata(
+        element: LogicalType,
+        dimensions: u8,
+        lower_bounds: Vec<i32>,
+    ) -> Self {
+        Self::ArrayWithMetadata {
+            element: Box::new(element),
+            dimensions,
+            lower_bounds,
+        }
+    }
+
+    pub fn domain(
+        name: impl Into<String>,
+        base: LogicalType,
+        constraints: Vec<String>,
+        not_null: bool,
+        collation: Option<String>,
+        definition_digest: impl Into<String>,
+    ) -> Self {
+        Self::Domain {
+            name: name.into(),
+            base: Box::new(base),
+            constraints,
+            not_null,
+            collation,
+            definition_digest: definition_digest.into(),
+        }
+    }
+
+    pub fn raw(
+        codec_identity: impl Into<String>,
+        native_type: impl Into<String>,
+        source_definition_digest: impl Into<String>,
+        encoding: impl Into<String>,
+    ) -> Self {
+        Self::Raw {
+            codec_identity: codec_identity.into(),
+            native_type: native_type.into(),
+            source_definition_digest: source_definition_digest.into(),
+            encoding: encoding.into(),
+        }
+    }
+
+    pub fn stable_digest(&self) -> String {
+        crate::stable_digest(self)
+    }
+
+    pub fn validate(&self) -> Result<(), LogicalTypeValidationError> {
+        match self {
+            Self::Integer { bits, .. } if !matches!(bits, 8 | 16 | 24 | 32 | 64) => Err(
+                LogicalTypeValidationError("integer width is invalid".into()),
+            ),
+            Self::Decimal { precision, scale } => {
+                if *precision == 0 || *scale < 0 || *scale > i32::from(*precision) {
+                    Err(LogicalTypeValidationError(
+                        "decimal precision or scale is invalid".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Float { bits } if !matches!(bits, 32 | 64) => Err(LogicalTypeValidationError(
+                "floating point width is invalid".into(),
+            )),
+            Self::Text {
+                charset, collation, ..
+            } => {
+                if charset.trim().is_empty() || charset.contains('\0') {
+                    return Err(LogicalTypeValidationError("text charset is invalid".into()));
+                }
+                if collation
+                    .as_ref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(LogicalTypeValidationError(
+                        "text collation is invalid".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::BitString { length } if *length == 0 => Err(LogicalTypeValidationError(
+                "bit string length must be positive".into(),
+            )),
+            Self::Spatial {
+                subtype,
+                dimensions,
+                ..
+            } => {
+                if subtype.trim().is_empty() || !(2..=4).contains(dimensions) {
+                    Err(LogicalTypeValidationError(
+                        "spatial declaration is invalid".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::InvalidTemporal { kind } => {
+                if kind.trim().is_empty() {
+                    Err(LogicalTypeValidationError(
+                        "invalid temporal kind is empty".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Network { address_family, .. } => {
+                if address_family.trim().is_empty() {
+                    Err(LogicalTypeValidationError("network family is empty".into()))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::ArrayWithMetadata {
+                element,
+                dimensions,
+                lower_bounds,
+            } => {
+                if *dimensions == 0 || usize::from(*dimensions) != lower_bounds.len() {
+                    return Err(LogicalTypeValidationError(
+                        "array dimensions and lower bounds do not agree".into(),
+                    ));
+                }
+                element.validate()
+            }
+            Self::Struct { fields } => {
+                let mut names = std::collections::BTreeSet::new();
+                for field in fields {
+                    if field.name.trim().is_empty() || !names.insert(&field.name) {
+                        return Err(LogicalTypeValidationError(
+                            "structured field names must be unique and non-empty".into(),
+                        ));
+                    }
+                    field.logical_type.validate()?;
+                }
+                Ok(())
+            }
+            Self::Array { element } | Self::Range { element } | Self::MultiRange { element } => {
+                element.validate()
+            }
+            Self::Map { key, value } => {
+                key.validate()?;
+                value.validate()
+            }
+            Self::Domain {
+                name,
+                base,
+                definition_digest,
+                ..
+            } => {
+                if name.trim().is_empty() || definition_digest.trim().is_empty() {
+                    return Err(LogicalTypeValidationError(
+                        "domain identity or definition digest is empty".into(),
+                    ));
+                }
+                base.validate()
+            }
+            Self::Raw {
+                codec_identity,
+                native_type,
+                source_definition_digest,
+                encoding,
+            } => {
+                if [
+                    codec_identity,
+                    native_type,
+                    source_definition_digest,
+                    encoding,
+                ]
+                .iter()
+                .any(|value| value.trim().is_empty() || value.contains('\0'))
+                {
+                    Err(LogicalTypeValidationError(
+                        "raw logical type lacks stable source evidence".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Return the family name used by the legacy summary manifest.
     pub fn family_name(&self) -> &'static str {
         match self {
@@ -262,22 +490,27 @@ impl LogicalType {
             Self::Enum { .. } => "enum",
             Self::Set { .. } => "set",
             Self::Spatial { .. } => "spatial",
+            Self::InvalidTemporal { .. } => "invalid_temporal",
+            Self::Network { .. } => "network",
+            Self::Xml => "xml",
             Self::Array { .. } => "array",
+            Self::ArrayWithMetadata { .. } => "array",
             Self::Struct { .. } => "struct",
             Self::Map { .. } => "map",
             Self::Range { .. } => "range",
             Self::MultiRange { .. } => "multi_range",
+            Self::Domain { .. } => "domain",
             Self::Opaque { .. } => "opaque",
+            Self::Raw { .. } => "raw",
         }
     }
 
-    fn matches_value(&self, value: &LogicalValue) -> bool {
+    pub fn matches_value(&self, value: &LogicalValue) -> bool {
         match (self, value) {
             (Self::Boolean, LogicalValue::Boolean { .. })
             | (Self::Uuid, LogicalValue::Uuid { .. })
-            | (Self::Binary { .. }, LogicalValue::Binary { .. })
-            | (Self::BitString { .. }, LogicalValue::BitString { .. })
             | (Self::Date, LogicalValue::Date { .. })
+            | (Self::LocalTime { .. }, LogicalValue::LocalTime { .. })
             | (Self::Duration { .. }, LogicalValue::Duration { .. })
             | (Self::Year, LogicalValue::Year { .. })
             | (Self::Json { .. }, LogicalValue::Json { .. }) => true,
@@ -290,11 +523,20 @@ impl LogicalType {
                 },
             ) => signed == value_signed && bits == value_bits,
             (
-                Self::Decimal { scale, .. },
-                LogicalValue::Decimal {
-                    scale: value_scale, ..
+                Self::Decimal {
+                    precision, scale, ..
                 },
-            ) => *scale >= 0 && *scale as usize == *value_scale,
+                LogicalValue::Decimal {
+                    unscaled,
+                    scale: value_scale,
+                },
+            ) => {
+                let digits = unscaled.strip_prefix('-').unwrap_or(unscaled);
+                *scale >= 0
+                    && *scale as usize == *value_scale
+                    && !digits.is_empty()
+                    && digits.len() <= usize::from(*precision)
+            }
             (
                 Self::Float { bits },
                 LogicalValue::Float {
@@ -302,12 +544,46 @@ impl LogicalType {
                 },
             ) => bits == value_bits,
             (
-                Self::Text { charset, .. },
-                LogicalValue::Text {
-                    charset: value_charset,
+                Self::Text {
+                    charset,
+                    max_length,
+                    length_unit,
                     ..
                 },
-            ) => charset.eq_ignore_ascii_case(value_charset),
+                LogicalValue::Text {
+                    charset: value_charset,
+                    bytes_base64url,
+                    text,
+                    ..
+                },
+            ) => {
+                if !charset.eq_ignore_ascii_case(value_charset) {
+                    return false;
+                }
+                let Some(max_length) = max_length else {
+                    return true;
+                };
+                let Some(length) = text.as_ref().map(|text| match length_unit {
+                    LengthUnit::Bytes => text.len(),
+                    LengthUnit::Characters => text.chars().count(),
+                }) else {
+                    let Ok(bytes) = URL_SAFE_NO_PAD.decode(bytes_base64url) else {
+                        return false;
+                    };
+                    return u64::try_from(bytes.len()).is_ok_and(|length| length <= *max_length);
+                };
+                u64::try_from(length).is_ok_and(|length| length <= *max_length)
+            }
+            (Self::Binary { max_length }, LogicalValue::Binary { bytes_base64url }) => {
+                max_length.as_ref().is_none_or(|max_length| {
+                    URL_SAFE_NO_PAD.decode(bytes_base64url).is_ok_and(|bytes| {
+                        u64::try_from(bytes.len()).is_ok_and(|len| len <= *max_length)
+                    })
+                })
+            }
+            (Self::BitString { length }, LogicalValue::BitString { bit_length, .. }) => {
+                length == bit_length
+            }
             (Self::Enum { members }, LogicalValue::Enum { label }) => {
                 !members.is_empty() && members.iter().any(|member| member == label)
             }
@@ -340,8 +616,45 @@ impl LogicalType {
                     && srid == value_srid
                     && dimensions == value_dimensions
             }
+            (
+                Self::InvalidTemporal { kind },
+                LogicalValue::InvalidTemporal {
+                    kind: value_kind, ..
+                },
+            ) => kind == value_kind,
+            (
+                Self::Network {
+                    address_family,
+                    cidr,
+                },
+                LogicalValue::Network {
+                    family: value_family,
+                    prefix_length,
+                    ..
+                },
+            ) => {
+                address_family.eq_ignore_ascii_case(value_family)
+                    && (*cidr == prefix_length.is_some())
+            }
+            (Self::Xml, LogicalValue::Xml { .. }) => true,
             (Self::Array { element }, LogicalValue::Array { elements }) => {
                 elements.iter().all(|value| element.matches_value(value))
+            }
+            (
+                Self::ArrayWithMetadata {
+                    element,
+                    dimensions,
+                    lower_bounds,
+                },
+                LogicalValue::ArrayWithMetadata {
+                    elements,
+                    dimensions: value_dimensions,
+                    lower_bounds: value_lower_bounds,
+                },
+            ) => {
+                dimensions == value_dimensions
+                    && lower_bounds == value_lower_bounds
+                    && elements.iter().all(|value| element.matches_value(value))
             }
             (Self::Struct { fields }, LogicalValue::Struct { fields: values }) => {
                 fields.len() == values.len()
@@ -365,10 +678,46 @@ impl LogicalType {
                     _ => false,
                 })
             }
+            (Self::Domain { base, .. }, LogicalValue::Domain { value }) => {
+                base.matches_value(value)
+            }
+            (Self::Domain { base, .. }, value) => base.matches_value(value),
+            (
+                Self::Raw {
+                    codec_identity,
+                    native_type,
+                    source_definition_digest,
+                    encoding,
+                },
+                LogicalValue::Raw { carrier },
+            ) => {
+                codec_identity == &carrier.codec_identity
+                    && native_type == &carrier.native_type
+                    && source_definition_digest == &carrier.source_definition_digest
+                    && encoding == &carrier.encoding
+            }
+            (Self::Opaque { .. }, LogicalValue::Raw { .. }) => true,
             _ => false,
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalTypeValidationError(String);
+
+impl std::fmt::Display for LogicalTypeValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl LogicalTypeValidationError {
+    pub const fn code(&self) -> &'static str {
+        "logical_type.invalid"
+    }
+}
+
+impl std::error::Error for LogicalTypeValidationError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct LogicalField {
@@ -1493,7 +1842,7 @@ fn validate_recursive_plan_value(
         )
     })?;
     let actual = match value {
-        LogicalValue::Array { .. } => "array",
+        LogicalValue::Array { .. } | LogicalValue::ArrayWithMetadata { .. } => "array",
         LogicalValue::Struct { .. } => "struct",
         LogicalValue::Map { .. } => "map",
         LogicalValue::Range { .. } => "range",
@@ -1522,9 +1871,22 @@ fn validate_recursive_value(value: &LogicalValue, depth: usize) -> Result<(), &'
         return Err("recursive value exceeds the maximum structure depth");
     }
     match value {
+        LogicalValue::Null => Ok(()),
         LogicalValue::Array { elements } => elements
             .iter()
             .try_for_each(|element| validate_recursive_value(element, depth + 1)),
+        LogicalValue::ArrayWithMetadata {
+            elements,
+            dimensions,
+            lower_bounds,
+        } => {
+            if *dimensions == 0 || usize::from(*dimensions) != lower_bounds.len() {
+                return Err("array dimensions and lower bounds do not agree");
+            }
+            elements
+                .iter()
+                .try_for_each(|element| validate_recursive_value(element, depth + 1))
+        }
         LogicalValue::Struct { fields } => {
             let mut names = std::collections::BTreeSet::new();
             for field in fields {
@@ -1573,6 +1935,10 @@ fn validate_recursive_value(value: &LogicalValue, depth: usize) -> Result<(), &'
             }
             Ok(())
         }
+        LogicalValue::Domain { value } => validate_recursive_value(value, depth + 1),
+        LogicalValue::Raw { carrier } => carrier
+            .validate()
+            .map_err(|_| "raw value carrier lacks stable source evidence"),
         _ => Ok(()),
     }
 }

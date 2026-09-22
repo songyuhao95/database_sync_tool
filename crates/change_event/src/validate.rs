@@ -9,6 +9,20 @@ use std::{collections::HashSet, fmt};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeEventValidationError(pub(crate) String);
 
+impl ChangeEventValidationError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    pub const fn code(&self) -> &'static str {
+        "change_event.validation_failed"
+    }
+
+    pub const fn class(&self) -> FailureClass {
+        FailureClass::ChangeEventValidation
+    }
+}
+
 /// Backwards-compatible name for generic ChangeEvent validation failures.
 pub type ValidationError = ChangeEventValidationError;
 
@@ -18,6 +32,14 @@ pub struct SourceContractError(pub(crate) String);
 impl SourceContractError {
     pub fn new(message: impl Into<String>) -> Self {
         Self(message.into())
+    }
+
+    pub const fn code(&self) -> &'static str {
+        "source_contract.invalid"
+    }
+
+    pub const fn class(&self) -> FailureClass {
+        FailureClass::SourceContract
     }
 }
 
@@ -186,6 +208,10 @@ impl ValidatedTransaction {
     pub fn transaction(&self) -> &ChangeTransaction {
         &self.0
     }
+
+    pub fn content_digest(&self) -> String {
+        self.0.content_digest()
+    }
 }
 
 pub(crate) type Result<T> = std::result::Result<T, ValidationError>;
@@ -195,6 +221,13 @@ pub(crate) fn ensure(ok: bool, message: &str) -> Result<()> {
     } else {
         Err(ChangeEventValidationError(message.into()))
     }
+}
+
+/// Validate one LogicalValue outside a transaction. Source adapters can use
+/// this seam before assembling a ChangeEvent, while `validate` remains the
+/// transaction-level gate.
+pub fn validate_value(value: &LogicalValue) -> std::result::Result<(), ChangeEventValidationError> {
+    logical_value(value)
 }
 
 /// Validate the database-independent row-only v0.3 contract.
@@ -374,7 +407,7 @@ fn logical_value(value: &LogicalValue) -> Result<()> {
 fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
     ensure(depth <= 100, "logical value nesting exceeds 100")?;
     match value {
-        LogicalValue::Boolean { .. } => Ok(()),
+        LogicalValue::Null | LogicalValue::Boolean { .. } => Ok(()),
         LogicalValue::Uuid { value } => ensure(
             value.len() == 36
                 && value.bytes().enumerate().all(|(i, c)| {
@@ -416,7 +449,10 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             )?;
             bytes(bytes_base64url)
         }
-        LogicalValue::Binary { bytes_base64url } => bytes(bytes_base64url),
+        LogicalValue::Binary { bytes_base64url }
+        | LogicalValue::Xml {
+            bytes_base64url, ..
+        } => bytes(bytes_base64url),
         LogicalValue::BitString {
             bytes_base64url,
             bit_length,
@@ -424,6 +460,15 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             bit_order,
         } => bit_string(bytes_base64url, *bit_length, *padding, *bit_order),
         LogicalValue::Date { year, month, day } => date(*year, *month, *day),
+        LogicalValue::LocalTime {
+            hour,
+            minute,
+            second,
+            microsecond,
+        } => ensure(
+            *hour < 24 && *minute < 60 && *second < 60 && *microsecond < 1_000_000,
+            "invalid local time",
+        ),
         LogicalValue::LocalDatetime {
             year,
             month,
@@ -502,7 +547,9 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             Ok(())
         }
         LogicalValue::Map { entries } => {
+            let mut keys = HashSet::new();
             for entry in entries {
+                ensure(keys.insert(&entry.key), "duplicate map key")?;
                 logical_value_at_depth(&entry.key, depth + 1)?;
                 logical_value_at_depth(&entry.value, depth + 1)?;
             }
@@ -535,6 +582,42 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             }
             Ok(())
         }
+        LogicalValue::ArrayWithMetadata {
+            elements,
+            dimensions,
+            lower_bounds,
+        } => {
+            ensure(
+                *dimensions > 0 && usize::from(*dimensions) == lower_bounds.len(),
+                "array dimensions and lower bounds do not agree",
+            )?;
+            for element in elements {
+                logical_value_at_depth(element, depth + 1)?;
+            }
+            Ok(())
+        }
+        LogicalValue::InvalidTemporal { kind, raw } => ensure(
+            !kind.trim().is_empty() && !raw.is_empty(),
+            "invalid temporal value lacks kind or raw spelling",
+        ),
+        LogicalValue::Network {
+            family,
+            address,
+            prefix_length,
+        } => {
+            ensure(
+                !family.trim().is_empty() && !address.trim().is_empty() && !address.contains('\0'),
+                "network value is incomplete",
+            )?;
+            ensure(
+                prefix_length.is_none_or(|prefix| prefix <= 128),
+                "network prefix is invalid",
+            )
+        }
+        LogicalValue::Domain { value } => logical_value_at_depth(value, depth + 1),
+        LogicalValue::Raw { carrier } => carrier
+            .validate()
+            .map_err(|error| ChangeEventValidationError(format!("{}: {error}", error.code()))),
         LogicalValue::Json { value } => json_value(value, 0),
     }
 }

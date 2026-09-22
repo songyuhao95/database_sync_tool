@@ -16,7 +16,7 @@ pub use model::*;
 pub use reader::JsonReader;
 pub use validate::{
     ChangeEventValidationError, SourceContractError, TargetCapabilityFailure, ValidatedTransaction,
-    ValidationError, validate,
+    ValidationError, validate, validate_value,
 };
 
 /// The outcome of checking the destination's authoritative replication

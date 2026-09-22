@@ -606,10 +606,18 @@ fn parameter_for(value: &LogicalValue) -> io::Result<Parameter> {
         )),
         LogicalValue::Spatial { .. }
         | LogicalValue::Array { .. }
+        | LogicalValue::ArrayWithMetadata { .. }
         | LogicalValue::Struct { .. }
         | LogicalValue::Map { .. }
         | LogicalValue::Range { .. }
-        | LogicalValue::MultiRange { .. } => Err(capability_failure(
+        | LogicalValue::MultiRange { .. }
+        | LogicalValue::Null
+        | LogicalValue::LocalTime { .. }
+        | LogicalValue::InvalidTemporal { .. }
+        | LogicalValue::Network { .. }
+        | LogicalValue::Xml { .. }
+        | LogicalValue::Domain { .. }
+        | LogicalValue::Raw { .. } => Err(capability_failure(
             "PostgreSQL 15 has no qualified target representation for this structured value",
         )),
         LogicalValue::Json { value } => Ok(Parameter::Json(
@@ -756,10 +764,18 @@ fn render_logical_value(value: &LogicalValue) -> io::Result<String> {
         )),
         LogicalValue::Spatial { .. }
         | LogicalValue::Array { .. }
+        | LogicalValue::ArrayWithMetadata { .. }
         | LogicalValue::Struct { .. }
         | LogicalValue::Map { .. }
         | LogicalValue::Range { .. }
-        | LogicalValue::MultiRange { .. } => Err(capability_failure(
+        | LogicalValue::MultiRange { .. }
+        | LogicalValue::Null
+        | LogicalValue::LocalTime { .. }
+        | LogicalValue::InvalidTemporal { .. }
+        | LogicalValue::Network { .. }
+        | LogicalValue::Xml { .. }
+        | LogicalValue::Domain { .. }
+        | LogicalValue::Raw { .. } => Err(capability_failure(
             "PostgreSQL 15 has no qualified SQL rendering for this structured value",
         )),
         LogicalValue::Json { value } => {
