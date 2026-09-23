@@ -659,7 +659,7 @@ impl LogicalType {
                 LogicalTypeValidationError("integer width is invalid".into()),
             ),
             Self::Decimal { precision, scale } => {
-                if *precision == 0 || *scale < 0 || *scale > i32::from(*precision) {
+                if *precision == 0 || *scale < -1000 || *scale > i32::from(*precision) {
                     Err(LogicalTypeValidationError(
                         "decimal precision or scale is invalid".into(),
                     ))
@@ -851,9 +851,11 @@ impl LogicalType {
                 },
             ) => {
                 let digits = unscaled.strip_prefix('-').unwrap_or(unscaled);
-                *scale >= 0
-                    && *scale as usize == *value_scale
-                    && !digits.is_empty()
+                (if *scale < 0 {
+                    *value_scale == 0
+                } else {
+                    *scale as usize == *value_scale
+                }) && !digits.is_empty()
                     && digits.len() <= usize::from(*precision)
             }
             (

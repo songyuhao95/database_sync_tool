@@ -15,6 +15,7 @@ pub(crate) struct Table {
     pub schema: String,
     pub name: String,
     pub identity: u8,
+    pub source_type_catalog_digest: String,
     pub columns: Vec<Column>,
 }
 pub(crate) async fn load(
@@ -40,6 +41,7 @@ pub(crate) async fn load(
         return Err(invalid("publication has no tables"));
     }
     let type_catalog = source_type_catalog(conn).await?;
+    let source_type_catalog_digest = type_catalog.evidence_digest();
     let mut tables = HashMap::new();
     for row in relations {
         let oid = u32::try_from(row.try_get::<i64, _>("oid")?)?;
@@ -101,6 +103,7 @@ pub(crate) async fn load(
                 schema,
                 name,
                 identity: identity.as_bytes()[0],
+                source_type_catalog_digest: source_type_catalog_digest.clone(),
                 columns,
             },
         );

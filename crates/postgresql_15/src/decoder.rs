@@ -228,7 +228,10 @@ impl Decoder {
             operation,
             source_cursor: cursor(p.final_lsn),
             source_timestamp: u32::try_from(seconds)?,
-            schema_basis: format!("pgoutput+catalog:{}", t.oid),
+            schema_basis: format!(
+                "pgoutput+catalog:{}:{}",
+                t.oid, t.source_type_catalog_digest
+            ),
             before,
             after,
         });
@@ -294,6 +297,7 @@ mod tests {
             schema: "public".into(),
             name: "items".into(),
             identity: b'd',
+            source_type_catalog_digest: "0".repeat(64),
             columns: vec![
                 catalog::Column {
                     name: "id".into(),

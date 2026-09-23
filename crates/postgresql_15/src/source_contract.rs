@@ -91,11 +91,17 @@ fn validate_image(
     image: &[ColumnDatum],
     version: &str,
 ) -> Result<(), SourceContractError> {
+    let Some(basis) = change.schema_basis.strip_prefix("pgoutput+catalog:") else {
+        return Err(SourceContractError::new("invalid PostgreSQL schema basis"));
+    };
+    let (oid, digest) = basis
+        .split_once(':')
+        .map_or((basis, None), |(oid, digest)| (oid, Some(digest)));
     ensure(
-        change
-            .schema_basis
-            .strip_prefix("pgoutput+catalog:")
-            .is_some_and(|oid| oid.parse::<u32>().is_ok_and(|value| value > 0)),
+        oid.parse::<u32>().is_ok_and(|value| value > 0)
+            && digest.is_none_or(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
         "invalid PostgreSQL schema basis",
     )?;
     ensure(
@@ -212,10 +218,12 @@ fn valid_parameterized_numeric(native: &str) -> bool {
     let Ok(precision) = precision.trim().parse::<usize>() else {
         return false;
     };
-    let Ok(scale) = scale.trim().parse::<usize>() else {
+    let Ok(scale) = scale.trim().parse::<i32>() else {
         return false;
     };
-    precision > 0 && precision <= 1000 && scale <= precision
+    precision > 0
+        && precision <= 1000
+        && (-1000..=i32::try_from(precision).unwrap()).contains(&scale)
 }
 
 fn valid_parameterized_timestamp(native: &str) -> bool {

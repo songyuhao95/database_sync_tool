@@ -44,12 +44,16 @@ impl SourceTypeCatalog {
         }
     }
 
-    fn digest(&self) -> String {
+    pub fn evidence_digest(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("PostgreSQL type catalog is serializable");
         Sha256::digest(bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    fn digest(&self) -> String {
+        self.evidence_digest()
     }
 }
 
@@ -1109,7 +1113,7 @@ fn numeric(native_type: &str, version: &str) -> Result<LogicalType, SourceTypeMa
         .trim()
         .parse::<i32>()
         .map_err(|_| SourceTypeMappingError::invalid(version, "numeric scale is invalid"))?;
-    if !(1..=1000).contains(&precision) || scale < 0 || scale > i32::from(precision) {
+    if !(1..=1000).contains(&precision) || !(-1000..=i32::from(precision)).contains(&scale) {
         return Err(SourceTypeMappingError::invalid(
             version,
             "numeric precision/scale is outside the ChangeEvent range",
@@ -1292,6 +1296,15 @@ mod tests {
                 collation: None,
             }
         );
+    }
+
+    #[test]
+    fn maps_postgresql_negative_numeric_scale_as_source_evidence() {
+        assert_eq!(
+            source_type_mapping("numeric(2,-3)").unwrap().logical_type,
+            LogicalType::decimal(2, -3)
+        );
+        assert!(validate_native_type_for_version("16", "numeric(2,-3)").is_ok());
     }
 
     #[test]
