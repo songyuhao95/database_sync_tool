@@ -12,7 +12,7 @@
 .task-tree-controls .task-error{max-height:36px;overflow:auto}
 .task-tree-viewport{height:500px;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;background:var(--card)}
 .task-tree-list{min-height:100%}
-.task-tree-row{display:grid;grid-template-columns:24px 20px minmax(90px,1fr) minmax(86px,auto) auto;align-items:center;column-gap:8px;border-bottom:1px solid var(--line);font-size:12px;transition:background .12s,box-shadow .12s}
+.task-tree-row{display:grid;grid-template-columns:24px 20px minmax(90px,1fr) minmax(86px,auto) minmax(56px,auto) auto;align-items:center;column-gap:8px;border-bottom:1px solid var(--line);font-size:12px;transition:background .12s,box-shadow .12s}
 .task-tree-schema{height:42px;padding:0 12px;background:var(--sub);font-weight:600}
 .task-tree-table{height:38px;padding:0 12px 0 34px}
 .task-tree-column{height:34px;padding:0 12px 0 58px}
@@ -28,6 +28,11 @@
 .task-tree-check{width:15px!important;height:15px!important;margin:0!important;accent-color:var(--brand)}
 .task-tree-check-locked{cursor:not-allowed;opacity:1;filter:none}
 .task-tree-row-action{width:72px}
+.task-compatibility-status{font-size:10px!important}
+.task-compatibility-status-equivalent{color:var(--muted)}
+.task-compatibility-status-configured{color:var(--good)}
+.task-compatibility-status-pending,.task-compatibility-status-confirm{color:var(--warn)}
+.task-compatibility-status-blocked{color:var(--bad)}
 .task-compatibility-button{height:25px;padding:0 7px;border:1px solid color-mix(in srgb,var(--warn) 60%,var(--line));border-radius:3px;background:transparent;color:var(--warn);font:inherit;font-size:11px;white-space:nowrap;cursor:pointer}
 .task-compatibility-button:hover{border-color:var(--brand);color:var(--brand);background:var(--soft)}
 .task-tree-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left;font-weight:500}

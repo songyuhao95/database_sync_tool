@@ -68,6 +68,15 @@ fn task_tree_controls_keep_hidden_database_selector_and_error_text_visible() {
     assert!(tasks.contains("compatibilityStatus(response.result)==='NEEDS_CONFIRMATION'"));
     assert!(tasks.contains("这次转换会发生什么"));
     assert!(tasks.contains("可能损失或语义变化"));
+    assert!(tasks.contains("键定位影响"));
+    assert!(tasks.contains("目标前置条件"));
+    assert!(tasks.contains("示例转换"));
+    assert!(tasks.contains("task-compatibility-status"));
+    assert!(tasks.contains("待预检"));
+    assert!(tasks.contains("验证能力"));
+    assert!(tasks.contains("loss.explanation"));
+    assert!(tasks.contains("nullable"));
+    assert!(tasks.contains("target_probe"));
     assert!(tasks.contains("compatibility-technical"));
     assert!(tasks.contains("function compatibilityNormalizedNativeType"));
     assert!(tasks.contains("compatibilityNormalizedNativeType(sourceType)"));

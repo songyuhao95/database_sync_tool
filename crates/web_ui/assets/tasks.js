@@ -162,12 +162,25 @@ function compatibilityHumanSummary(source,sink,result,plan,targetOverride) {
     loss='时间点或本地时间语义按计划保留，超出目标精度的值不静默舍入。';
   }
   const status=String(result?.status||'').toUpperCase();
-  return {difference:difference.join('；'),conversion,risk,loss,status,riskLabel:compatibilityRiskLabel(plan?.risk||result?.risk)};
+  const example=plan?.examples?.[0];
+  const exampleText=example?.source&&example?.target
+    ? example.source+' → '+example.target+'；'+conversionExample(kind,parameters)
+    : conversionExample(kind,parameters);
+  const targetText=conversionTarget(kind,parameters,targetType);
+  const locator={preserved:'保留主键/Row Locator 语义，可用于定位更新和删除',value_only:'仅用于值写入，不得用于主键、唯一键或 Row Locator',blocked:'已阻断：不能用该转换定位行',not_used:'该字段不参与 Row Locator'}[String(plan?.locator_impact||'').toLowerCase()]||'需要按任务的键策略使用；有损转换不可用于键定位';
+  const lossDetails=plan?.loss?.explanation
+    ? plan.loss.explanation+(plan.loss.value||plan.loss.comparison||plan.loss.ordering||plan.loss.constraints?'（计划已标记对应语义风险）':'')
+    : '';
+  if(lossDetails)loss=lossDetails;
+  const targetPrerequisite=plan?.target_probe_digest
+    ? '目的端 '+targetType+' 字段、能力和会话预检已通过；目标定义、扩展或会话变化后必须重新预检。'
+    : '目的端必须预先创建 '+targetType+' 字段，并在启动前完成能力预检；未完成预检前不能把本地同类型判断当作原生等价。';
+  return {difference:difference.join('；'),conversion,target:targetText,example:exampleText,risk,loss,locator,prerequisite:targetPrerequisite,status,riskLabel:compatibilityRiskLabel(plan?.risk||result?.risk)};
 }
 function appendCompatibilitySummary(parent,summary) {
   const section=node('section','compatibility-human-summary');
   section.append(node('h3','','这次转换会发生什么'));
-  [['字段差异',summary.difference],['转换方式',summary.conversion],['可能损失或语义变化',summary.loss],['风险和失败条件',summary.risk],['事务行为','失败时整笔事务回滚，checkpoint 不推进。']].forEach(([label,value])=>{
+  [['字段差异',summary.difference],['转换方式',summary.conversion],['目标结果',summary.target],['示例转换',summary.example],['可能损失或语义变化',summary.loss],['键定位影响',summary.locator],['目标前置条件',summary.prerequisite],['风险和失败条件',summary.risk],['事务行为','失败时整笔事务回滚，checkpoint 不推进。']].forEach(([label,value])=>{
     const row=node('div','compatibility-human-row');row.append(node('b','',label),node('p','',value));section.append(row);
   });
   if(summary.riskLabel)section.append(node('p','compatibility-risk-badge','风险等级：'+summary.riskLabel));
@@ -506,6 +519,7 @@ async function renderTaskDetail(id) {
         const technical=node('details','compatibility-technical'),technicalTitle=node('summary','','查看技术细节');technical.append(technicalTitle);
         if(parameterText)technical.append(node('p','mono','转换参数：'+parameterText));
         if(plan.risk_code)technical.append(node('p','mono','风险代码：'+plan.risk_code));
+        if(plan.target_probe_digest)technical.append(node('p','mono','目标端预检证据：'+plan.target_probe_digest));
         technical.append(node('p','mono','计划摘要：'+(plan.plan_digest||'未知')));
         card.append(technical);
         preview.append(card);
@@ -589,6 +603,16 @@ async function renderTaskAdd() {
       .replace(/\binteger\b/g,'int');
   }
   function compatibilityStatus(result) { return String(result?.status||'').toUpperCase(); }
+  function compatibilityDifferences(sourceTable,sinkTable,source,sink) {
+    const differences=[];
+    if(normalizedNativeType(source.column_type)!==normalizedNativeType(sink.column_type))differences.push('类型');
+    if(String(source.collation||'')!==String(sink.collation||''))differences.push('排序规则');
+    if(Boolean(source.nullable)!==Boolean(sink.nullable))differences.push('可空性');
+    if(String(source.extra||'')!==String(sink.extra||''))differences.push('生成/自增属性');
+    const sourceKey=(sourceTable?.primary_key||[]).indexOf(source.name),sinkKey=(sinkTable?.primary_key||[]).indexOf(sink.name);
+    if(sourceKey!==sinkKey)differences.push('Row Locator 键位');
+    return differences;
+  }
   function nativeLength(value) {
     const match=normalizedNativeType(value).match(/\((\d+)\)/);return match?match[1]:'';
   }
@@ -603,8 +627,31 @@ async function renderTaskAdd() {
     if(!source||!sink)return false;
     const saved=compatibility.get(columnKey(schema,table,column));
     if(compatibilityStatus(saved?.result)==='COMPATIBLE')return false;
-    return normalizedNativeType(source.column_type)!==normalizedNativeType(sink.column_type)
-      ||String(source.collation||'')!==String(sink.collation||'');
+    return compatibilityDifferences(sourceTable,sinkTable,source,sink).length>0;
+  }
+  function compatibilityFieldStatus(schema,table,column) {
+    const sourceTable=tableFor(endpoints.source,schema,table),sinkTable=tableFor(endpoints.sink,schema,table);
+    const source=columnFor(sourceTable,column),sink=columnFor(sinkTable,column);
+    const saved=compatibility.get(columnKey(schema,table,column));
+    const status=compatibilityStatus(saved?.result);
+    if(status==='COMPATIBLE') {
+      const qualification=String(saved.result.qualification||'').toUpperCase();
+      if(qualification==='EXACT')return {className:'equivalent',label:'原生等价'};
+      if(qualification==='RANGE_CHECKED')return {className:'configured',label:'值完整保留'};
+      return {className:'configured',label:'已配置'};
+    }
+    if(status==='NEEDS_CONFIRMATION')return {className:'confirm',label:'需确认'};
+    if(status==='NEEDS_CONFIGURATION')return {className:'pending',label:'需配置'};
+    if(status==='UNSUPPORTED'||status==='BLOCKED'||status==='STALE')return {className:'blocked',label:'不可用'};
+    if(!source||!sink)return {className:'blocked',label:'缺少对应字段'};
+    if(tablePairReason(schema,table))return {className:'blocked',label:'不可用'};
+    if(compatibilityDifferences(sourceTable,sinkTable,source,sink).length)return {className:'pending',label:'需配置'};
+    return {className:'pending',label:'待预检'};
+  }
+  function showCompatibilityEntry(schema,table,column) {
+    const source=columnFor(tableFor(endpoints.source,schema,table),column),sink=columnFor(tableFor(endpoints.sink,schema,table),column);
+    if(!source||!sink)return false;
+    return compatibilityStatus(compatibility.get(columnKey(schema,table,column))?.result)!=='COMPATIBLE';
   }
   function columnPairReason(schema,table,column) {
     const sourceTable=tableFor(endpoints.source,schema,table),sinkTable=tableFor(endpoints.sink,schema,table);
@@ -788,6 +835,8 @@ async function renderTaskAdd() {
       return api('/api/compatibility/preview',{method:'POST',body:JSON.stringify(payload(nextParameters,nextConfirmations))});
     }
     function renderPreview() {
+      if(response?.result&&compatibilityStatus(response.result)!=='COMPATIBLE')
+        compatibility.set(row.key,{parameters:{...parameters},confirmations:[...confirmations],result:response.result});
       content.replaceChildren();
       const sourceLabel='源端：'+compatibilityFieldType(source)+(source.collation?' · '+source.collation:'');
       const sinkLabel='目的端：'+compatibilityFieldType(sink)+(sink.collation?' · '+sink.collation:'');
@@ -907,8 +956,12 @@ async function renderTaskAdd() {
     label.addEventListener('click',()=>focusRow(row.key));
     const meta=node('small',present?'muted':'warn',rowMeta(side,row,entity));
     line.append(expand,checkbox,label,meta);
-    if(row.kind==='column'&&needsCompatibilityOptions(row.schema,row.table,row.column)) {
-      const compatibilityButton=node('button','task-compatibility-button',compatibility.has(row.key)?'调整配置':'兼容选项');
+    if(row.kind==='column'&&present) {
+      const status=compatibilityFieldStatus(row.schema,row.table,row.column);
+      line.append(node('small','task-compatibility-status task-compatibility-status-'+status.className,status.label));
+    }
+    if(row.kind==='column'&&showCompatibilityEntry(row.schema,row.table,row.column)) {
+      const compatibilityButton=node('button','task-compatibility-button',needsCompatibilityOptions(row.schema,row.table,row.column)?(compatibility.has(row.key)?'调整配置':'兼容选项'):'验证能力');
       compatibilityButton.type='button';compatibilityButton.addEventListener('click',event=>{event.stopPropagation();openCompatibility(row);});
       line.append(compatibilityButton);
     } else line.append(node('span','task-tree-row-action'));

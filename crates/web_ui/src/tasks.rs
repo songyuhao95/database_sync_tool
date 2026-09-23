@@ -1050,26 +1050,33 @@ impl Store {
             .find(|column| column.name == input.column)
             .cloned()
             .ok_or(Error::Validation("目的字段不存在或无权访问".into()))?;
+        // Field preview must use the same target-side evidence as task
+        // preflight.  Without this probe the dialog could show a manifest
+        // candidate that the actual target column, extension, or session
+        // cannot qualify.
+        let target_probe = sink.probe_target(&input.schema, &input.table, &input.column)?;
         let source_build = server_build_identity(source_connector, &source.metadata);
         let target_build = server_build_identity(sink_connector, &sink.metadata);
         let route_id = input.draft_id;
         let configuration_revision = format!("{route_id}:r1");
-        let compatibility = crate::registry::field_compatibility_with_source_evidence(
-            source_connector,
-            sink_connector,
-            &source_table,
-            &sink_table,
-            &source_column,
-            &sink_column,
-            &route_id,
-            &configuration_revision,
-            Some(source_build),
-            Some(target_build.clone()),
-            source.source_type_catalog.as_ref(),
-            source_environment_fingerprint(&source.metadata),
-            &input.parameters,
-            &input.confirmations,
-        );
+        let compatibility =
+            crate::registry::field_compatibility_with_source_evidence_and_target_probe(
+                source_connector,
+                sink_connector,
+                &source_table,
+                &sink_table,
+                &source_column,
+                &sink_column,
+                &route_id,
+                &configuration_revision,
+                Some(source_build),
+                Some(target_build.clone()),
+                source.source_type_catalog.as_ref(),
+                source_environment_fingerprint(&source.metadata),
+                &input.parameters,
+                &input.confirmations,
+                Some(&target_probe),
+            );
         let (result, error) = match compatibility {
             Ok(result) => (Some(result), None),
             Err(error) => (

@@ -1,11 +1,16 @@
 use super::super::{
     catalog::{CatalogColumn, CatalogTable},
     registry::{
-        AdapterKind, ConnectorIdentity, SinkRegistry, SourceRegistry,
+        AdapterKind, ConnectorIdentity, SinkRegistry, SourceRegistry, catalog_fingerprint,
         field_compatibility_with_parameters,
+        field_compatibility_with_source_evidence_and_target_probe,
     },
 };
-use change_event::{CompatibilityStatus, RiskConfirmation, ServerBuildIdentity};
+use change_event::{
+    CapabilityProbeEntry, CapabilityProbeStatus, CompatibilityStatus, FailureClass,
+    RiskConfirmation, ServerBuildIdentity, TargetCapabilityProbe, TargetColumnMetadata,
+    TargetSessionProfile,
+};
 use std::collections::BTreeMap;
 
 #[test]
@@ -332,4 +337,68 @@ fn mysql_enum_collation_mismatch_keeps_label_mapping_available() {
             .map(String::as_str),
         Some("enum_label")
     );
+}
+
+#[test]
+fn target_probe_failure_is_reported_as_target_capability_failure() {
+    let source_connector = SourceRegistry
+        .find("mysql", "5.7")
+        .expect("MySQL 5.7 source is registered");
+    let sink_connector = SinkRegistry
+        .find("mysql", "8.0")
+        .expect("MySQL 8.0 sink is registered");
+    let table = CatalogTable {
+        schema: "CDC_test".into(),
+        name: "orders".into(),
+        engine: "InnoDB".into(),
+        primary_key: vec!["id".into()],
+        columns: vec![CatalogColumn {
+            name: "id".into(),
+            column_type: "bigint".into(),
+            nullable: false,
+            extra: String::new(),
+            collation: None,
+            default_value: None,
+        }],
+    };
+    let target_build = ServerBuildIdentity::new("mysql", "oracle", "8.0.36", "mysql-8.0.36");
+    let probe = TargetCapabilityProbe::new(
+        target_build.clone(),
+        "CDC_test",
+        "orders",
+        "id",
+        TargetColumnMetadata::new(catalog_fingerprint(&table)).with_native_type("bigint"),
+        [CapabilityProbeEntry::new(
+            "mysql8.target.capability",
+            CapabilityProbeStatus::Missing,
+        )],
+        [],
+        TargetSessionProfile::new("mysql8-session", std::iter::empty::<(String, String)>()),
+    );
+    let error = field_compatibility_with_source_evidence_and_target_probe(
+        source_connector,
+        sink_connector,
+        &table,
+        &table,
+        &table.columns[0],
+        &table.columns[0],
+        "draft-probe-failure",
+        "draft-probe-failure:r1",
+        Some(ServerBuildIdentity::new(
+            "mysql",
+            "oracle",
+            "5.7.44",
+            "mysql-5.7.44",
+        )),
+        Some(target_build),
+        None,
+        None,
+        &BTreeMap::new(),
+        &[],
+        Some(&probe),
+    )
+    .expect_err("an unqualified target probe must fail closed");
+
+    assert_eq!(error.class(), FailureClass::TargetCapability);
+    assert_eq!(error.code(), "target_capability.probe_not_qualified");
 }
