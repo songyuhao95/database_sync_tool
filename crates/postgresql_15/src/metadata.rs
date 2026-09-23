@@ -88,7 +88,7 @@ pub async fn metadata_for_version(
         )
         .fetch_all(&mut conn)
         .await?;
-        let extensions = sqlx::query(
+        let mut extensions = sqlx::query(
             "SELECT e.extname,e.extversion,n.nspname AS schema
                FROM pg_extension e
                JOIN pg_namespace n ON n.oid=e.extnamespace
@@ -103,9 +103,32 @@ pub async fn metadata_for_version(
                 version: extension.try_get("extversion")?,
                 schema: extension.try_get("schema")?,
                 installed: true,
+                available: true,
+                target_compatible: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+        for extension in sqlx::query(
+            "SELECT name,default_version FROM pg_available_extensions ORDER BY name",
+        )
+        .fetch_all(&mut conn)
+        .await?
+        {
+            let name: String = extension.try_get("name")?;
+            if !extensions
+                .iter()
+                .any(|installed| installed.name.eq_ignore_ascii_case(&name))
+            {
+                extensions.push(SourceExtension {
+                    name,
+                    version: extension.try_get("default_version")?,
+                    schema: String::new(),
+                    installed: false,
+                    available: true,
+                    target_compatible: None,
+                });
+            }
+        }
         let environment_fingerprint = environment_fingerprint([
             row.try_get::<String, _>("database")?,
             row.try_get::<String, _>("encoding")?,

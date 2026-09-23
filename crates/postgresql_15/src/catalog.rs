@@ -39,7 +39,7 @@ pub(crate) async fn load(
     if relations.is_empty() {
         return Err(invalid("publication has no tables"));
     }
-    let type_catalog = load_type_catalog(conn).await?;
+    let type_catalog = source_type_catalog(conn).await?;
     let mut tables = HashMap::new();
     for row in relations {
         let oid = u32::try_from(row.try_get::<i64, _>("oid")?)?;
@@ -111,7 +111,10 @@ pub(crate) async fn load(
 /// Read the recursive PostgreSQL type directory once per capture activation.
 /// The resulting evidence is used to validate every published column before
 /// the replication stream is opened; no row value participates in mapping.
-async fn load_type_catalog(conn: &mut PgConnection) -> Result<crate::SourceTypeCatalog> {
+/// Load the immutable PostgreSQL type and extension directory used by
+/// SourceTypeMapping. Callers should retain the returned snapshot together
+/// with the server build and environment fingerprint from [`crate::Metadata`].
+pub async fn source_type_catalog(conn: &mut PgConnection) -> Result<crate::SourceTypeCatalog> {
     use crate::type_mapping::{SourceTypeDefinition, SourceTypeField};
 
     let rows = sqlx::query(
@@ -226,7 +229,7 @@ async fn load_type_catalog(conn: &mut PgConnection) -> Result<crate::SourceTypeC
         };
         definitions.push(definition);
     }
-    let extensions = sqlx::query(
+    let mut extensions = sqlx::query(
         "SELECT extname,extversion,n.nspname AS schema FROM pg_extension e
           JOIN pg_namespace n ON n.oid=e.extnamespace ORDER BY extname",
     )
@@ -239,9 +242,31 @@ async fn load_type_catalog(conn: &mut PgConnection) -> Result<crate::SourceTypeC
             version: row.try_get("extversion")?,
             schema: row.try_get("schema")?,
             installed: true,
+            available: true,
+            target_compatible: None,
         })
     })
     .collect::<Result<Vec<_>>>()?;
+    for extension in
+        sqlx::query("SELECT name,default_version FROM pg_available_extensions ORDER BY name")
+            .fetch_all(&mut *conn)
+            .await?
+    {
+        let name: String = extension.try_get("name")?;
+        if !extensions
+            .iter()
+            .any(|installed| installed.name.eq_ignore_ascii_case(&name))
+        {
+            extensions.push(crate::SourceExtension {
+                name,
+                version: extension.try_get("default_version")?,
+                schema: String::new(),
+                installed: false,
+                available: true,
+                target_compatible: None,
+            });
+        }
+    }
     Ok(crate::SourceTypeCatalog::with_extensions(
         definitions,
         extensions,

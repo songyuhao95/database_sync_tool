@@ -99,6 +99,7 @@ pub(crate) struct CatalogConnection {
     pub server_uuid: String,
     pub database: Option<String>,
     pub metadata: Metadata,
+    pub source_type_catalog: Option<postgresql_15::SourceTypeCatalog>,
     conn: CatalogBackend,
 }
 
@@ -190,7 +191,7 @@ impl Store {
         .ok_or(Error::Invalid("Web 未注册该数据库连接器"))?;
         if kind == "postgresql" {
             let database_for_connection = database.clone();
-            let (runtime, conn, metadata) = std::thread::spawn(move || {
+            let (runtime, conn, metadata, source_type_catalog) = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -230,7 +231,11 @@ impl Store {
                 let conn = runtime
                     .block_on(PgConnection::connect_with(&options))
                     .map_err(|_| Error::Invalid("数据库连接失败，请检查实例地址和对应账号权限"))?;
-                Ok::<_, Error>((runtime, conn, metadata))
+                let mut conn = conn;
+                let source_type_catalog = runtime
+                    .block_on(postgresql_15::source_type_catalog(&mut conn))
+                    .map_err(|_| Error::Invalid("读取 PostgreSQL 类型目录失败，请检查账号权限"))?;
+                Ok::<_, Error>((runtime, conn, metadata, source_type_catalog))
             })
             .join()
             .map_err(|_| Error::Internal)??;
@@ -239,6 +244,7 @@ impl Store {
                 server_uuid: format!("postgresql:{id}"),
                 database: Some(database),
                 metadata: Metadata::Postgresql(metadata),
+                source_type_catalog: Some(source_type_catalog),
                 conn: CatalogBackend::Postgresql {
                     runtime: Some(runtime),
                     conn,
@@ -276,6 +282,7 @@ impl Store {
                 binlog_row_image: row_image,
                 gtid_mode: gtid,
             },
+            source_type_catalog: None,
             conn: CatalogBackend::Mysql(conn),
         })
     }

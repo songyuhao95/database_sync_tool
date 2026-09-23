@@ -27,6 +27,8 @@ mod auto_start_tests;
 mod registry_tests;
 #[path = "runtime_tests.rs"]
 mod runtime_tests;
+#[path = "source_mapping_tests.rs"]
+mod source_mapping_tests;
 #[path = "task_plan_tests.rs"]
 mod task_plan_tests;
 #[path = "task_tests.rs"]

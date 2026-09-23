@@ -59,6 +59,18 @@ pub struct SourceExtension {
     pub version: String,
     pub schema: String,
     pub installed: bool,
+    /// Whether the server advertises the extension in pg_available_extensions.
+    #[serde(default = "default_available")]
+    pub available: bool,
+    /// Optional target-side qualification result. `Some(false)` is an
+    /// explicit, explainable target block; `None` means target probing has not
+    /// been performed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_compatible: Option<bool>,
+}
+
+fn default_available() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -269,22 +281,24 @@ impl SourceTypeDefinition {
     }
 
     fn finalized(mut self) -> Self {
-        if self.definition_digest.is_empty() {
-            let bytes = serde_json::to_vec(&(
-                self.oid,
-                &self.schema,
-                &self.name,
-                &self.kind,
-                &self.collation,
-            ))
-            .expect("PostgreSQL type definition is serializable");
-            self.definition_digest = Sha256::digest(bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-        }
+        self.definition_digest = expected_definition_digest(&self);
         self
     }
+}
+
+fn expected_definition_digest(definition: &SourceTypeDefinition) -> String {
+    let bytes = serde_json::to_vec(&(
+        definition.oid,
+        &definition.schema,
+        &definition.name,
+        &definition.kind,
+        &definition.collation,
+    ))
+    .expect("PostgreSQL type definition is serializable");
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl SourceTypeField {
@@ -334,6 +348,24 @@ impl SourceTypeMappingError {
             code: format!("postgresql{version}.source_type.codec_unqualified"),
             message: format!(
                 "PostgreSQL {version} type {native_type:?} has no verified source codec"
+            ),
+        }
+    }
+
+    fn extension_unavailable(version: &str, native_type: &str, extension: &str) -> Self {
+        Self {
+            code: format!("postgresql{version}.source_type.extension_unavailable"),
+            message: format!(
+                "PostgreSQL {version} type {native_type:?} requires extension {extension:?}, which is not available"
+            ),
+        }
+    }
+
+    fn extension_target_blocked(version: &str, native_type: &str, extension: &str) -> Self {
+        Self {
+            code: format!("postgresql{version}.source_type.extension_target_blocked"),
+            message: format!(
+                "PostgreSQL {version} type {native_type:?} requires extension {extension:?}, which is not qualified on the target"
             ),
         }
     }
@@ -767,7 +799,17 @@ fn definition_digest(
             ),
         ));
     }
-    Ok(definition.definition_digest.clone())
+    let expected = expected_definition_digest(definition);
+    if definition.definition_digest != expected {
+        return Err(SourceTypeMappingError::invalid(
+            version,
+            format!(
+                "PostgreSQL type {}.{} has a mismatched definition digest",
+                definition.schema, definition.name
+            ),
+        ));
+    }
+    Ok(expected)
 }
 
 fn definition_by_oid<'a>(
@@ -893,14 +935,26 @@ fn logical_type_from_definition(
             encoding,
             logical_type,
         } => {
-            let installed = catalog
+            let extension_state = catalog
                 .extensions
                 .iter()
-                .any(|known| known.installed && known.name.eq_ignore_ascii_case(extension));
-            if !installed {
+                .find(|known| known.name.eq_ignore_ascii_case(extension));
+            if extension_state.is_none_or(|known| !known.installed) {
                 Err(SourceTypeMappingError::missing_catalog(
                     version,
                     &format!("extension {extension} type {}", definition.name),
+                ))
+            } else if extension_state.is_some_and(|known| !known.available) {
+                Err(SourceTypeMappingError::extension_unavailable(
+                    version,
+                    &definition.name,
+                    extension,
+                ))
+            } else if extension_state.is_some_and(|known| known.target_compatible == Some(false)) {
+                Err(SourceTypeMappingError::extension_target_blocked(
+                    version,
+                    &definition.name,
+                    extension,
                 ))
             } else if let Some(logical_type) = logical_type {
                 Ok(logical_type.clone())
@@ -1393,12 +1447,16 @@ mod tests {
                     version: "3.4.0".into(),
                     schema: "public".into(),
                     installed: true,
+                    available: true,
+                    target_compatible: None,
                 },
                 SourceExtension {
                     name: "hstore".into(),
                     version: "1.8".into(),
                     schema: "public".into(),
                     installed: true,
+                    available: true,
+                    target_compatible: None,
                 },
             ],
         );
@@ -1429,6 +1487,33 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "postgresql15.source_type.catalog_required"
+        );
+
+        let mut unavailable = catalog.clone();
+        unavailable.extensions[0].available = false;
+        assert_eq!(
+            source_type_mapping_with_catalog("public.geometry", &unavailable)
+                .unwrap_err()
+                .code(),
+            "postgresql15.source_type.extension_unavailable"
+        );
+
+        let mut target_blocked = catalog.clone();
+        target_blocked.extensions[0].target_compatible = Some(false);
+        assert_eq!(
+            source_type_mapping_with_catalog("public.geometry", &target_blocked)
+                .unwrap_err()
+                .code(),
+            "postgresql15.source_type.extension_target_blocked"
+        );
+
+        let mut forged = SourceTypeDefinition::enum_type(9_004, "public", "forged", ["one", "two"]);
+        forged.definition_digest = "forged".into();
+        assert_eq!(
+            source_type_mapping_with_catalog("public.forged", &SourceTypeCatalog::new([forged]),)
+                .unwrap_err()
+                .code(),
+            "postgresql15.source_type.invalid_declaration"
         );
     }
 }

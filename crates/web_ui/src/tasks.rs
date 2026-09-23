@@ -168,6 +168,11 @@ fn server_build_identity(
     connector: &ConnectorDescriptor,
     metadata: &crate::model::Metadata,
 ) -> change_event::ServerBuildIdentity {
+    if let crate::model::Metadata::Postgresql(metadata) = metadata
+        && let Some(server_build) = &metadata.server_build
+    {
+        return server_build.clone();
+    }
     let server_version = match metadata {
         crate::model::Metadata::Mysql { server_version, .. } => server_version,
         crate::model::Metadata::Postgresql(metadata) => &metadata.server_version,
@@ -178,6 +183,13 @@ fn server_build_identity(
         connector.identity.version,
         server_version.clone(),
     )
+}
+
+fn source_environment_fingerprint(metadata: &crate::model::Metadata) -> Option<&str> {
+    match metadata {
+        crate::model::Metadata::Postgresql(metadata) => metadata.environment_fingerprint.as_deref(),
+        crate::model::Metadata::Mysql { .. } => None,
+    }
 }
 
 fn validate_database_selection(connector: &ConnectorDescriptor, database: &str) -> Result<()> {
@@ -294,10 +306,12 @@ fn plan_field_for_sink(
     confirmations: &[change_event::RiskConfirmation],
     source_build: Option<change_event::ServerBuildIdentity>,
     target_build: Option<change_event::ServerBuildIdentity>,
+    source_type_catalog: Option<&postgresql_15::SourceTypeCatalog>,
+    source_environment_fingerprint: Option<&str>,
 ) -> Result<change_event::ColumnConversionPlan> {
     let fail =
         |reason: &str| Error::Validation(format!("{}.{}：{reason}", source.schema, source.name));
-    let compatibility = crate::registry::field_compatibility_with_parameters(
+    let compatibility = crate::registry::field_compatibility_with_source_evidence(
         source_connector,
         sink_connector,
         source,
@@ -308,6 +322,8 @@ fn plan_field_for_sink(
         configuration_revision,
         source_build,
         target_build,
+        source_type_catalog,
+        source_environment_fingerprint,
         parameters,
         confirmations,
     )
@@ -341,6 +357,8 @@ fn plan_pair_for_sink(
     confirmations: &[change_event::RiskConfirmation],
     source_build: Option<change_event::ServerBuildIdentity>,
     target_build: Option<change_event::ServerBuildIdentity>,
+    source_type_catalog: Option<&postgresql_15::SourceTypeCatalog>,
+    source_environment_fingerprint: Option<&str>,
 ) -> Result<Vec<change_event::ColumnConversionPlan>> {
     let fail =
         |reason: &str| Error::Validation(format!("{}.{}：{reason}", source.schema, source.name));
@@ -377,6 +395,8 @@ fn plan_pair_for_sink(
             confirmations,
             source_build.clone(),
             target_build.clone(),
+            source_type_catalog,
+            source_environment_fingerprint,
         )?);
     }
     Ok(plans)
@@ -398,6 +418,8 @@ fn validate_pair_for_sink(
         "catalog",
         &BTreeMap::new(),
         &[],
+        None,
+        None,
         None,
         None,
     )
@@ -427,6 +449,8 @@ fn plan_selected_pair_for_sink(
     confirmations: &[change_event::RiskConfirmation],
     source_build: Option<change_event::ServerBuildIdentity>,
     target_build: Option<change_event::ServerBuildIdentity>,
+    source_type_catalog: Option<&postgresql_15::SourceTypeCatalog>,
+    source_environment_fingerprint: Option<&str>,
 ) -> Result<Vec<change_event::ColumnConversionPlan>> {
     if columns.is_empty() {
         return plan_pair_for_sink(
@@ -440,6 +464,8 @@ fn plan_selected_pair_for_sink(
             confirmations,
             source_build,
             target_build,
+            source_type_catalog,
+            source_environment_fingerprint,
         );
     }
     let fail =
@@ -485,6 +511,8 @@ fn plan_selected_pair_for_sink(
             confirmations,
             source_build.clone(),
             target_build.clone(),
+            source_type_catalog,
+            source_environment_fingerprint,
         )?);
     }
     for column in &sink.columns {
@@ -522,6 +550,8 @@ fn validate_selected_pair_for_sink(
         "catalog",
         &BTreeMap::new(),
         &[],
+        None,
+        None,
         None,
         None,
     )
@@ -819,6 +849,9 @@ impl Store {
         let mut sink_tables = BTreeMap::new();
         let source_build = server_build_identity(source_connector, &source.metadata);
         let target_build = server_build_identity(sink_connector, &sink.metadata);
+        let source_type_catalog = source.source_type_catalog.clone();
+        let source_environment_fingerprint =
+            source_environment_fingerprint(&source.metadata).map(str::to_owned);
         for schema in input
             .mappings
             .iter()
@@ -863,6 +896,8 @@ impl Store {
                 &input.confirmations,
                 Some(source_build.clone()),
                 Some(target_build.clone()),
+                source_type_catalog.as_ref(),
+                source_environment_fingerprint.as_deref(),
             )?);
         }
         let snapshot = plan_snapshot(

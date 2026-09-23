@@ -47,6 +47,8 @@ fn catalog_mapping_is_recursive_and_extension_qualified() {
             version: "3.4.0".into(),
             schema: "public".into(),
             installed: true,
+            available: true,
+            target_compatible: None,
         }],
     );
 

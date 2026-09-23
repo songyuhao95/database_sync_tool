@@ -10,6 +10,7 @@ mod source_contract;
 mod sql;
 mod type_mapping;
 mod types;
+pub use catalog::source_type_catalog;
 pub use checkpoint::{CheckpointApplyResult, CheckpointWriter, ReplicationCheckpoint};
 pub use compatibility::{
     capability_manifest_for, compatibility_manifest, plan_compatibility,

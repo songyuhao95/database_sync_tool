@@ -93,13 +93,6 @@ const POSTGRES_LOGICAL_TYPES: &[&str] = &[
     "local_time",
     "network",
     "xml",
-    "spatial",
-    "array",
-    "struct",
-    "range",
-    "multi_range",
-    "domain",
-    "raw",
 ];
 const PRESENCE: &[&str] = &["value", "null", "unchanged", "unavailable"];
 const TRANSACTION_CAPABILITIES: ConnectorCapabilities = ConnectorCapabilities {
@@ -310,6 +303,41 @@ impl ConnectorDescriptor {
             ),
         }
     }
+
+    pub(crate) fn source_type_mapping_with_evidence(
+        &self,
+        column: &CatalogColumn,
+        catalog: Option<&postgresql_15::SourceTypeCatalog>,
+        source_build: Option<ServerBuildIdentity>,
+        environment_fingerprint: Option<&str>,
+    ) -> Result<SourceTypeMapping, String> {
+        let Some(catalog) = catalog else {
+            return self.source_type_mapping(column);
+        };
+        let map_with_catalog = |version: &str| match (source_build.clone(), environment_fingerprint)
+        {
+            (Some(build), Some(environment)) => {
+                postgresql_15::source_type_mapping_with_source_evidence_for_version(
+                    version,
+                    &column.column_type,
+                    catalog,
+                    build,
+                    environment,
+                )
+            }
+            _ => postgresql_15::source_type_mapping_with_catalog_for_version(
+                version,
+                &column.column_type,
+                catalog,
+            ),
+        };
+        match self.adapter {
+            AdapterKind::Postgresql15 => map_with_catalog("15").map_err(|error| error.to_string()),
+            AdapterKind::Postgresql16 => map_with_catalog("16").map_err(|error| error.to_string()),
+            AdapterKind::Postgresql17 => map_with_catalog("17").map_err(|error| error.to_string()),
+            _ => self.source_type_mapping(column),
+        }
+    }
 }
 
 /// Build one public field-planning request from catalog metadata.  Both Web
@@ -389,8 +417,76 @@ pub(crate) fn field_compatibility_with_parameters(
     parameters: &BTreeMap<String, String>,
     confirmations: &[change_event::RiskConfirmation],
 ) -> Result<CompatibilityResult, CompatibilityError> {
+    field_compatibility_with_source_evidence(
+        source_connector,
+        sink_connector,
+        source,
+        sink,
+        source_column,
+        sink_column,
+        route_id,
+        configuration_revision,
+        source_build,
+        target_build,
+        None,
+        None,
+        parameters,
+        confirmations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn field_compatibility_with_source_evidence(
+    source_connector: &ConnectorDescriptor,
+    sink_connector: &ConnectorDescriptor,
+    source: &CatalogTable,
+    sink: &CatalogTable,
+    source_column: &CatalogColumn,
+    sink_column: &CatalogColumn,
+    route_id: &str,
+    configuration_revision: &str,
+    source_build: Option<ServerBuildIdentity>,
+    target_build: Option<ServerBuildIdentity>,
+    source_catalog: Option<&postgresql_15::SourceTypeCatalog>,
+    source_environment_fingerprint: Option<&str>,
+    parameters: &BTreeMap<String, String>,
+    confirmations: &[change_event::RiskConfirmation],
+) -> Result<CompatibilityResult, CompatibilityError> {
+    // The task JSON keeps the selected rule beside its user-facing
+    // conversion parameters. These reserved keys are consumed here and are
+    // never forwarded to the rule option validator as arbitrary parameters.
+    let selected_rule = match (
+        parameters.get("__rule_id"),
+        parameters.get("__rule_version"),
+    ) {
+        (Some(id), Some(version)) => Some(change_event::RuleReference {
+            id: id.clone(),
+            version: version.clone(),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(CompatibilityError::InvalidInput(
+                change_event::CompatibilityFailure {
+                    class: change_event::FailureClass::InvalidInput,
+                    code: "compatibility.incomplete_rule_selection".into(),
+                    phase: change_event::FailurePhase::PlanConstruction,
+                    retry: change_event::RetryClassification::NotRetryable,
+                    message: "selected compatibility rule id and version must be provided together"
+                        .into(),
+                },
+            ));
+        }
+    };
+    let mut planner_parameters = parameters.clone();
+    planner_parameters.remove("__rule_id");
+    planner_parameters.remove("__rule_version");
     let source_mapping = source_connector
-        .source_type_mapping(source_column)
+        .source_type_mapping_with_evidence(
+            source_column,
+            source_catalog,
+            source_build.clone(),
+            source_environment_fingerprint,
+        )
         .map_err(|message| {
             CompatibilityError::SourceContract(change_event::CompatibilityFailure {
                 class: change_event::FailureClass::SourceContract,
@@ -461,9 +557,10 @@ pub(crate) fn field_compatibility_with_parameters(
         options: RouteOptions {
             route_id: route_id.into(),
             configuration_revision: configuration_revision.into(),
-            parameters: parameters.clone(),
+            selected_rule,
+            parameters: planner_parameters,
             confirmations: confirmations.to_vec(),
-            ..RouteOptions::default()
+            target_probe: None,
         },
     })
 }
