@@ -17,8 +17,10 @@ pub(crate) fn validate(transaction: &ValidatedTransaction) -> Result<(), SourceC
     )?;
     let version = tx.source.version.split('.').collect::<Vec<_>>();
     ensure(
-        version.len() == 2 && version[0] == "15" && version[1].parse::<u32>().is_ok(),
-        "unsupported PostgreSQL source version; expected 15.x",
+        version.len() == 2
+            && matches!(version[0], "15" | "16" | "17")
+            && version[1].parse::<u32>().is_ok(),
+        "unsupported PostgreSQL source version; expected 15.x, 16.x, or 17.x",
     )?;
     let identity = tx.source.id.split(':').collect::<Vec<_>>();
     ensure(
@@ -76,7 +78,7 @@ pub(crate) fn validate(transaction: &ValidatedTransaction) -> Result<(), SourceC
         )?;
         for (is_before, image) in [(true, &change.before), (false, &change.after)] {
             if let Some(image) = image {
-                validate_image(change, is_before, image)?;
+                validate_image(change, is_before, image, version[0])?;
             }
         }
     }
@@ -87,6 +89,7 @@ fn validate_image(
     change: &change_event::RowChange,
     is_before: bool,
     image: &[ColumnDatum],
+    version: &str,
 ) -> Result<(), SourceContractError> {
     ensure(
         change
@@ -114,10 +117,10 @@ fn validate_image(
             "generated PostgreSQL columns are unsupported",
         )?;
         validate_presence(change.operation, is_before, column)?;
-        validate_native_type(&column.native_type)?;
+        validate_native_type_for_version(version, &column.native_type)?;
         if let Datum::Value(value) = &column.datum {
             ensure(
-                logical_matches_native(value, &column.native_type),
+                logical_matches_native(value, &column.native_type, version),
                 "PostgreSQL native/logical type mismatch",
             )?;
         }
@@ -147,7 +150,10 @@ fn validate_presence(
     }
 }
 
-fn validate_native_type(native_type: &str) -> Result<(), SourceContractError> {
+fn validate_native_type_for_version(
+    version: &str,
+    native_type: &str,
+) -> Result<(), SourceContractError> {
     let native = native_type.trim().to_ascii_lowercase();
     let supported = matches!(
         native.as_str(),
@@ -161,15 +167,24 @@ fn validate_native_type(native_type: &str) -> Result<(), SourceContractError> {
             | "text"
             | "bytea"
             | "date"
+            | "time"
+            | "time without time zone"
+            | "inet"
+            | "cidr"
+            | "macaddr"
+            | "macaddr8"
+            | "xml"
             | "jsonb"
+            | "json"
             | "timestamp without time zone"
             | "timestamp with time zone"
     ) || valid_character(&native)
-        || native == "numeric"
         || valid_parameterized_numeric(&native)
         || valid_parameterized_timestamp(&native)
+        || valid_parameterized_time(&native)
+        || valid_parameterized_bit(&native)
         || (native.starts_with("enum(")
-            && crate::type_mapping::validate_native_type(native_type).is_ok());
+            && crate::type_mapping::validate_native_type_for_version(version, native_type).is_ok());
     ensure(supported, "unsupported PostgreSQL native type")
 }
 
@@ -214,8 +229,9 @@ fn valid_parameterized_timestamp(native: &str) -> bool {
         && matches!(suffix, "without time zone" | "with time zone")
 }
 
-fn logical_matches_native(value: &LogicalValue, native_type: &str) -> bool {
-    let native = native_type.trim().to_ascii_lowercase();
+fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str) -> bool {
+    let native_raw = native_type.trim();
+    let native = native_raw.to_ascii_lowercase();
     match value {
         LogicalValue::Boolean { .. } => native == "boolean",
         LogicalValue::Uuid { .. } => native == "uuid",
@@ -234,7 +250,7 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str) -> bool {
             bits: 64,
             ..
         } => native == "bigint",
-        LogicalValue::Decimal { .. } => native == "numeric" || valid_parameterized_numeric(&native),
+        LogicalValue::Decimal { .. } => valid_parameterized_numeric(&native),
         LogicalValue::Float { bits: 32, .. } => native == "real",
         LogicalValue::Float { bits: 64, .. } => native == "double precision",
         LogicalValue::Text { charset, .. } => {
@@ -242,6 +258,11 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str) -> bool {
         }
         LogicalValue::Binary { .. } => native == "bytea",
         LogicalValue::Date { .. } => native == "date",
+        LogicalValue::LocalTime { .. } => {
+            native == "time"
+                || native == "time without time zone"
+                || valid_parameterized_time(&native)
+        }
         LogicalValue::LocalDatetime { .. } => {
             native.ends_with("without time zone")
                 && (native.starts_with("timestamp") || valid_parameterized_timestamp(&native))
@@ -250,11 +271,74 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str) -> bool {
             native.ends_with("with time zone")
                 && (native.starts_with("timestamp") || valid_parameterized_timestamp(&native))
         }
-        LogicalValue::Json { .. } => native == "jsonb",
-        LogicalValue::Enum { label } => native.starts_with("enum(") && !label.is_empty(),
+        LogicalValue::Json { .. } => native == "jsonb" || native == "json",
+        LogicalValue::BitString { .. } => native == "bit" || valid_parameterized_bit(&native),
+        LogicalValue::Network {
+            family,
+            address,
+            prefix_length,
+        } => valid_network(&native, family, address, *prefix_length),
+        LogicalValue::Xml { .. } => native == "xml",
+        LogicalValue::Enum { label } => {
+            if !native.starts_with("enum(") || label.is_empty() {
+                false
+            } else {
+                crate::type_mapping::source_type_mapping_for_version(version, native_raw)
+                    .ok()
+                    .and_then(|mapping| match mapping.logical_type {
+                        change_event::LogicalType::Enum { members } => Some(members),
+                        _ => None,
+                    })
+                    .is_some_and(|members| members.iter().any(|member| member == label))
+            }
+        }
         LogicalValue::Duration { .. } | LogicalValue::Year { .. } => false,
         _ => false,
     }
+}
+
+fn valid_network(native: &str, family: &str, address: &str, prefix_length: Option<u8>) -> bool {
+    match native {
+        "inet" | "cidr" => {
+            let Ok(parsed) = address.parse::<std::net::IpAddr>() else {
+                return false;
+            };
+            let is_v6 = parsed.is_ipv6();
+            if (family == "ipv6") != is_v6 || (family != "ipv6" && family != "ipv4") {
+                return false;
+            }
+            prefix_length.is_none_or(|prefix| prefix <= if is_v6 { 128 } else { 32 })
+        }
+        "macaddr" | "macaddr8" => {
+            let expected = if native == "macaddr" { 6 } else { 8 };
+            family == native
+                && address.split(':').count() == expected
+                && address.split(':').all(|part| {
+                    part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                && prefix_length.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn valid_parameterized_bit(native: &str) -> bool {
+    ["bit(", "bit varying(", "varbit("]
+        .iter()
+        .find_map(|prefix| native.strip_prefix(prefix))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(|length| length.parse::<u64>().is_ok_and(|value| value > 0))
+}
+
+fn valid_parameterized_time(native: &str) -> bool {
+    let Some(rest) = native.strip_prefix("time(") else {
+        return false;
+    };
+    let Some((precision, suffix)) = rest.split_once(")") else {
+        return false;
+    };
+    precision.trim().parse::<u8>().is_ok_and(|value| value <= 6)
+        && matches!(suffix.trim(), "" | "without time zone")
 }
 
 fn lsn(cursor: &SourceCursor) -> Result<u64, SourceContractError> {

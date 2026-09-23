@@ -13,6 +13,7 @@ struct Pending {
 }
 pub(crate) struct Decoder {
     pub source: Source,
+    source_version: String,
     database: String,
     tables: HashMap<u32, Table>,
     seen: HashSet<u32>,
@@ -27,8 +28,10 @@ impl Decoder {
         tables: HashMap<u32, Table>,
         max_bytes: usize,
     ) -> Self {
+        let source_version = source.version.split('.').next().unwrap_or("15").to_owned();
         Self {
             source,
+            source_version,
             database,
             tables,
             seen: HashSet::new(),
@@ -132,7 +135,7 @@ impl Decoder {
             }
             M::Insert { relation_id, tuple } => {
                 let t = self.table(relation_id)?;
-                let after = image(t, &tuple, false)?;
+                let after = image(t, &tuple, false, &self.source_version)?;
                 self.row(relation_id, Operation::Insert, None, Some(after))?;
             }
             M::Update {
@@ -142,10 +145,12 @@ impl Decoder {
                 key_type,
             } => {
                 let t = self.table(relation_id)?;
-                let after = image(t, &new_tuple, false)?;
+                let after = image(t, &new_tuple, false, &self.source_version)?;
                 let before = match (key_type, old_tuple) {
-                    (Some('K'), Some(old)) => image(t, &old, true)?,
-                    (Some('O'), Some(old)) if t.identity == b'f' => image(t, &old, false)?,
+                    (Some('K'), Some(old)) => image(t, &old, true, &self.source_version)?,
+                    (Some('O'), Some(old)) if t.identity == b'f' => {
+                        image(t, &old, false, &self.source_version)?
+                    }
                     (None, None) if t.identity == b'd' => after
                         .iter()
                         .map(|c| {
@@ -171,7 +176,7 @@ impl Decoder {
                     'O' if t.identity == b'f' => false,
                     _ => return Err(invalid("invalid DELETE identity")),
                 };
-                let before = image(t, &old_tuple, key_only)?;
+                let before = image(t, &old_tuple, key_only, &self.source_version)?;
                 self.row(relation_id, Operation::Delete, Some(before), None)?;
             }
             M::Truncate { .. } => {
@@ -230,7 +235,12 @@ impl Decoder {
         Ok(())
     }
 }
-fn image(table: &Table, tuple: &TupleData, key_only: bool) -> Result<Vec<ColumnDatum>> {
+fn image(
+    table: &Table,
+    tuple: &TupleData,
+    key_only: bool,
+    version: &str,
+) -> Result<Vec<ColumnDatum>> {
     if tuple.columns.len() != table.columns.len() {
         return Err(invalid("tuple column count differs from Relation"));
     }
@@ -246,7 +256,8 @@ fn image(table: &Table, tuple: &TupleData, key_only: bool) -> Result<Vec<ColumnD
                 match data.data_type {
                     b'n' => Datum::Null,
                     b'u' => Datum::Unchanged,
-                    b't' => Datum::Value(types::decode_column(
+                    b't' => Datum::Value(types::decode_column_for_version(
+                        version,
                         meta.oid,
                         &meta.native_type,
                         data.as_bytes(),

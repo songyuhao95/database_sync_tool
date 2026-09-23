@@ -1,0 +1,9 @@
+[package]
+name = "postgresql_17"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+change_event.workspace = true
+postgresql_15 = { path = "../postgresql_15" }

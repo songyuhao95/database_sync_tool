@@ -66,6 +66,18 @@ pub struct Replication {
 }
 /// Opens an existing slot, or explicitly creates a new one. No automatic reconnect/slot recreation.
 pub async fn replication(config: Config) -> Result<Replication> {
+    replication_for_version(config, 15).await
+}
+
+/// Open a PostgreSQL logical replication source for one supported server
+/// major. The protocol and recovery contract are shared by 15/16/17, while
+/// the server major remains part of Source identity and catalog evidence.
+pub async fn replication_for_version(config: Config, expected_major: u16) -> Result<Replication> {
+    if !matches!(expected_major, 15..=17) {
+        return Err(invalid(
+            "PostgreSQL SourceAdapter supports versions 15, 16, and 17",
+        ));
+    }
     if config.slot.is_empty()
         || config.slot.len() > 63
         || !config
@@ -109,15 +121,15 @@ pub async fn replication(config: Config) -> Result<Replication> {
     let settings=sqlx::query("SELECT current_setting('server_version_num')::integer AS version,current_setting('wal_level') AS wal_level,current_setting('server_encoding') AS encoding,(SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid")
         .fetch_one(&mut sql).await?;
     let version: i32 = settings.try_get("version")?;
-    if version / 10000 != 15
+    if version / 10000 != i32::from(expected_major)
         || settings.try_get::<String, _>("wal_level")? != "logical"
         || settings.try_get::<String, _>("encoding")? != "UTF8"
     {
         return Err(invalid(
-            "requires PostgreSQL 15, wal_level=logical and UTF8 database encoding",
+            "requires PostgreSQL 15, 16, or 17, wal_level=logical and UTF8 database encoding",
         ));
     }
-    let tables = catalog::load(&mut sql, &config.publication).await?;
+    let tables = catalog::load(&mut sql, &config.publication, expected_major).await?;
     let slot=sqlx::query("SELECT database,plugin,slot_type,active,temporary,wal_status,confirmed_flush_lsn::text AS confirmed FROM pg_replication_slots WHERE slot_name=$1")
         .bind(&config.slot).fetch_optional(&mut sql).await?;
     if config.create_slot && slot.is_some() {
@@ -176,7 +188,7 @@ pub async fn replication(config: Config) -> Result<Replication> {
     }
     let source = Source {
         kind: "postgresql".into(),
-        version: format!("15.{}", version % 10000),
+        version: format!("{expected_major}.{}", version % 10000),
         id: format!(
             "postgresql:{system}:{timeline}:{}:{}",
             settings.try_get::<i64, _>("database_oid")?,

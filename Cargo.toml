@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/change_event", "crates/mysql_source_contract", "crates/mysql_5_7", "crates/mysql_8_0", "crates/mysql_8_4", "crates/web_ui", "crates/postgresql_15"]
+members = ["crates/change_event", "crates/mysql_source_contract", "crates/mysql_5_7", "crates/mysql_8_0", "crates/mysql_8_4", "crates/web_ui", "crates/postgresql_15", "crates/postgresql_16", "crates/postgresql_17"]
 resolver = "3"
 
 [workspace.package]

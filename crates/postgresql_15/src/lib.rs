@@ -2,7 +2,7 @@
 mod catalog;
 mod compatibility;
 mod metadata;
-pub use metadata::{Metadata, databases, metadata};
+pub use metadata::{Metadata, databases, metadata, metadata_for_version};
 mod checkpoint;
 mod decoder;
 mod replication;
@@ -16,15 +16,19 @@ pub use compatibility::{
     structured_capability_manifest, target_capability_manifest,
 };
 pub use pg_walstream::CancellationToken;
-pub use replication::{Config, Replication, replication};
+pub use replication::{Config, Replication, replication, replication_for_version};
 pub use sql::{
     ApplyResult, CAPABILITY_MANIFEST, Parameter, SinkAdapter, SnapshotSql, SqlTransaction,
     TargetConfig, capability_manifest, classify_apply_error, commit_outcome_unknown, execute,
     snapshot_sql, sql,
 };
 pub use type_mapping::{
-    MAPPING_VERSION, SourceTypeMappingError, map_source_type, source_type_mapping,
-    validate_native_type,
+    MAPPING_VERSION, MAPPING_VERSION_16, MAPPING_VERSION_17, SourceExtension, SourceTypeCatalog,
+    SourceTypeDefinition, SourceTypeDefinitionKind, SourceTypeField, SourceTypeMappingError,
+    map_source_type, source_type_mapping, source_type_mapping_for_version,
+    source_type_mapping_with_catalog, source_type_mapping_with_catalog_for_version,
+    source_type_mapping_with_source_evidence, source_type_mapping_with_source_evidence_for_version,
+    validate_native_type, validate_native_type_for_version,
 };
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

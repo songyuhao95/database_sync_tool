@@ -7,7 +7,7 @@
 
 use change_event::{
     ConnectorIdentity, DuplicateKeyPolicy, JsonProfile, LengthUnit, LogicalField, LogicalType,
-    SourceTypeMapping,
+    ServerBuildIdentity, SourceTypeMapping,
 };
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, error::Error, fmt};
@@ -127,6 +127,7 @@ impl SourceTypeDefinition {
             collation: None,
             definition_digest: String::new(),
         }
+        .finalized()
     }
 
     pub fn enum_type(
@@ -145,6 +146,7 @@ impl SourceTypeDefinition {
             collation: None,
             definition_digest: String::new(),
         }
+        .finalized()
     }
 
     pub fn domain(
@@ -168,6 +170,7 @@ impl SourceTypeDefinition {
             collation,
             definition_digest: String::new(),
         }
+        .finalized()
     }
 
     pub fn composite(
@@ -186,6 +189,7 @@ impl SourceTypeDefinition {
             collation: None,
             definition_digest: String::new(),
         }
+        .finalized()
     }
 
     pub fn array(
@@ -202,6 +206,7 @@ impl SourceTypeDefinition {
             collation: None,
             definition_digest: String::new(),
         }
+        .finalized()
     }
 
     pub fn range(
@@ -218,6 +223,7 @@ impl SourceTypeDefinition {
             collation: None,
             definition_digest: String::new(),
         }
+        .finalized()
     }
 
     pub fn multi_range(
@@ -234,6 +240,7 @@ impl SourceTypeDefinition {
             collation: None,
             definition_digest: String::new(),
         }
+        .finalized()
     }
 
     pub fn extension(
@@ -258,6 +265,25 @@ impl SourceTypeDefinition {
             collation: None,
             definition_digest: String::new(),
         }
+        .finalized()
+    }
+
+    fn finalized(mut self) -> Self {
+        if self.definition_digest.is_empty() {
+            let bytes = serde_json::to_vec(&(
+                self.oid,
+                &self.schema,
+                &self.name,
+                &self.kind,
+                &self.collation,
+            ))
+            .expect("PostgreSQL type definition is serializable");
+            self.definition_digest = Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+        }
+        self
     }
 }
 
@@ -353,6 +379,21 @@ pub fn source_type_mapping_with_catalog(
     source_type_mapping_with_catalog_for_version("15", native_type, catalog)
 }
 
+pub fn source_type_mapping_with_source_evidence(
+    native_type: &str,
+    catalog: &SourceTypeCatalog,
+    source_build: ServerBuildIdentity,
+    environment_fingerprint: impl Into<String>,
+) -> Result<SourceTypeMapping, SourceTypeMappingError> {
+    source_type_mapping_with_source_evidence_for_version(
+        "15",
+        native_type,
+        catalog,
+        source_build,
+        environment_fingerprint,
+    )
+}
+
 pub fn source_type_mapping_with_catalog_for_version(
     version: &str,
     native_type: &str,
@@ -364,6 +405,17 @@ pub fn source_type_mapping_with_catalog_for_version(
     logical_type
         .validate()
         .map_err(|error| SourceTypeMappingError::invalid(version, error.to_string()))?;
+    let source_definition_fingerprint = if array_declaration(&native_type).is_some()
+        || base_name(&native_type).eq_ignore_ascii_case("enum")
+        || logical_type_from_builtin(&native_type, version)?.is_some()
+    {
+        None
+    } else {
+        Some(definition_digest(
+            find_definition(&native_type, catalog, version)?,
+            version,
+        )?)
+    };
     let base = base_name(&native_type).to_ascii_lowercase();
     let mapping_version = mapping_version(version);
     let mapping_id = format!("postgresql{version}.source-type.{base}");
@@ -380,10 +432,32 @@ pub fn source_type_mapping_with_catalog_for_version(
         mapping_id,
         mapping_version,
         evidence_digest: Some(evidence_digest),
-        source_definition_fingerprint: None,
+        source_definition_fingerprint,
         source_build: None,
         environment_fingerprint: None,
     })
+}
+
+/// Bind a mapping to the exact server and semantic session that qualified it.
+/// The plain mapping functions remain useful for static planning; live source
+/// activation should use this form after collecting [`crate::Metadata`].
+pub fn source_type_mapping_with_source_evidence_for_version(
+    version: &str,
+    native_type: &str,
+    catalog: &SourceTypeCatalog,
+    source_build: ServerBuildIdentity,
+    environment_fingerprint: impl Into<String>,
+) -> Result<SourceTypeMapping, SourceTypeMappingError> {
+    let mapping = source_type_mapping_with_catalog_for_version(version, native_type, catalog)?;
+    let definition_fingerprint = mapping
+        .source_definition_fingerprint
+        .clone()
+        .unwrap_or_else(|| catalog.digest());
+    Ok(mapping.with_source_evidence(
+        definition_fingerprint,
+        source_build,
+        environment_fingerprint,
+    ))
 }
 
 pub fn map_source_type(native_type: &str) -> Result<SourceTypeMapping, SourceTypeMappingError> {
@@ -495,7 +569,7 @@ fn logical_type_from_builtin(
         "oid" | "xid" | "cid" => Ok(LogicalType::integer(false, 32)),
         "real" => Ok(LogicalType::float(32)),
         "double precision" => Ok(LogicalType::float(64)),
-        "text" | "character varying" | "varchar" => Ok(LogicalType::Text {
+        "text" | "character" | "char" | "character varying" | "varchar" => Ok(LogicalType::Text {
             charset: "UTF8".into(),
             max_length: None,
             length_unit: LengthUnit::Characters,
@@ -546,6 +620,16 @@ fn logical_type_from_builtin(
             }
             Ok(LogicalType::bit_string(length))
         }
+        _ if native_type.starts_with("varbit(") => {
+            let length = parenthesized_u64(native_type, "varbit", version)?;
+            if !(1..=10_000_000).contains(&length) {
+                return Err(SourceTypeMappingError::invalid(
+                    version,
+                    "varbit length must be positive and bounded",
+                ));
+            }
+            Ok(LogicalType::bit_string(length))
+        }
         _ if native_type.starts_with("geometry(") => spatial(native_type, version),
         _ if native_type.starts_with("character varying(")
             || native_type.starts_with("varchar(") =>
@@ -570,7 +654,24 @@ fn logical_type_from_builtin(
             })
         }
         _ if native_type.starts_with("character(") || native_type.starts_with("char(") => {
-            Err(SourceTypeMappingError::unsupported(version, native_type))
+            let prefix = if native_type.starts_with("char(") {
+                "char"
+            } else {
+                "character"
+            };
+            let length = parenthesized_u64(native_type, prefix, version)?;
+            if length == 0 {
+                return Err(SourceTypeMappingError::invalid(
+                    version,
+                    "character length must be positive",
+                ));
+            }
+            Ok(LogicalType::Text {
+                charset: "UTF8".into(),
+                max_length: Some(length),
+                length_unit: LengthUnit::Characters,
+                collation: None,
+            })
         }
         _ if native_type.starts_with("time(") => time(native_type, version),
         _ if native_type.starts_with("timestamp") => timestamp(native_type, version),
@@ -653,16 +754,20 @@ fn find_definition<'a>(
     Ok(definition)
 }
 
-fn definition_digest(definition: &SourceTypeDefinition, catalog: &SourceTypeCatalog) -> String {
-    if !definition.definition_digest.trim().is_empty() {
-        return definition.definition_digest.clone();
+fn definition_digest(
+    definition: &SourceTypeDefinition,
+    version: &str,
+) -> Result<String, SourceTypeMappingError> {
+    if definition.definition_digest.trim().is_empty() {
+        return Err(SourceTypeMappingError::invalid(
+            version,
+            format!(
+                "PostgreSQL type {}.{} is missing a stable definition digest",
+                definition.schema, definition.name
+            ),
+        ));
     }
-    let bytes = serde_json::to_vec(&(definition, &catalog.extensions))
-        .expect("PostgreSQL type definition is serializable");
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    Ok(definition.definition_digest.clone())
 }
 
 fn definition_by_oid<'a>(
@@ -722,7 +827,7 @@ fn logical_type_from_definition(
                 constraints.clone(),
                 *not_null,
                 definition.collation.clone(),
-                definition_digest(definition, catalog),
+                definition_digest(definition, version)?,
             ))
         }
         SourceTypeDefinitionKind::Composite { fields } => {
@@ -817,7 +922,7 @@ fn logical_type_from_definition(
                 Ok(LogicalType::raw(
                     codec_identity,
                     format!("{}.{}", definition.schema, definition.name),
-                    definition_digest(definition, catalog),
+                    definition_digest(definition, version)?,
                     encoding,
                 ))
             }
@@ -1137,7 +1242,7 @@ mod tests {
 
     #[test]
     fn blocks_unproven_json_arrays_and_unbounded_numeric() {
-        for native_type in ["integer[]", "numeric", "character(10)"] {
+        for native_type in ["integer[]", "numeric"] {
             assert!(source_type_mapping(native_type).is_err(), "{native_type}");
         }
     }
@@ -1176,6 +1281,19 @@ mod tests {
         assert_ne!(pg15.mapping_version, pg16.mapping_version);
         assert_ne!(pg16.evidence_digest, pg17.evidence_digest);
         assert!(source_type_mapping_for_version("14", "integer").is_err());
+        let qualified = source_type_mapping_with_source_evidence(
+            "integer",
+            &SourceTypeCatalog::default(),
+            ServerBuildIdentity::new("postgresql", "community", "15.19", "postgres-15.19"),
+            "environment-1",
+        )
+        .unwrap();
+        assert!(qualified.source_build.is_some());
+        assert_eq!(
+            qualified.environment_fingerprint.as_deref(),
+            Some("environment-1")
+        );
+        assert!(qualified.source_definition_fingerprint.is_some());
     }
 
     #[test]
