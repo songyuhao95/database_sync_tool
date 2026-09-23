@@ -143,6 +143,21 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
             );
         }
     }
+    for charset in ["utf8mb4", "utf8", "latin1", "ascii"] {
+        for max_length in 1..=255 {
+            add_exact(
+                &mut capabilities,
+                LogicalType::Text {
+                    charset: charset.to_owned(),
+                    max_length: Some(max_length),
+                    length_unit: change_event::LengthUnit::Characters,
+                    collation: None,
+                },
+                format!("char({max_length})"),
+                format!("text.{charset}.char.{max_length}"),
+            );
+        }
+    }
     for max_length in text_lengths() {
         add_exact(
             &mut capabilities,
@@ -375,9 +390,20 @@ pub fn capability_manifest_for(target_build: ServerBuildIdentity) -> TargetCapab
 pub fn plan_compatibility(
     input: CompatibilityInput<'_>,
 ) -> Result<CompatibilityResult, CompatibilityError> {
+    let collation_is_configurable = matches!(
+        &input.source_field.logical_type,
+        LogicalType::Text { .. } | LogicalType::Enum { .. } | LogicalType::Set { .. }
+    );
+    let source_mapping_matches = input.source_type_mapping.connector == input.source_connector
+        && input.source_type_mapping.logical_type == input.source_field.logical_type
+        && input
+            .source_type_mapping
+            .native_type
+            .eq_ignore_ascii_case(&input.source_field.native_type);
     if input.source_field.collation.is_some()
         && input.target_field.collation.is_some()
         && input.source_field.collation != input.target_field.collation
+        && (!collation_is_configurable || !source_mapping_matches)
         && input.options.parameters.is_empty()
         && input.options.selected_rule.is_none()
     {
@@ -824,6 +850,7 @@ fn text_target_types() -> Vec<String> {
             "mediumtext".into(),
             "longtext".into(),
         ])
+        .chain((1u64..=255).map(|length| format!("char({length})")))
         .collect()
 }
 
@@ -1016,6 +1043,20 @@ mod tests {
                     length_unit: change_event::LengthUnit::Characters,
                     collation: None,
                 }
+        }));
+    }
+
+    #[test]
+    fn text_conversion_manifest_includes_precreated_char_targets() {
+        let manifest = compatibility_manifest(build());
+        assert!(manifest.capabilities.iter().any(|entry| {
+            entry.target.native_type == "char(255)"
+                && entry
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("text")
         }));
     }
 }

@@ -190,8 +190,24 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
                     .all(|member| !member.is_empty() && !member.contains('\0'))
         }
         LogicalValue::Boolean { .. } | LogicalValue::Uuid { .. } => false,
-        LogicalValue::Spatial { .. }
-        | LogicalValue::Array { .. }
+        LogicalValue::Spatial {
+            geometry_type,
+            dimensions,
+            ..
+        } => {
+            matches!(
+                base,
+                "point"
+                    | "linestring"
+                    | "polygon"
+                    | "multipoint"
+                    | "multilinestring"
+                    | "multipolygon"
+                    | "geometrycollection"
+            ) && base.eq_ignore_ascii_case(geometry_type)
+                && (2..=4).contains(dimensions)
+        }
+        LogicalValue::Array { .. }
         | LogicalValue::ArrayWithMetadata { .. }
         | LogicalValue::Struct { .. }
         | LogicalValue::Map { .. }
@@ -199,11 +215,15 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
         | LogicalValue::MultiRange { .. }
         | LogicalValue::Null
         | LogicalValue::LocalTime { .. }
-        | LogicalValue::InvalidTemporal { .. }
         | LogicalValue::Network { .. }
         | LogicalValue::Xml { .. }
         | LogicalValue::Domain { .. }
         | LogicalValue::Raw { .. } => false,
+        LogicalValue::InvalidTemporal { kind, raw } => {
+            matches!(base, "date" | "datetime" | "timestamp")
+                && !kind.trim().is_empty()
+                && !raw.trim().is_empty()
+        }
     };
     ensure(valid, "MySQL native type does not match LogicalValue")
 }

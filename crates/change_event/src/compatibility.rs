@@ -58,6 +58,323 @@ impl ServerBuildIdentity {
     }
 }
 
+/// The state observed for one target-side capability or extension prerequisite.
+///
+/// The states are intentionally not collapsed into a boolean.  An installed
+/// extension is evidence that a target can load it, while a qualified
+/// capability additionally requires the connector's versioned evidence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityProbeStatus {
+    Detected,
+    Available,
+    Installed,
+    Qualified,
+    Missing,
+    PermissionDenied,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CapabilityProbeEntry {
+    pub identity: String,
+    pub status: CapabilityProbeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<String>,
+}
+
+impl CapabilityProbeEntry {
+    pub fn new(identity: impl Into<String>, status: CapabilityProbeStatus) -> Self {
+        Self {
+            identity: identity.into(),
+            status,
+            version: None,
+            evidence_digest: None,
+        }
+    }
+
+    pub fn qualified(identity: impl Into<String>) -> Self {
+        Self::new(identity, CapabilityProbeStatus::Qualified)
+    }
+
+    pub fn installed(identity: impl Into<String>) -> Self {
+        Self::new(identity, CapabilityProbeStatus::Installed)
+    }
+
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    pub fn with_evidence_digest(mut self, digest: impl Into<String>) -> Self {
+        self.evidence_digest = Some(digest.into());
+        self
+    }
+}
+
+/// Catalog evidence for the exact target column bound by a plan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TargetColumnMetadata {
+    pub definition_fingerprint: String,
+    #[serde(default)]
+    pub native_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_oid: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typmod: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexes: Vec<String>,
+}
+
+impl TargetColumnMetadata {
+    pub fn new(definition_fingerprint: impl Into<String>) -> Self {
+        Self {
+            definition_fingerprint: definition_fingerprint.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_native_type(mut self, native_type: impl Into<String>) -> Self {
+        self.native_type = native_type.into();
+        self
+    }
+
+    pub fn with_precision(mut self, precision: u32) -> Self {
+        self.precision = Some(precision);
+        self
+    }
+
+    pub fn with_scale(mut self, scale: i32) -> Self {
+        self.scale = Some(scale);
+        self
+    }
+
+    pub fn with_length(mut self, length: u64) -> Self {
+        self.length = Some(length);
+        self
+    }
+
+    pub fn with_charset(mut self, charset: impl Into<String>) -> Self {
+        self.charset = Some(charset.into());
+        self
+    }
+
+    pub fn with_collation(mut self, collation: impl Into<String>) -> Self {
+        self.collation = Some(collation.into());
+        self
+    }
+
+    pub fn with_timezone(mut self, timezone: impl Into<String>) -> Self {
+        self.timezone = Some(timezone.into());
+        self
+    }
+
+    pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    pub fn with_extension(mut self, extension: impl Into<String>) -> Self {
+        self.extension = Some(extension.into());
+        self
+    }
+
+    pub fn with_constraints<I, S>(mut self, constraints: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.constraints = constraints.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_indexes<I, S>(mut self, indexes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.indexes = indexes.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// The complete target session identity used while qualifying one plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TargetSessionProfile {
+    pub identity: String,
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+}
+
+impl TargetSessionProfile {
+    pub fn new<I, K, V>(identity: impl Into<String>, settings: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        Self {
+            identity: identity.into(),
+            settings: settings
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        }
+    }
+}
+
+/// Immutable target-side evidence collected during preflight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetCapabilityProbe {
+    pub target_build: ServerBuildIdentity,
+    pub database: String,
+    pub table: String,
+    pub column: String,
+    pub column_metadata: TargetColumnMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<CapabilityProbeEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<CapabilityProbeEntry>,
+    pub session: TargetSessionProfile,
+    pub digest: String,
+}
+
+impl TargetCapabilityProbe {
+    pub fn new<I, J>(
+        target_build: ServerBuildIdentity,
+        database: impl Into<String>,
+        table: impl Into<String>,
+        column: impl Into<String>,
+        column_metadata: TargetColumnMetadata,
+        capabilities: I,
+        extensions: J,
+        session: TargetSessionProfile,
+    ) -> Self
+    where
+        I: IntoIterator<Item = CapabilityProbeEntry>,
+        J: IntoIterator<Item = CapabilityProbeEntry>,
+    {
+        let mut probe = Self {
+            target_build,
+            database: database.into(),
+            table: table.into(),
+            column: column.into(),
+            column_metadata,
+            capabilities: capabilities.into_iter().collect(),
+            extensions: extensions.into_iter().collect(),
+            session,
+            digest: String::new(),
+        };
+        probe.refresh_digest();
+        probe
+    }
+
+    pub fn computed_digest(&self) -> String {
+        digest_of(&ProbeDigestInput {
+            target_build: &self.target_build,
+            database: &self.database,
+            table: &self.table,
+            column: &self.column,
+            column_metadata: &self.column_metadata,
+            capabilities: &self.capabilities,
+            extensions: &self.extensions,
+            session: &self.session,
+        })
+    }
+
+    pub fn refresh_digest(&mut self) {
+        self.digest = self.computed_digest();
+    }
+
+    pub fn verify_digest(&self) -> bool {
+        !self.digest.is_empty() && self.digest == self.computed_digest()
+    }
+
+    /// A probe is usable only when every capability has qualification evidence
+    /// and every extension prerequisite is at least installed.  Installed is
+    /// deliberately not accepted for capability entries.
+    pub fn is_qualified(&self) -> bool {
+        !self.capabilities.is_empty()
+            && self
+                .capabilities
+                .iter()
+                .all(|entry| entry.status == CapabilityProbeStatus::Qualified)
+            && self.extensions.iter().all(|entry| {
+                matches!(
+                    entry.status,
+                    CapabilityProbeStatus::Installed | CapabilityProbeStatus::Qualified
+                )
+            })
+    }
+
+    pub fn validate(&self) -> Result<(), TargetCapabilityFailure> {
+        if !self.verify_digest() {
+            return Err(
+                TargetCapabilityFailure::new("target capability probe digest is invalid")
+                    .with_code("target_capability.invalid_probe"),
+            );
+        }
+        if self.database.trim().is_empty()
+            || self.table.trim().is_empty()
+            || self.column.trim().is_empty()
+            || self
+                .column_metadata
+                .definition_fingerprint
+                .trim()
+                .is_empty()
+            || self.session.identity.trim().is_empty()
+            || self.capabilities.is_empty()
+        {
+            return Err(TargetCapabilityFailure::new(
+                "target capability probe is missing target identity evidence",
+            )
+            .with_code("target_capability.incomplete_probe"));
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        for entry in self.capabilities.iter().chain(&self.extensions) {
+            if entry.identity.trim().is_empty() || !identities.insert(&entry.identity) {
+                return Err(TargetCapabilityFailure::new(
+                    "target capability probe contains an empty or duplicate evidence identity",
+                )
+                .with_code("target_capability.invalid_probe"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct ProbeDigestInput<'a> {
+    target_build: &'a ServerBuildIdentity,
+    database: &'a str,
+    table: &'a str,
+    column: &'a str,
+    column_metadata: &'a TargetColumnMetadata,
+    capabilities: &'a [CapabilityProbeEntry],
+    extensions: &'a [CapabilityProbeEntry],
+    session: &'a TargetSessionProfile,
+}
+
 /// An immutable source definition identity. The target has its own independent
 /// instance of this type; the two fingerprints are never conflated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -776,6 +1093,12 @@ pub struct SourceTypeMapping {
     pub mapping_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_definition_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_build: Option<ServerBuildIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_fingerprint: Option<String>,
 }
 
 impl SourceTypeMapping {
@@ -793,7 +1116,34 @@ impl SourceTypeMapping {
             mapping_id: mapping_id.into(),
             mapping_version: mapping_version.into(),
             evidence_digest: None,
+            source_definition_fingerprint: None,
+            source_build: None,
+            environment_fingerprint: None,
         }
+    }
+
+    /// Bind a mapping to the immutable source definition, exact server build,
+    /// and semantic environment that qualified its interpretation.
+    pub fn with_source_evidence(
+        mut self,
+        source_definition_fingerprint: impl Into<String>,
+        source_build: ServerBuildIdentity,
+        environment_fingerprint: impl Into<String>,
+    ) -> Self {
+        self.source_definition_fingerprint = Some(source_definition_fingerprint.into());
+        self.source_build = Some(source_build);
+        self.environment_fingerprint = Some(environment_fingerprint.into());
+        self.evidence_digest = Some(crate::stable_digest(&(
+            &self.connector,
+            &self.native_type,
+            &self.logical_type,
+            &self.mapping_id,
+            &self.mapping_version,
+            &self.source_definition_fingerprint,
+            &self.source_build,
+            &self.environment_fingerprint,
+        )));
+        self
     }
 }
 
@@ -834,6 +1184,104 @@ pub enum RiskLevel {
     Medium,
     High,
     Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct LossAssessment {
+    /// Whether the selected representation can lose source value semantics.
+    pub value: bool,
+    /// Whether target equality/uniqueness comparison can differ.
+    pub comparison: bool,
+    /// Whether ordering semantics can differ.
+    pub ordering: bool,
+    /// Whether source constraints require an explicit target policy.
+    pub constraints: bool,
+    pub explanation: String,
+}
+
+impl Default for LossAssessment {
+    fn default() -> Self {
+        Self {
+            value: false,
+            comparison: false,
+            ordering: false,
+            constraints: false,
+            explanation: String::new(),
+        }
+    }
+}
+
+impl LossAssessment {
+    fn for_qualification(qualification: QualificationLevel, key_like: bool) -> Self {
+        match qualification {
+            QualificationLevel::Exact => Self {
+                value: false,
+                comparison: false,
+                ordering: false,
+                constraints: false,
+                explanation: "source semantics are preserved by the qualified target representation"
+                    .into(),
+            },
+            QualificationLevel::RangeChecked => Self {
+                value: false,
+                comparison: false,
+                ordering: false,
+                constraints: false,
+                explanation: "values are preserved when the declared target range check passes"
+                    .into(),
+            },
+            QualificationLevel::ExplicitConversion => Self {
+                value: true,
+                comparison: key_like,
+                ordering: key_like,
+                constraints: true,
+                explanation: "the selected rule is an explicit semantic conversion and carries a declared guarantee downgrade"
+                    .into(),
+            },
+            QualificationLevel::Unsupported => Self {
+                value: true,
+                comparison: true,
+                ordering: true,
+                constraints: true,
+                explanation: "no qualified target representation exists".into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ConversionExample {
+    pub source: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LocatorImpact {
+    Preserved,
+    NotUsed,
+    ValueOnly,
+    Blocked,
+}
+
+impl Default for LocatorImpact {
+    fn default() -> Self {
+        Self::NotUsed
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanConfirmationState {
+    NotRequired,
+    Required,
+    Confirmed,
+}
+
+impl Default for PlanConfirmationState {
+    fn default() -> Self {
+        Self::NotRequired
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1045,6 +1493,15 @@ impl TargetCapabilityManifest {
             if capability.rule.qualification == QualificationLevel::Unsupported {
                 continue;
             }
+            if capability.rule.qualification == QualificationLevel::ExplicitConversion
+                && capability.rule.allows_key
+            {
+                return Err(CompatibilityError::TargetCapability(Box::new(
+                    TargetCapabilityFailure::manifest(
+                        "an explicit conversion cannot be qualified for a key or Row Locator",
+                    ),
+                )));
+            }
             if capability.rule.supported_operations.is_empty()
                 || capability.rule.supported_presence.is_empty()
             {
@@ -1116,6 +1573,11 @@ pub struct RouteOptions {
     pub parameters: BTreeMap<String, String>,
     #[serde(default)]
     pub confirmations: Vec<RiskConfirmation>,
+    /// Optional target preflight evidence.  Legacy callers may omit it while
+    /// connectors migrate to probe-backed activation; when present it is
+    /// always part of the immutable plan identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_probe: Option<TargetCapabilityProbe>,
 }
 
 pub type CompatibilityOptions = RouteOptions;
@@ -3275,12 +3737,24 @@ pub struct ColumnConversionPlan {
     pub source_mapping_version: String,
     pub target: TargetRepresentation,
     pub rule: RuleReference,
+    #[serde(default)]
+    pub rule_digest: String,
     pub capability_code: String,
     pub capability_manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_probe_digest: Option<String>,
     pub qualification: QualificationLevel,
     pub risk: RiskLevel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_code: Option<String>,
+    #[serde(default)]
+    pub loss: LossAssessment,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<ConversionExample>,
+    #[serde(default)]
+    pub locator_impact: LocatorImpact,
+    #[serde(default)]
+    pub confirmation: PlanConfirmationState,
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
     pub failure_policy: FailurePolicy,
@@ -3308,11 +3782,16 @@ impl ColumnConversionPlan {
             source_mapping_version: &self.source_mapping_version,
             target: &self.target,
             rule: &self.rule,
+            rule_digest: &self.rule_digest,
             capability_code: &self.capability_code,
             capability_manifest_digest: &self.capability_manifest_digest,
+            target_probe_digest: &self.target_probe_digest,
             qualification: self.qualification,
             risk: self.risk,
             risk_code: &self.risk_code,
+            loss: &self.loss,
+            examples: &self.examples,
+            locator_impact: self.locator_impact,
             parameters: &self.parameters,
             failure_policy: self.failure_policy,
             input_digest: &self.input_digest,
@@ -3340,22 +3819,41 @@ impl ColumnConversionPlan {
                 "the stored ColumnConversionPlan digest is invalid",
             )));
         }
+        let current_probe_digest = input
+            .options
+            .target_probe
+            .as_ref()
+            .map(|probe| probe.digest.clone());
+        if self.target_probe_digest != current_probe_digest {
+            return Err(CompatibilityError::PlanInvalidated(
+                CompatibilityFailure::new(
+                    FailureClass::StaleInput,
+                    "compatibility.plan_inputs_changed",
+                    FailurePhase::PlanConstruction,
+                    "target capability, column, extension, or session evidence changed; requalification is required",
+                ),
+            ));
+        }
         let result = explain_compatibility(input)?;
         let Some(current) = result.plan else {
-            return Err(CompatibilityError::StaleInput(CompatibilityFailure::new(
-                FailureClass::StaleInput,
-                "compatibility.plan_no_longer_qualifies",
-                FailurePhase::PlanConstruction,
-                "the stored ColumnConversionPlan no longer qualifies for current inputs",
-            )));
+            return Err(CompatibilityError::PlanInvalidated(
+                CompatibilityFailure::new(
+                    FailureClass::StaleInput,
+                    "compatibility.plan_no_longer_qualifies",
+                    FailurePhase::PlanConstruction,
+                    "the stored ColumnConversionPlan no longer qualifies for current inputs",
+                ),
+            ));
         };
         if current.plan_digest != self.plan_digest {
-            return Err(CompatibilityError::StaleInput(CompatibilityFailure::new(
-                FailureClass::StaleInput,
-                "compatibility.plan_inputs_changed",
-                FailurePhase::PlanConstruction,
-                "ColumnConversionPlan inputs changed; requalification is required",
-            )));
+            return Err(CompatibilityError::PlanInvalidated(
+                CompatibilityFailure::new(
+                    FailureClass::StaleInput,
+                    "compatibility.plan_inputs_changed",
+                    FailurePhase::PlanConstruction,
+                    "ColumnConversionPlan inputs changed; requalification is required",
+                ),
+            ));
         }
         Ok(())
     }
@@ -3376,11 +3874,16 @@ struct PlanDigestInput<'a> {
     source_mapping_version: &'a str,
     target: &'a TargetRepresentation,
     rule: &'a RuleReference,
+    rule_digest: &'a str,
     capability_code: &'a str,
     capability_manifest_digest: &'a str,
+    target_probe_digest: &'a Option<String>,
     qualification: QualificationLevel,
     risk: RiskLevel,
     risk_code: &'a Option<String>,
+    loss: &'a LossAssessment,
+    examples: &'a [ConversionExample],
+    locator_impact: LocatorImpact,
     parameters: &'a BTreeMap<String, String>,
     failure_policy: FailurePolicy,
     input_digest: &'a str,
@@ -3417,6 +3920,7 @@ struct InputDigest<'a> {
     source_build: &'a Option<ServerBuildIdentity>,
     target_build: &'a Option<ServerBuildIdentity>,
     manifest_digest: &'a str,
+    target_probe_digest: &'a Option<String>,
     options: RouteOptionsDigest<'a>,
     candidate: &'a TargetTypeCandidate,
 }
@@ -3435,6 +3939,7 @@ pub enum CompatibilityError {
     SourceContract(CompatibilityFailure),
     TargetCapability(Box<TargetCapabilityFailure>),
     StaleInput(CompatibilityFailure),
+    PlanInvalidated(CompatibilityFailure),
 }
 
 impl CompatibilityError {
@@ -3442,7 +3947,8 @@ impl CompatibilityError {
         match self {
             Self::InvalidInput(failure)
             | Self::SourceContract(failure)
-            | Self::StaleInput(failure) => failure.class,
+            | Self::StaleInput(failure)
+            | Self::PlanInvalidated(failure) => failure.class,
             Self::TargetCapability(_) => FailureClass::TargetCapability,
         }
     }
@@ -3451,7 +3957,8 @@ impl CompatibilityError {
         match self {
             Self::InvalidInput(failure)
             | Self::SourceContract(failure)
-            | Self::StaleInput(failure) => &failure.code,
+            | Self::StaleInput(failure)
+            | Self::PlanInvalidated(failure) => &failure.code,
             Self::TargetCapability(failure) => &failure.code,
         }
     }
@@ -3462,7 +3969,8 @@ impl fmt::Display for CompatibilityError {
         match self {
             Self::InvalidInput(failure)
             | Self::SourceContract(failure)
-            | Self::StaleInput(failure) => f.write_str(&failure.message),
+            | Self::StaleInput(failure)
+            | Self::PlanInvalidated(failure) => f.write_str(&failure.message),
             Self::TargetCapability(failure) => failure.fmt(f),
         }
     }
@@ -3528,6 +4036,9 @@ pub fn explain_compatibility(
         .filter(|capability| {
             capability_matches_source(capability, &input.source_field.logical_type)
                 && capability.rule.qualification != QualificationLevel::Unsupported
+        })
+        .filter(|capability| {
+            probe_qualifies_capability(input.options.target_probe.as_ref(), capability)
         })
         .filter(|capability| target_representation_matches_binding(capability, &input.target_field))
         .filter(|capability| {
@@ -3753,13 +4264,16 @@ pub fn explain_compatibility(
 
     let mut normalized_input = input.clone();
     normalized_input.options.parameters = parameters;
-    let plan = build_plan(&normalized_input, &candidate, &capability.rule);
+    let mut plan = build_plan(&normalized_input, &candidate, &capability.rule);
     let confirmed = candidate.requires_confirmation
         && input
             .options
             .confirmations
             .iter()
             .any(|confirmation| plan.confirmation_matches(confirmation));
+    if confirmed {
+        plan.confirmation = PlanConfirmationState::Confirmed;
+    }
     let needs_confirmation = candidate.requires_confirmation && !confirmed;
     let status = if needs_confirmation {
         CompatibilityStatus::NeedsConfirmation
@@ -3867,6 +4381,9 @@ pub fn explain_field_compatibility(
         .filter(|capability| {
             capability_matches_source(capability, &input.source_field.logical_type)
                 && capability.rule.qualification != QualificationLevel::Unsupported
+        })
+        .filter(|capability| {
+            probe_qualifies_capability(input.options.target_probe.as_ref(), capability)
         })
         .filter(|capability| target_representation_matches_binding(capability, &input.target_field))
         .filter(|capability| {
@@ -4071,13 +4588,16 @@ pub fn explain_field_compatibility(
         ));
     }
 
-    let plan = build_field_plan(&input, &candidate, &capability.rule, &parameters);
+    let mut plan = build_field_plan(&input, &candidate, &capability.rule, &parameters);
     let confirmed = candidate.requires_confirmation
         && input
             .options
             .confirmations
             .iter()
             .any(|confirmation| plan.confirmation_matches(confirmation));
+    if confirmed {
+        plan.confirmation = PlanConfirmationState::Confirmed;
+    }
     let needs_confirmation = candidate.requires_confirmation && !confirmed;
     let (status, reason_code, explanation, failure) = if needs_confirmation {
         (
@@ -4163,6 +4683,34 @@ fn validate_field_input(input: &FieldCompatibilityInput<'_>) -> Result<(), Compa
             "source and target field definitions are incomplete",
         ));
     }
+    let collation_mismatch = if input.source_connector == input.sink_connector {
+        input.source_field.collation != input.target_field.collation
+    } else {
+        input.source_field.collation.is_some()
+            && input.target_field.collation.is_some()
+            && input.source_field.collation != input.target_field.collation
+    };
+    // Text-like values can carry a target-side collation policy.  ENUM and
+    // SET values are label/member semantics, so a collation difference must
+    // not prevent the exact label/member plan from being selected.  For
+    // other logical values a catalog collation is evidence of malformed
+    // metadata, so retain the fail-closed contract instead of inventing a
+    // conversion.
+    let collation_is_configurable = matches!(
+        &input.source_field.logical_type,
+        LogicalType::Text { .. } | LogicalType::Enum { .. } | LogicalType::Set { .. }
+    );
+    if collation_mismatch
+        && !collation_is_configurable
+        && input.options.parameters.is_empty()
+        && input.options.selected_rule.is_none()
+    {
+        return Err(CompatibilityError::TargetCapability(Box::new(
+            TargetCapabilityFailure::new("source and target field collations are not equivalent")
+                .with_code("target_capability.collation_mismatch")
+                .with_route(input.options.route_id.clone()),
+        )));
+    }
     if input.source_type_mapping.connector != input.source_connector
         || input.source_type_mapping.logical_type != input.source_field.logical_type
         || !input
@@ -4180,23 +4728,6 @@ fn validate_field_input(input: &FieldCompatibilityInput<'_>) -> Result<(), Compa
                 "the SourceTypeMapping does not describe the selected source field",
             ),
         ));
-    }
-    let collation_mismatch = if input.source_connector == input.sink_connector {
-        input.source_field.collation != input.target_field.collation
-    } else {
-        input.source_field.collation.is_some()
-            && input.target_field.collation.is_some()
-            && input.source_field.collation != input.target_field.collation
-    };
-    if collation_mismatch
-        && input.options.parameters.is_empty()
-        && input.options.selected_rule.is_none()
-    {
-        return Err(CompatibilityError::TargetCapability(Box::new(
-            TargetCapabilityFailure::new("source and target field collations are not equivalent")
-                .with_code("target_capability.collation_mismatch")
-                .with_route(input.options.route_id.clone()),
-        )));
     }
     if input.manifest.connector != input.sink_connector {
         return Err(CompatibilityError::StaleInput(CompatibilityFailure::new(
@@ -4225,6 +4756,12 @@ fn validate_field_input(input: &FieldCompatibilityInput<'_>) -> Result<(), Compa
         ));
     }
     input.manifest.validate()?;
+    validate_target_probe(
+        input.options.target_probe.as_ref(),
+        &input.target_field,
+        &input.manifest.target_build,
+        &input.options.route_id,
+    )?;
     Ok(())
 }
 
@@ -4841,6 +5378,11 @@ fn build_field_plan(
         source_build: &input.source_build,
         target_build: &input.target_build,
         manifest_digest: &input.manifest.digest,
+        target_probe_digest: &input
+            .options
+            .target_probe
+            .as_ref()
+            .map(|probe| probe.digest.clone()),
         operations: &input.operations,
         presences: &input.presences,
         options: RouteOptionsDigest {
@@ -4899,11 +5441,37 @@ fn build_field_plan(
         source_mapping_version: input.source_type_mapping.mapping_version.clone(),
         target,
         rule: candidate.rule.clone(),
+        rule_digest: digest_of(rule),
         capability_code: candidate.capability_code.clone(),
         capability_manifest_digest: input.manifest.digest.clone(),
+        target_probe_digest: input
+            .options
+            .target_probe
+            .as_ref()
+            .map(|probe| probe.digest.clone()),
         qualification: candidate.qualification,
         risk: candidate.risk,
         risk_code: candidate.risk_code.clone(),
+        loss: LossAssessment::for_qualification(
+            candidate.qualification,
+            is_key_like(&input.source_field),
+        ),
+        examples: vec![ConversionExample {
+            source: input.source_field.logical_type.family_name().into(),
+            target: input.target_field.native_type.clone(),
+        }],
+        locator_impact: if is_key_like(&input.source_field) {
+            LocatorImpact::Preserved
+        } else if rule.qualification == QualificationLevel::ExplicitConversion {
+            LocatorImpact::ValueOnly
+        } else {
+            LocatorImpact::NotUsed
+        },
+        confirmation: if candidate.requires_confirmation {
+            PlanConfirmationState::Required
+        } else {
+            PlanConfirmationState::NotRequired
+        },
         parameters: parameters.clone(),
         failure_policy: rule.failure_policy,
         input_digest,
@@ -4923,10 +5491,64 @@ struct FieldInputDigest<'a> {
     source_build: &'a Option<ServerBuildIdentity>,
     target_build: &'a Option<ServerBuildIdentity>,
     manifest_digest: &'a str,
+    target_probe_digest: &'a Option<String>,
     operations: &'a [Operation],
     presences: &'a [PresenceState],
     options: RouteOptionsDigest<'a>,
     candidate: &'a TargetTypeCandidate,
+}
+
+fn validate_target_probe(
+    probe: Option<&TargetCapabilityProbe>,
+    target_field: &FieldDefinition,
+    target_build: &ServerBuildIdentity,
+    route_id: &str,
+) -> Result<(), CompatibilityError> {
+    let Some(probe) = probe else {
+        return Ok(());
+    };
+    probe.validate().map_err(|failure| {
+        CompatibilityError::TargetCapability(Box::new(failure.with_route(route_id.to_owned())))
+    })?;
+    if &probe.target_build != target_build
+        || probe.column != target_field.name
+        || probe.column_metadata.definition_fingerprint != target_field.reference.schema_fingerprint
+        || (!probe.column_metadata.native_type.is_empty()
+            && !probe
+                .column_metadata
+                .native_type
+                .eq_ignore_ascii_case(&target_field.native_type))
+    {
+        return Err(CompatibilityError::PlanInvalidated(
+            CompatibilityFailure::new(
+                FailureClass::StaleInput,
+                "compatibility.target_probe_changed",
+                FailurePhase::InputValidation,
+                "target column metadata or target build no longer matches the plan input",
+            ),
+        ));
+    }
+    if !probe.is_qualified() {
+        return Err(CompatibilityError::TargetCapability(Box::new(
+            TargetCapabilityFailure::new(
+                "target preflight did not produce qualified capability evidence",
+            )
+            .with_code("target_capability.probe_not_qualified")
+            .with_route(route_id.to_owned()),
+        )));
+    }
+    Ok(())
+}
+
+fn probe_qualifies_capability(
+    probe: Option<&TargetCapabilityProbe>,
+    capability: &CapabilityEntry,
+) -> bool {
+    probe.is_none_or(|probe| {
+        probe.capabilities.iter().any(|entry| {
+            entry.identity == capability.code && entry.status == CapabilityProbeStatus::Qualified
+        })
+    })
 }
 
 fn validate_input(input: &CompatibilityInput<'_>) -> Result<(), CompatibilityError> {
@@ -5020,6 +5642,12 @@ fn validate_input(input: &CompatibilityInput<'_>) -> Result<(), CompatibilityErr
         ));
     }
     input.manifest.validate()?;
+    validate_target_probe(
+        input.options.target_probe.as_ref(),
+        &input.target_field,
+        &input.manifest.target_build,
+        &input.options.route_id,
+    )?;
     let field_seen = input
         .transaction
         .transaction()
@@ -5930,6 +6558,11 @@ fn build_plan(
         source_build: &input.source_build,
         target_build: &input.target_build,
         manifest_digest: &input.manifest.digest,
+        target_probe_digest: &input
+            .options
+            .target_probe
+            .as_ref()
+            .map(|probe| probe.digest.clone()),
         options: RouteOptionsDigest {
             route_id: &input.options.route_id,
             configuration_revision: &input.options.configuration_revision,
@@ -5986,11 +6619,37 @@ fn build_plan(
         source_mapping_version: input.source_type_mapping.mapping_version.clone(),
         target,
         rule: candidate.rule.clone(),
+        rule_digest: digest_of(rule),
         capability_code: candidate.capability_code.clone(),
         capability_manifest_digest: input.manifest.digest.clone(),
+        target_probe_digest: input
+            .options
+            .target_probe
+            .as_ref()
+            .map(|probe| probe.digest.clone()),
         qualification: candidate.qualification,
         risk: candidate.risk,
         risk_code: candidate.risk_code.clone(),
+        loss: LossAssessment::for_qualification(
+            candidate.qualification,
+            is_key_like(&input.source_field),
+        ),
+        examples: vec![ConversionExample {
+            source: input.source_field.logical_type.family_name().into(),
+            target: input.target_field.native_type.clone(),
+        }],
+        locator_impact: if is_key_like(&input.source_field) {
+            LocatorImpact::Preserved
+        } else if rule.qualification == QualificationLevel::ExplicitConversion {
+            LocatorImpact::ValueOnly
+        } else {
+            LocatorImpact::NotUsed
+        },
+        confirmation: if candidate.requires_confirmation {
+            PlanConfirmationState::Required
+        } else {
+            PlanConfirmationState::NotRequired
+        },
         parameters: input.options.parameters.clone(),
         failure_policy: rule.failure_policy,
         input_digest,

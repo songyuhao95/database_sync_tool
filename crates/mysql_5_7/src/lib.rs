@@ -18,11 +18,12 @@ pub use compatibility::{
 pub use binlog::{
     BinlogConfig, BinlogPosition, BinlogStartMode, BinlogStream, binlog, validate_change_event,
 };
+pub use decoder::decode_temporal_components;
 pub use sql::{
     ApplyResult, CAPABILITY_MANIFEST, SinkAdapter, SqlTransaction, TargetConfig,
     capability_manifest, classify_apply_error, commit_outcome_unknown, execute, sql,
 };
 pub use type_mapping::{
-    MAPPING_VERSION, SourceTypeMappingError, map_source_type, source_type_mapping,
-    validate_native_type,
+    MAPPING_VERSION, SourceTypeMappingError, decode_enum_set_ordinal, decode_set_bitmask,
+    decode_spatial_value, map_source_type, source_type_mapping, validate_native_type,
 };

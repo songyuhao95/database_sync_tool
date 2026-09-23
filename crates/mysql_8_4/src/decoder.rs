@@ -143,7 +143,8 @@ impl Decoder {
     }
 
     fn load_columns(&mut self, schema: &str, table: &str) -> io::Result<Vec<ColumnInfo>> {
-        self.metadata
+        let columns = self
+            .metadata
             .exec_map(
                 "SELECT c.COLUMN_NAME, c.COLUMN_TYPE, c.DATA_TYPE, c.CHARACTER_SET_NAME,
                         c.COLLATION_NAME, c.GENERATION_EXPRESSION, k.ORDINAL_POSITION
@@ -172,7 +173,16 @@ impl Decoder {
                     primary_key_ordinal: key.map(|ordinal| ordinal as usize - 1),
                 },
             )
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        for column in &columns {
+            crate::source_type_mapping(
+                &column.native_type,
+                column.charset.as_deref(),
+                column.collation.as_deref(),
+            )
+            .map_err(io::Error::other)?;
+        }
+        Ok(columns)
     }
 
     fn start_transaction(&mut self, id: String, cursor: SourceCursor) -> io::Result<()> {
@@ -414,12 +424,34 @@ fn decode_value(value: &BinlogValue<'_>, info: &ColumnInfo) -> io::Result<Logica
 }
 
 pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result<LogicalValue> {
+    let mapping = crate::source_type_mapping(
+        &info.native_type,
+        info.charset.as_deref(),
+        info.collation.as_deref(),
+    )
+    .map_err(io::Error::other)?;
     let data_type = info.data_type.to_ascii_lowercase();
-    if matches!(data_type.as_str(), "enum" | "set") && !matches!(value, Value::Bytes(_)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ENUM/SET binlog value is not label/member text; refusing ordinal conversion",
-        ));
+    if matches!(data_type.as_str(), "enum" | "set") {
+        match value {
+            Value::Int(value) => {
+                let value = u64::try_from(*value).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "ENUM/SET ordinal is negative")
+                })?;
+                return mysql_5_7::decode_enum_set_ordinal(&mapping.logical_type, value)
+                    .map_err(io::Error::other);
+            }
+            Value::UInt(value) => {
+                return mysql_5_7::decode_enum_set_ordinal(&mapping.logical_type, *value)
+                    .map_err(io::Error::other);
+            }
+            Value::Bytes(_) => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ENUM/SET binlog value is neither label/member text nor numeric wire encoding",
+                ));
+            }
+        }
     }
     match value {
         Value::Int(value) => {
@@ -452,33 +484,16 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
             ieee754_hex: format!("{:016x}", value.to_bits()),
         }),
         Value::Date(year, month, day, hour, minute, second, microsecond) => {
-            if info.data_type.eq_ignore_ascii_case("date") {
-                Ok(LogicalValue::Date {
-                    year: *year,
-                    month: *month,
-                    day: *day,
-                })
-            } else if info.data_type.eq_ignore_ascii_case("timestamp") {
-                timestamp_from_components(
-                    *year,
-                    *month,
-                    *day,
-                    *hour,
-                    *minute,
-                    *second,
-                    *microsecond,
-                )
-            } else {
-                Ok(LogicalValue::LocalDatetime {
-                    year: *year,
-                    month: *month,
-                    day: *day,
-                    hour: *hour,
-                    minute: *minute,
-                    second: *second,
-                    microsecond: *microsecond,
-                })
-            }
+            mysql_5_7::decode_temporal_components(
+                &info.data_type,
+                *year,
+                *month,
+                *day,
+                *hour,
+                *minute,
+                *second,
+                *microsecond,
+            )
         }
         Value::Time(negative, days, hours, minutes, seconds, microsecond) => {
             Ok(LogicalValue::Duration {
@@ -490,13 +505,18 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
             })
         }
         Value::Bytes(bytes) => {
-            if data_type == "enum" || data_type == "set" {
-                let mapping = mysql_5_7::source_type_mapping(
-                    &info.native_type,
-                    info.charset.as_deref(),
-                    info.collation.as_deref(),
-                )
-                .map_err(io::Error::other)?;
+            if matches!(
+                mapping.logical_type,
+                change_event::LogicalType::Spatial { .. }
+            ) {
+                return mysql_5_7::decode_spatial_value(&mapping.logical_type, bytes)
+                    .map_err(io::Error::other);
+            }
+            if data_type == "set" {
+                return mysql_5_7::decode_set_bitmask(&mapping.logical_type, bytes)
+                    .map_err(io::Error::other);
+            }
+            if data_type == "enum" {
                 let text = String::from_utf8(bytes.clone())
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 match mapping.logical_type {
@@ -509,25 +529,7 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
                         }
                         return Ok(LogicalValue::Enum { label: text });
                     }
-                    change_event::LogicalType::Set { members } => {
-                        if text.is_empty() {
-                            return Ok(LogicalValue::Set {
-                                members: Vec::new(),
-                            });
-                        }
-                        let values = text.split(',').map(str::to_owned).collect::<Vec<_>>();
-                        if values.iter().enumerate().any(|(index, value)| {
-                            !members.iter().any(|member| member == value)
-                                || values[..index].contains(value)
-                        }) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "SET value contains an unknown or duplicate member",
-                            ));
-                        }
-                        return Ok(LogicalValue::Set { members: values });
-                    }
-                    _ => unreachable!("enum/set native type mapped to another logical type"),
+                    _ => unreachable!("enum native type mapped to another logical type"),
                 }
             }
             if data_type == "decimal" || data_type == "numeric" {
@@ -786,50 +788,6 @@ fn timestamp(value: &str) -> io::Result<LogicalValue> {
     })
 }
 
-fn timestamp_from_components(
-    year: u16,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
-    microsecond: u32,
-) -> io::Result<LogicalValue> {
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 0,
-    };
-    if year == 0
-        || day == 0
-        || day > days_in_month
-        || hour >= 24
-        || minute >= 60
-        || second >= 60
-        || microsecond >= 1_000_000
-    {
-        return Err(io::Error::other("invalid TIMESTAMP date value"));
-    }
-    let y = i64::from(year) - if month <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let month = i64::from(month);
-    let day = i64::from(day);
-    let month_prime = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    let day_of_era = yoe * 365 + yoe / 4 - yoe / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    let unix_seconds =
-        days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second);
-    Ok(LogicalValue::Instant {
-        unix_seconds: unix_seconds.to_string(),
-        nanoseconds: microsecond * 1_000,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,9 +838,17 @@ mod tests {
             primary_key_ordinal: None,
         };
         assert!(matches!(
-            decode_mysql_value(&Value::Bytes(b"b,a".to_vec()), &set_info).unwrap(),
-            LogicalValue::Set { members } if members == vec!["b", "a"]
+            decode_mysql_value(&Value::Bytes(vec![0b11]), &set_info).unwrap(),
+            LogicalValue::Set { members } if members == vec!["a", "b"]
         ));
         assert!(decode_mysql_value(&Value::Bytes(b"unknown".to_vec()), &enum_info).is_err());
+        assert!(matches!(
+            decode_mysql_value(&Value::Int(2), &enum_info).unwrap(),
+            LogicalValue::Enum { label } if label == "blocked"
+        ));
+        assert!(matches!(
+            decode_mysql_value(&Value::UInt(0b11), &set_info).unwrap(),
+            LogicalValue::Set { members } if members == vec!["a", "b"]
+        ));
     }
 }

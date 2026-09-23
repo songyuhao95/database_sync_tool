@@ -23,6 +23,48 @@ const STATUS: &str = "SHOW MASTER STATUS";
 const BATCH_ROWS: usize = 256;
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
+fn snapshot_data_type_supported(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "bigint"
+            | "decimal"
+            | "float"
+            | "double"
+            | "char"
+            | "varchar"
+            | "tinytext"
+            | "text"
+            | "mediumtext"
+            | "longtext"
+            | "binary"
+            | "varbinary"
+            | "tinyblob"
+            | "blob"
+            | "mediumblob"
+            | "longblob"
+            | "bit"
+            | "enum"
+            | "set"
+            | "date"
+            | "datetime"
+            | "time"
+            | "timestamp"
+            | "year"
+            | "json"
+            | "point"
+            | "linestring"
+            | "polygon"
+            | "multipoint"
+            | "multilinestring"
+            | "multipolygon"
+            | "geometrycollection"
+    )
+}
+
 struct ReadLock {
     conn: Conn,
     held: bool,
@@ -211,35 +253,7 @@ pub fn snapshot(config: BinlogConfig, tables: Vec<SnapshotTable>) -> io::Result<
             if !scope.columns.is_empty() && !scope.columns.contains(&c.name) {
                 continue;
             }
-            if !matches!(
-                c.data_type.as_str(),
-                "tinyint"
-                    | "smallint"
-                    | "mediumint"
-                    | "int"
-                    | "bigint"
-                    | "decimal"
-                    | "float"
-                    | "double"
-                    | "char"
-                    | "varchar"
-                    | "tinytext"
-                    | "text"
-                    | "mediumtext"
-                    | "longtext"
-                    | "binary"
-                    | "varbinary"
-                    | "tinyblob"
-                    | "blob"
-                    | "mediumblob"
-                    | "longblob"
-                    | "date"
-                    | "datetime"
-                    | "time"
-                    | "timestamp"
-                    | "year"
-                    | "json"
-            ) {
+            if !snapshot_data_type_supported(&c.data_type) {
                 return Err(io::Error::other(format!(
                     "snapshot type unsupported: {}.{}.{} {}",
                     scope.schema, scope.table, c.name, c.native_type
@@ -280,8 +294,17 @@ pub fn snapshot(config: BinlogConfig, tables: Vec<SnapshotTable>) -> io::Result<
     })
 }
 fn load_columns(conn: &mut Conn, table: &SnapshotTable) -> io::Result<Vec<ColumnInfo>> {
-    conn.exec_map("SELECT c.COLUMN_NAME,c.COLUMN_TYPE,c.DATA_TYPE,c.CHARACTER_SET_NAME,c.COLLATION_NAME,c.GENERATION_EXPRESSION,k.ORDINAL_POSITION FROM information_schema.COLUMNS c LEFT JOIN information_schema.KEY_COLUMN_USAGE k ON k.TABLE_SCHEMA=c.TABLE_SCHEMA AND k.TABLE_NAME=c.TABLE_NAME AND k.COLUMN_NAME=c.COLUMN_NAME AND k.CONSTRAINT_NAME='PRIMARY' WHERE c.TABLE_SCHEMA=? AND c.TABLE_NAME=? ORDER BY c.ORDINAL_POSITION", (&table.schema,&table.table),
-        |(name,native_type,data_type,charset,collation,expression,key):(String,String,String,Option<String>,Option<String>,String,Option<u64>)| ColumnInfo { name,native_type,data_type,charset,collation,generated:!expression.is_empty(),primary_key_ordinal:key.map(|v|v as usize-1) }).map_err(io::Error::other)
+    let columns = conn.exec_map("SELECT c.COLUMN_NAME,c.COLUMN_TYPE,c.DATA_TYPE,c.CHARACTER_SET_NAME,c.COLLATION_NAME,c.GENERATION_EXPRESSION,k.ORDINAL_POSITION FROM information_schema.COLUMNS c LEFT JOIN information_schema.KEY_COLUMN_USAGE k ON k.TABLE_SCHEMA=c.TABLE_SCHEMA AND k.TABLE_NAME=c.TABLE_NAME AND k.COLUMN_NAME=c.COLUMN_NAME AND k.CONSTRAINT_NAME='PRIMARY' WHERE c.TABLE_SCHEMA=? AND c.TABLE_NAME=? ORDER BY c.ORDINAL_POSITION", (&table.schema,&table.table),
+        |(name,native_type,data_type,charset,collation,expression,key):(String,String,String,Option<String>,Option<String>,String,Option<u64>)| ColumnInfo { name,native_type,data_type,charset,collation,generated:!expression.is_empty(),primary_key_ordinal:key.map(|v|v as usize-1) }).map_err(io::Error::other)?;
+    for column in &columns {
+        crate::source_type_mapping(
+            &column.native_type,
+            column.charset.as_deref(),
+            column.collation.as_deref(),
+        )
+        .map_err(io::Error::other)?;
+    }
+    Ok(columns)
 }
 impl SnapshotReader {
     fn next_batch(&mut self) -> io::Result<SnapshotBatch> {
@@ -463,6 +486,14 @@ fn json_value(value: serde_json::Value) -> io::Result<JsonValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_accepts_binlog_supported_bit_enum_and_set_types() {
+        assert!(snapshot_data_type_supported("bit"));
+        assert!(snapshot_data_type_supported("enum"));
+        assert!(snapshot_data_type_supported("set"));
+        assert!(snapshot_data_type_supported("point"));
+        assert!(snapshot_data_type_supported("geometrycollection"));
+    }
     #[test]
     fn cancelled_snapshot_does_not_connect() {
         let mut config = BinlogConfig::new("invalid.example", 1, "reader", "");

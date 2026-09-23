@@ -7,7 +7,8 @@
 //! catalog semantics before a value is decoded.  Unknown or value-less native
 //! types remain blocked instead of being converted to text or binary.
 
-use change_event::{ConnectorIdentity, LengthUnit, LogicalType, SourceTypeMapping};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use change_event::{ConnectorIdentity, LengthUnit, LogicalType, LogicalValue, SourceTypeMapping};
 use sha2::{Digest as _, Sha256};
 use std::{error::Error, fmt};
 
@@ -75,6 +76,9 @@ pub fn source_type_mapping(
         mapping_id,
         mapping_version: MAPPING_VERSION.to_owned(),
         evidence_digest: Some(evidence_digest),
+        source_definition_fingerprint: None,
+        source_build: None,
+        environment_fingerprint: None,
     })
 }
 
@@ -85,6 +89,141 @@ pub fn map_source_type(
     collation: Option<&str>,
 ) -> Result<SourceTypeMapping, SourceTypeMappingError> {
     source_type_mapping(native_type, charset, collation)
+}
+
+/// Decode MySQL's native ENUM/SET numeric binlog representation into the
+/// database-neutral label/member representation. The numeric value is only a
+/// wire encoding; it never crosses the SourceAdapter boundary as an ordinal.
+pub fn decode_enum_set_ordinal(
+    logical_type: &LogicalType,
+    value: u64,
+) -> Result<LogicalValue, String> {
+    match logical_type {
+        LogicalType::Enum { members } => {
+            let index = usize::try_from(value)
+                .map_err(|_| "ENUM ordinal does not fit the declared member index".to_owned())?;
+            if index == 0 || index > members.len() {
+                return Err("ENUM ordinal is outside the declared label list".to_owned());
+            }
+            Ok(LogicalValue::Enum {
+                label: members[index - 1].clone(),
+            })
+        }
+        LogicalType::Set { members } => {
+            if members.len() < u64::BITS as usize && value >> members.len() != 0 {
+                return Err("SET bitmask contains a member outside the declared list".to_owned());
+            }
+            Ok(LogicalValue::Set {
+                members: members
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| value & (1_u64 << index) != 0)
+                    .map(|(_, member)| member.clone())
+                    .collect(),
+            })
+        }
+        _ => Err("native type is not ENUM or SET".to_owned()),
+    }
+}
+
+/// Decode the little-endian bitmask used by MySQL's SET binlog value.
+pub fn decode_set_bitmask(
+    logical_type: &LogicalType,
+    bytes: &[u8],
+) -> Result<LogicalValue, String> {
+    if bytes.len() > u64::BITS as usize {
+        return Err("SET bitmask is wider than the portable 64-bit SET limit".to_owned());
+    }
+    let value = bytes
+        .iter()
+        .enumerate()
+        .try_fold(0_u64, |value, (index, byte)| {
+            let shift = u32::try_from(index * 8)
+                .map_err(|_| "SET bitmask byte offset is invalid".to_owned())?;
+            Ok::<_, String>(value | (u64::from(*byte) << shift))
+        })?;
+    decode_enum_set_ordinal(logical_type, value)
+}
+
+/// Decode MySQL's internal spatial representation. MySQL prefixes the WKB
+/// payload with a little-endian four-byte SRID; the public value contract
+/// carries the standard WKB payload and records that SRID separately.
+pub fn decode_spatial_value(
+    logical_type: &LogicalType,
+    bytes: &[u8],
+) -> Result<LogicalValue, String> {
+    let LogicalType::Spatial {
+        subtype,
+        srid: expected_srid,
+        dimensions: expected_dimensions,
+    } = logical_type
+    else {
+        return Err("native type is not spatial".to_owned());
+    };
+    if bytes.len() < 9 {
+        return Err("MySQL spatial value is missing its SRID or WKB header".to_owned());
+    }
+    let actual_srid = i32::try_from(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
+        .map_err(|_| "MySQL spatial SRID exceeds the portable range".to_owned())?;
+    if expected_srid.is_some_and(|expected| expected != actual_srid) {
+        return Err("MySQL spatial value SRID differs from the column declaration".to_owned());
+    }
+    let wkb = &bytes[4..];
+    let (geometry_type, dimensions) = spatial_wire_header(wkb)?;
+    if !geometry_type.eq_ignore_ascii_case(subtype) || dimensions != *expected_dimensions {
+        return Err("MySQL spatial WKB header differs from the column declaration".to_owned());
+    }
+    Ok(LogicalValue::Spatial {
+        format: change_event::SpatialFormat::Wkb,
+        bytes_base64url: URL_SAFE_NO_PAD.encode(wkb),
+        geometry_type: geometry_type.to_owned(),
+        dimensions,
+        srid: Some(actual_srid),
+        crs: Some(format!("srid:{actual_srid}")),
+    })
+}
+
+fn spatial_wire_header(bytes: &[u8]) -> Result<(&'static str, u8), String> {
+    if bytes.len() < 5 {
+        return Err("spatial WKB header is truncated".to_owned());
+    }
+    let little_endian = match bytes[0] {
+        0 => false,
+        1 => true,
+        _ => return Err("spatial WKB byte order marker is invalid".to_owned()),
+    };
+    let geometry_code = if little_endian {
+        u32::from_le_bytes(bytes[1..5].try_into().unwrap())
+    } else {
+        u32::from_be_bytes(bytes[1..5].try_into().unwrap())
+    };
+    if geometry_code & 0x2000_0000 != 0 {
+        return Err("MySQL spatial value unexpectedly contains an EWKB SRID".to_owned());
+    }
+    let has_z = geometry_code & 0x8000_0000 != 0;
+    let has_m = geometry_code & 0x4000_0000 != 0;
+    let mut base_code = geometry_code & 0x0fff_ffff;
+    let mut dimensions = 2 + u8::from(has_z) + u8::from(has_m);
+    if base_code >= 1_000 {
+        let suffix = base_code / 1_000;
+        base_code %= 1_000;
+        dimensions = match suffix {
+            1 | 2 => 3,
+            3 => 4,
+            _ => return Err("spatial WKB dimension code is invalid".to_owned()),
+        };
+    }
+    let geometry_type = match base_code {
+        1 => "point",
+        2 => "linestring",
+        3 => "polygon",
+        4 => "multipoint",
+        5 => "multilinestring",
+        6 => "multipolygon",
+        7 => "geometrycollection",
+        _ => return Err("spatial WKB geometry type is unsupported".to_owned()),
+    };
+    Ok((geometry_type, dimensions))
 }
 
 /// Validate a native declaration when there is no row value from which a text
@@ -297,8 +436,7 @@ fn logical_type(
             reject_modifiers(declaration, &[])?;
             Ok(LogicalType::float(64))
         }
-        "char" => Err(SourceTypeMappingError::unsupported("char")),
-        "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => {
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => {
             let charset = charset
                 .map(str::trim)
                 .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unknown"))
@@ -309,7 +447,7 @@ fn logical_type(
                 })?
                 .to_ascii_lowercase();
             let max_length = text_length(declaration)?;
-            let length_unit = if base == "varchar" {
+            let length_unit = if matches!(base, "char" | "varchar") {
                 LengthUnit::Characters
             } else {
                 LengthUnit::Bytes
@@ -344,6 +482,11 @@ fn logical_type(
         }),
         "year" => Ok(LogicalType::year()),
         "json" => Ok(LogicalType::json()),
+        "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon"
+        | "geometrycollection" => {
+            let (subtype, srid, dimensions) = spatial_shape(declaration)?;
+            Ok(LogicalType::spatial(subtype, srid, dimensions))
+        }
         "enum" => Ok(LogicalType::Enum {
             members: declaration.arguments.clone(),
         }),
@@ -404,7 +547,25 @@ fn validate_shape(declaration: &NativeDeclaration) -> Result<(), SourceTypeMappi
             }
             reject_modifiers(declaration, &[])
         }
-        "char" => Err(SourceTypeMappingError::unsupported("char")),
+        "char" => {
+            if declaration.arguments.len() > 1 {
+                return Err(SourceTypeMappingError::invalid(
+                    "CHAR accepts at most one length argument",
+                ));
+            }
+            let length = declaration
+                .arguments
+                .first()
+                .map(|value| parse_u64(value, "text length"))
+                .transpose()?
+                .unwrap_or(1);
+            if length == 0 || length > 255 {
+                return Err(SourceTypeMappingError::invalid(
+                    "CHAR length is outside MySQL 5.7 limits",
+                ));
+            }
+            reject_modifiers(declaration, &[])
+        }
         "varchar" => {
             if declaration.arguments.len() != 1 {
                 return Err(SourceTypeMappingError::invalid(
@@ -495,6 +656,15 @@ fn validate_shape(declaration: &NativeDeclaration) -> Result<(), SourceTypeMappi
             }
             reject_modifiers(declaration, &[])
         }
+        "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon"
+        | "geometrycollection" => {
+            if !declaration.arguments.is_empty() {
+                return Err(SourceTypeMappingError::invalid(format!(
+                    "{base} does not accept arguments"
+                )));
+            }
+            spatial_shape(declaration).map(|_| ())
+        }
         "enum" | "set" => {
             if declaration.arguments.is_empty() {
                 return Err(SourceTypeMappingError::invalid(format!(
@@ -552,6 +722,28 @@ fn reject_modifiers(
     Ok(())
 }
 
+fn spatial_shape(
+    declaration: &NativeDeclaration,
+) -> Result<(String, Option<i32>, u8), SourceTypeMappingError> {
+    let srid = match declaration.modifiers.as_slice() {
+        [] => None,
+        [marker, value] if marker == "srid" => {
+            let value = value.parse::<u64>().map_err(|_| {
+                SourceTypeMappingError::invalid(format!("invalid spatial SRID: {value:?}"))
+            })?;
+            Some(i32::try_from(value).map_err(|_| {
+                SourceTypeMappingError::unsupported("spatial SRID outside LogicalType range")
+            })?)
+        }
+        _ => {
+            return Err(SourceTypeMappingError::invalid(
+                "spatial type accepts only an optional SRID declaration",
+            ));
+        }
+    };
+    Ok((declaration.base.clone(), srid, 2))
+}
+
 fn parse_u16(value: &str, label: &str) -> Result<u16, SourceTypeMappingError> {
     value
         .parse()
@@ -574,6 +766,14 @@ fn float_bits(declaration: &NativeDeclaration) -> Result<u8, SourceTypeMappingEr
 
 fn text_length(declaration: &NativeDeclaration) -> Result<Option<u64>, SourceTypeMappingError> {
     match declaration.base.as_str() {
+        "char" => Ok(Some(
+            declaration
+                .arguments
+                .first()
+                .map(|value| parse_u64(value, "text length"))
+                .transpose()?
+                .unwrap_or(1),
+        )),
         "varchar" => Ok(Some(parse_u64(&declaration.arguments[0], "text length")?)),
         "tinytext" => Ok(Some(255)),
         "text" => Ok(Some(65_535)),
@@ -701,15 +901,28 @@ mod tests {
     }
 
     #[test]
+    fn char_mapping_is_text_with_fixed_declared_length() {
+        let mapping =
+            source_type_mapping("char(10)", Some("utf8mb4"), Some("utf8mb4_bin")).unwrap();
+        assert_eq!(
+            mapping.logical_type,
+            LogicalType::Text {
+                charset: "utf8mb4".into(),
+                max_length: Some(10),
+                length_unit: LengthUnit::Characters,
+                collation: None,
+            }
+        );
+    }
+
+    #[test]
     fn unsupported_or_out_of_range_types_fail_closed() {
-        for native_type in ["geometry", "char(10)"] {
-            assert_eq!(
-                source_type_mapping(native_type, Some("utf8mb4"), None)
-                    .unwrap_err()
-                    .code(),
-                "mysql57.source_type.unsupported"
-            );
-        }
+        assert_eq!(
+            source_type_mapping("geometry", Some("utf8mb4"), None)
+                .unwrap_err()
+                .code(),
+            "mysql57.source_type.unsupported"
+        );
         assert!(source_type_mapping("decimal(66,0)", None, None).is_err());
         assert!(source_type_mapping("datetime(7)", None, None).is_err());
         assert!(source_type_mapping("decimal(10,2) unsigned", None, None).is_err());
@@ -753,5 +966,35 @@ mod tests {
     fn native_validation_rejects_unsupported_null_only_columns() {
         assert!(validate_native_type("enum('a','b')").is_ok());
         assert!(validate_native_type("varchar(255)").is_ok());
+    }
+
+    #[test]
+    fn maps_declared_spatial_subtypes_and_rejects_unbounded_geometry() {
+        assert_eq!(
+            source_type_mapping("POINT SRID 4326", None, None)
+                .unwrap()
+                .logical_type,
+            LogicalType::Spatial {
+                subtype: "point".into(),
+                srid: Some(4326),
+                dimensions: 2,
+            }
+        );
+        assert_eq!(
+            source_type_mapping("linestring", None, None)
+                .unwrap()
+                .logical_type,
+            LogicalType::Spatial {
+                subtype: "linestring".into(),
+                srid: None,
+                dimensions: 2,
+            }
+        );
+        assert_eq!(
+            source_type_mapping("geometry", None, None)
+                .unwrap_err()
+                .code(),
+            "mysql57.source_type.unsupported"
+        );
     }
 }

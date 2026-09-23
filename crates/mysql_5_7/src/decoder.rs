@@ -10,7 +10,10 @@ use mysql_driver::binlog::value::BinlogValue;
 use mysql_driver::prelude::Queryable;
 use mysql_driver::{Conn, Value};
 
-use crate::type_mapping::{source_type_mapping, validate_native_type};
+use crate::type_mapping::{
+    decode_enum_set_ordinal, decode_set_bitmask, decode_spatial_value, source_type_mapping,
+    validate_native_type,
+};
 use change_event::{
     BitOrder, BitPadding, ChangeTransaction, ColumnDatum, Datum, JsonEntry, JsonValue,
     LogicalValue, Operation, RowChange, Source, SourceCursor,
@@ -144,7 +147,8 @@ impl Decoder {
     }
 
     fn load_columns(&mut self, schema: &str, table: &str) -> io::Result<Vec<ColumnInfo>> {
-        self.metadata
+        let columns = self
+            .metadata
             .exec_map(
                 "SELECT c.COLUMN_NAME, c.COLUMN_TYPE, c.DATA_TYPE, c.CHARACTER_SET_NAME,
                         c.COLLATION_NAME, c.GENERATION_EXPRESSION, k.ORDINAL_POSITION
@@ -173,7 +177,16 @@ impl Decoder {
                     primary_key_ordinal: key.map(|ordinal| ordinal as usize - 1),
                 },
             )
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        for column in &columns {
+            source_type_mapping(
+                &column.native_type,
+                column.charset.as_deref(),
+                column.collation.as_deref(),
+            )
+            .map_err(io::Error::other)?;
+        }
+        Ok(columns)
     }
 
     fn start_transaction(&mut self, id: String, cursor: SourceCursor) -> io::Result<()> {
@@ -427,11 +440,27 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
     )
     .map_err(io::Error::other)?;
     let data_type = info.data_type.to_ascii_lowercase();
-    if matches!(data_type.as_str(), "enum" | "set") && !matches!(value, Value::Bytes(_)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ENUM/SET binlog value is not label/member text; refusing ordinal conversion",
-        ));
+    if matches!(data_type.as_str(), "enum" | "set") {
+        match value {
+            Value::Int(value) => {
+                let value = u64::try_from(*value).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "ENUM/SET ordinal is negative")
+                })?;
+                return decode_enum_set_ordinal(&mapping.logical_type, value)
+                    .map_err(io::Error::other);
+            }
+            Value::UInt(value) => {
+                return decode_enum_set_ordinal(&mapping.logical_type, *value)
+                    .map_err(io::Error::other);
+            }
+            Value::Bytes(_) => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ENUM/SET binlog value is neither label/member text nor numeric wire encoding",
+                ));
+            }
+        }
     }
     match value {
         Value::Int(value) => {
@@ -464,33 +493,16 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
             ieee754_hex: format!("{:016x}", value.to_bits()),
         }),
         Value::Date(year, month, day, hour, minute, second, microsecond) => {
-            if info.data_type.eq_ignore_ascii_case("date") {
-                Ok(LogicalValue::Date {
-                    year: *year,
-                    month: *month,
-                    day: *day,
-                })
-            } else if info.data_type.eq_ignore_ascii_case("timestamp") {
-                timestamp_from_components(
-                    *year,
-                    *month,
-                    *day,
-                    *hour,
-                    *minute,
-                    *second,
-                    *microsecond,
-                )
-            } else {
-                Ok(LogicalValue::LocalDatetime {
-                    year: *year,
-                    month: *month,
-                    day: *day,
-                    hour: *hour,
-                    minute: *minute,
-                    second: *second,
-                    microsecond: *microsecond,
-                })
-            }
+            decode_temporal_components(
+                &info.data_type,
+                *year,
+                *month,
+                *day,
+                *hour,
+                *minute,
+                *second,
+                *microsecond,
+            )
         }
         Value::Time(negative, days, hours, minutes, seconds, microsecond) => {
             Ok(LogicalValue::Duration {
@@ -502,7 +514,17 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
             })
         }
         Value::Bytes(bytes) => {
-            if data_type == "enum" || data_type == "set" {
+            if matches!(
+                mapping.logical_type,
+                change_event::LogicalType::Spatial { .. }
+            ) {
+                return decode_spatial_value(&mapping.logical_type, bytes)
+                    .map_err(io::Error::other);
+            }
+            if data_type == "set" {
+                return decode_set_bitmask(&mapping.logical_type, bytes).map_err(io::Error::other);
+            }
+            if data_type == "enum" {
                 let text = String::from_utf8(bytes.clone())
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 match mapping.logical_type {
@@ -515,25 +537,7 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
                         }
                         return Ok(LogicalValue::Enum { label: text });
                     }
-                    change_event::LogicalType::Set { members } => {
-                        if text.is_empty() {
-                            return Ok(LogicalValue::Set {
-                                members: Vec::new(),
-                            });
-                        }
-                        let values = text.split(',').map(str::to_owned).collect::<Vec<_>>();
-                        if values.iter().enumerate().any(|(index, value)| {
-                            !members.iter().any(|member| member == value)
-                                || values[..index].contains(value)
-                        }) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "SET value contains an unknown or duplicate member",
-                            ));
-                        }
-                        return Ok(LogicalValue::Set { members: values });
-                    }
-                    _ => unreachable!("enum/set native type mapped to another logical type"),
+                    _ => unreachable!("enum native type mapped to another logical type"),
                 }
             }
             if data_type == "decimal" || data_type == "numeric" {
@@ -602,6 +606,56 @@ fn parse_decimal(text: &str) -> io::Result<LogicalValue> {
     Ok(LogicalValue::Decimal {
         unscaled,
         scale: fraction.len(),
+    })
+}
+
+pub fn decode_temporal_components(
+    data_type: &str,
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    microsecond: u32,
+) -> io::Result<LogicalValue> {
+    let kind = format!("mysql.{}", data_type.to_ascii_lowercase());
+    let raw = if data_type.eq_ignore_ascii_case("date") {
+        format!("{year:04}-{month:02}-{day:02}")
+    } else {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{microsecond:06}")
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    let invalid = year == 0
+        || month == 0
+        || day == 0
+        || day > days_in_month
+        || (!data_type.eq_ignore_ascii_case("date")
+            && (hour >= 24 || minute >= 60 || second >= 60 || microsecond >= 1_000_000));
+    if invalid {
+        return Ok(LogicalValue::InvalidTemporal { kind, raw });
+    }
+    if data_type.eq_ignore_ascii_case("date") {
+        return Ok(LogicalValue::Date { year, month, day });
+    }
+    if data_type.eq_ignore_ascii_case("timestamp") {
+        return timestamp_from_components(year, month, day, hour, minute, second, microsecond);
+    }
+    Ok(LogicalValue::LocalDatetime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        microsecond,
     })
 }
 
@@ -877,9 +931,63 @@ mod tests {
             primary_key_ordinal: None,
         };
         assert!(matches!(
-            decode_mysql_value(&Value::Bytes(b"b,a".to_vec()), &set_info).unwrap(),
-            LogicalValue::Set { members } if members == vec!["b", "a"]
+            decode_mysql_value(&Value::Bytes(vec![0b11]), &set_info).unwrap(),
+            LogicalValue::Set { members } if members == vec!["a", "b"]
         ));
         assert!(decode_mysql_value(&Value::Bytes(b"unknown".to_vec()), &enum_info).is_err());
+        assert!(matches!(
+            decode_mysql_value(&Value::Int(2), &enum_info).unwrap(),
+            LogicalValue::Enum { label } if label == "blocked"
+        ));
+        assert!(matches!(
+            decode_mysql_value(&Value::UInt(0b11), &set_info).unwrap(),
+            LogicalValue::Set { members } if members == vec!["a", "b"]
+        ));
+    }
+
+    #[test]
+    fn zero_date_is_preserved_as_invalid_temporal() {
+        let info = ColumnInfo {
+            name: "created_at".into(),
+            native_type: "datetime(6)".into(),
+            data_type: "datetime".into(),
+            charset: None,
+            collation: None,
+            generated: false,
+            primary_key_ordinal: None,
+        };
+        assert!(matches!(
+            decode_mysql_value(&Value::Date(0, 0, 0, 0, 0, 0, 0), &info).unwrap(),
+            LogicalValue::InvalidTemporal { kind, raw }
+                if kind == "mysql.datetime" && raw == "0000-00-00 00:00:00.000000"
+        ));
+    }
+
+    #[test]
+    fn mysql_geometry_is_decoded_as_wkb_with_srid_evidence() {
+        let info = ColumnInfo {
+            name: "location".into(),
+            native_type: "point srid 4326".into(),
+            data_type: "point".into(),
+            charset: None,
+            collation: None,
+            generated: false,
+            primary_key_ordinal: None,
+        };
+        let mut bytes = 4326_u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        assert!(matches!(
+            decode_mysql_value(&Value::Bytes(bytes), &info).unwrap(),
+            LogicalValue::Spatial {
+                format: change_event::SpatialFormat::Wkb,
+                geometry_type,
+                dimensions: 2,
+                srid: Some(4326),
+                crs: Some(crs),
+                ..
+            } if geometry_type == "point" && crs == "srid:4326"
+        ));
     }
 }
