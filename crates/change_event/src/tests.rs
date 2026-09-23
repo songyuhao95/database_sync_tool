@@ -614,6 +614,47 @@ fn compatibility_options() -> RouteOptions {
     }
 }
 
+fn target_capability_probe() -> TargetCapabilityProbe {
+    TargetCapabilityProbe::new(
+        ServerBuildIdentity::new("mysql", "oracle", "5.7.44", "build-1"),
+        "cdc",
+        "items",
+        "id",
+        TargetColumnMetadata::new("target-schema-1")
+            .with_native_type("bigint")
+            .with_precision(19)
+            .with_constraints(["PRIMARY KEY"])
+            .with_indexes(["PRIMARY"]),
+        vec![CapabilityProbeEntry::qualified("test.integer")],
+        vec![CapabilityProbeEntry::installed("mysql_native")],
+        TargetSessionProfile::new("mysql.strict.v1", [("sql_mode", "STRICT_ALL_TABLES")]),
+    )
+}
+
+#[test]
+fn target_capability_probe_is_content_addressed_and_qualification_is_explicit() {
+    let probe = target_capability_probe();
+    assert!(probe.verify_digest());
+    assert!(probe.is_qualified());
+    assert_eq!(probe.column_metadata.typmod, None);
+    assert_eq!(probe.column_metadata.precision, Some(19));
+
+    let mut changed = probe.clone();
+    changed
+        .session
+        .settings
+        .insert("time_zone".into(), "UTC".into());
+    changed.refresh_digest();
+    assert_ne!(probe.digest, changed.digest);
+    assert!(changed.verify_digest());
+
+    let mut unqualified = probe;
+    unqualified.capabilities[0].status = CapabilityProbeStatus::PermissionDenied;
+    unqualified.refresh_digest();
+    assert!(!unqualified.is_qualified());
+    assert!(unqualified.validate().is_ok());
+}
+
 #[test]
 fn compatibility_plan_is_structured_serializable_and_reproducible() {
     let transaction = validate(insert_transaction()).unwrap();
@@ -632,7 +673,7 @@ fn compatibility_plan_is_structured_serializable_and_reproducible() {
         ),
         true,
     );
-    let input = compatibility_input(
+    let mut input = compatibility_input(
         &transaction,
         source,
         target,
@@ -640,6 +681,7 @@ fn compatibility_plan_is_structured_serializable_and_reproducible() {
         &manifest,
         compatibility_options(),
     );
+    input.options.target_probe = Some(target_capability_probe());
 
     let result = explain_compatibility(input.clone()).unwrap();
     assert_eq!(result.status, CompatibilityStatus::Compatible);
@@ -647,6 +689,17 @@ fn compatibility_plan_is_structured_serializable_and_reproducible() {
     assert!(result.is_selectable());
     let plan = result.plan.as_ref().expect("qualified field has a plan");
     assert!(plan.verify_digest());
+    assert_eq!(
+        plan.target_probe_digest,
+        input
+            .options
+            .target_probe
+            .as_ref()
+            .map(|probe| probe.digest.clone())
+    );
+    assert_eq!(plan.locator_impact, LocatorImpact::Preserved);
+    assert!(!plan.loss.value);
+    assert_eq!(plan.confirmation, PlanConfirmationState::NotRequired);
     assert_eq!(
         plan.plan_digest,
         result.summary.as_ref().unwrap().plan_digest
@@ -663,6 +716,20 @@ fn compatibility_plan_is_structured_serializable_and_reproducible() {
     stale_input.target_field.reference.schema_fingerprint = "changed-target-schema".into();
     let stale = plan.validate_against(stale_input).unwrap_err();
     assert_eq!(stale.class(), FailureClass::StaleInput);
+
+    let mut changed_probe_input = input.clone();
+    let probe = changed_probe_input.options.target_probe.as_mut().unwrap();
+    probe
+        .session
+        .settings
+        .insert("time_zone".into(), "UTC".into());
+    probe.refresh_digest();
+    let invalidated = plan.validate_against(changed_probe_input).unwrap_err();
+    assert_eq!(invalidated.code(), "compatibility.plan_inputs_changed");
+    assert!(matches!(
+        invalidated,
+        CompatibilityError::PlanInvalidated(_)
+    ));
 
     let repeated = explain_compatibility(input).unwrap();
     assert_eq!(
@@ -733,6 +800,47 @@ fn compatibility_requires_parameters_and_exact_risk_confirmation() {
     let confirmed = explain_compatibility(input).unwrap();
     assert_eq!(confirmed.status, CompatibilityStatus::Compatible);
     assert!(confirmed.failure.is_none());
+    let confirmed_plan = confirmed.plan.as_ref().unwrap();
+    assert_eq!(
+        confirmed_plan.confirmation,
+        PlanConfirmationState::Confirmed
+    );
+    assert!(confirmed_plan.loss.value);
+    assert_eq!(confirmed_plan.locator_impact, LocatorImpact::ValueOnly);
+}
+
+#[test]
+fn unqualified_target_probe_blocks_plan_selection() {
+    let transaction = validate(insert_transaction()).unwrap();
+    let source = compatibility_field(Some(0));
+    let mut target = source.clone();
+    target.reference = DefinitionReference::new("target-column-1", "target-schema-1");
+    let manifest = compatibility_manifest(
+        "bigint",
+        compatibility_rule(
+            "integer.exact",
+            QualificationLevel::Exact,
+            RiskLevel::None,
+            false,
+            true,
+        ),
+        true,
+    );
+    let mut input = compatibility_input(
+        &transaction,
+        source,
+        target,
+        compatibility_mapping(),
+        &manifest,
+        compatibility_options(),
+    );
+    let mut probe = target_capability_probe();
+    probe.capabilities[0].status = CapabilityProbeStatus::PermissionDenied;
+    probe.refresh_digest();
+    input.options.target_probe = Some(probe);
+
+    let error = explain_compatibility(input).unwrap_err();
+    assert_eq!(error.code(), "target_capability.probe_not_qualified");
 }
 
 #[test]
