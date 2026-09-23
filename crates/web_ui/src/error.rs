@@ -9,6 +9,10 @@ use serde_json::json;
 pub enum Error {
     Invalid(&'static str),
     Validation(String),
+    /// The route reached a durable source boundary but cannot continue
+    /// without an operator changing its saved plan or resolving an unknown
+    /// commit outcome.
+    Blocked(String),
     Unauthorized,
     Forbidden,
     NotFound,
@@ -21,7 +25,7 @@ impl Error {
     pub fn message(&self) -> &str {
         match self {
             Self::Invalid(m) | Self::Conflict(m) => m,
-            Self::Validation(m) => m,
+            Self::Validation(m) | Self::Blocked(m) => m,
             Self::Unauthorized => "请重新登录，或检查账号密码",
             Self::Forbidden => "没有操作权限，或请求校验失败",
             Self::NotFound => "记录不存在",
@@ -41,6 +45,7 @@ impl IntoResponse for Error {
         let (status, code) = match self {
             Self::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_input"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "invalid_input"),
+            Self::Blocked(_) => (StatusCode::CONFLICT, "blocked_route"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),

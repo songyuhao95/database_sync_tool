@@ -1,5 +1,5 @@
-
 BEGIN IMMEDIATE;
+ALTER TABLE task_runtime RENAME TO task_runtime_v12_old;
 CREATE TABLE task_runtime (
  task_id TEXT PRIMARY KEY REFERENCES replication_tasks(id) ON DELETE CASCADE,
  state TEXT NOT NULL CHECK(state IN ('starting','running','stopping','stopped','failed','blocked')),
@@ -12,13 +12,9 @@ CREATE TABLE task_runtime (
  applied_rows INTEGER NOT NULL DEFAULT 0,
  last_applied_at INTEGER
 );
-CREATE TABLE task_logs (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- task_id TEXT NOT NULL REFERENCES replication_tasks(id) ON DELETE CASCADE,
- timestamp INTEGER NOT NULL,
- level TEXT NOT NULL,
- message TEXT NOT NULL
-);
-CREATE INDEX task_logs_route ON task_logs(task_id,id);
-PRAGMA user_version=5;
+INSERT INTO task_runtime(task_id,state,checkpoint_json,pending_transaction,last_error,started_at,stopped_at,applied_transactions,applied_rows,last_applied_at)
+SELECT task_id,state,checkpoint_json,pending_transaction,last_error,started_at,stopped_at,applied_transactions,applied_rows,last_applied_at
+FROM task_runtime_v12_old;
+DROP TABLE task_runtime_v12_old;
+PRAGMA user_version=12;
 COMMIT;

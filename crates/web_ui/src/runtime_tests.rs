@@ -68,6 +68,12 @@ fn runtime_permissions_conflicts_and_restart_state() {
         Err(Error::Forbidden)
     ));
     store.begin_task(admin, &first.id).unwrap();
+    store
+        .finish_task_with_state(&first.id, Some("blocked diagnostic"), true)
+        .unwrap();
+    assert_eq!(store.task(&first.id).unwrap().status, "blocked");
+    // Re-activation is the recovery boundary after the saved plan is fixed.
+    store.begin_task(admin, &first.id).unwrap();
     assert!(matches!(
         store.begin_task(admin, &second.id),
         Err(Error::Conflict(_))

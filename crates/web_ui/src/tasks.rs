@@ -665,6 +665,45 @@ fn digest_serialized<T: Serialize>(value: &T) -> String {
         .collect()
 }
 
+/// Recompute the digest that binds the runtime to one immutable plan set.
+/// Keeping this calculation next to plan persistence prevents the worker from
+/// accepting a collection whose individual plan digests are valid but whose
+/// route-level summary was swapped or reordered.
+pub(crate) fn computed_plan_set_digest(task: &ReplicationTask) -> String {
+    let source_metadata_fingerprint = task.source_metadata_fingerprint.clone().unwrap_or_default();
+    let sink_metadata_fingerprint = task.sink_metadata_fingerprint.clone().unwrap_or_default();
+    let plan_digests = task
+        .plans
+        .iter()
+        .map(|plan| plan.plan_digest.clone())
+        .collect::<Vec<_>>();
+    let rule_summary = task
+        .plans
+        .iter()
+        .map(|plan| {
+            (
+                plan.capability_code.clone(),
+                plan.rule.clone(),
+                plan.parameters.clone(),
+                plan.failure_policy,
+            )
+        })
+        .collect::<Vec<_>>();
+    let rule_summary_digest = digest_serialized(&rule_summary);
+    digest_serialized(&(
+        TASK_PLAN_VERSION,
+        &task.id,
+        task.configuration_revision,
+        &source_metadata_fingerprint,
+        &sink_metadata_fingerprint,
+        &task.connector_summary_json,
+        &task.capability_summary_json,
+        &rule_summary_digest,
+        &plan_digests,
+        &task.risk_confirmations,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_snapshot(
     route_id: &str,

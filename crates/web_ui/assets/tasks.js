@@ -217,7 +217,7 @@ function taskMetadataText(catalog) {
 function taskStatus(task) {
   if(task.status==='running')return {key:'running',label:task.runtime?.checkpoint?.phase==='snapshot'?'全量同步中':'增量同步中',tone:'good'};
   const statuses={starting:['启动中','neutral'],running:['同步中','good'],stopping:['停止中','warning'],
-    stopped:['已停止','neutral'],failed:['失败','warning']};
+    stopped:['已停止','neutral'],failed:['失败','warning'],blocked:['已阻塞','danger']};
   if(statuses[task.status])return {key:task.status,label:statuses[task.status][0],tone:statuses[task.status][1]};
   if(task.configuration_changed||task.plan_needs_requalification)return {key:'changed',label:task.plan_status==='legacy'?'需要重新预检':'需要重新检查',tone:'warning'};
   return {key:'configured',label:'待启动',tone:'neutral'};
@@ -287,7 +287,7 @@ async function renderTasks() {
   const shell=node('section','panel task-list-shell'),toolbar=node('div','task-list-toolbar');
   const search=node('input','task-search');search.type='search';search.placeholder='搜索任务、实例、库或表';search.setAttribute('aria-label','搜索同步任务');
   const status=node('select','task-status-filter');status.setAttribute('aria-label','按任务状态筛选');
-  [['all','全部状态'],['configured','待启动'],['starting','启动中'],['running','同步中'],['stopping','停止中'],['stopped','已停止'],['failed','失败'],['changed','需要重新检查']].forEach(([value,label])=>{
+  [['all','全部状态'],['configured','待启动'],['starting','启动中'],['running','同步中'],['stopping','停止中'],['stopped','已停止'],['failed','失败'],['blocked','已阻塞'],['changed','需要重新检查']].forEach(([value,label])=>{
     const option=node('option','',label);option.value=value;status.append(option);
   });
   const result=node('span','muted task-filter-result');
@@ -296,7 +296,7 @@ async function renderTasks() {
 
   const params=new URLSearchParams(location.search);
   search.value=params.get('q')||'';
-  status.value=['configured','changed','starting','running','stopping','stopped','failed'].includes(params.get('status'))?params.get('status'):'all';
+  status.value=['configured','changed','starting','running','stopping','stopped','failed','blocked'].includes(params.get('status'))?params.get('status'):'all';
 
   const render=()=>{
     total.replaceChildren(node('strong','',String(tasks.length)),document.createTextNode(' 个任务'));

@@ -7,12 +7,13 @@ use crate::{
     tasks::TableMapping,
 };
 use change_event::{
-    ChangeTransaction, ColumnConversionPlan, CommitResolution, SnapshotBatch, SnapshotBoundary,
-    SnapshotTable, TargetApplyErrorKind, TargetCapabilityFailure,
+    ChangeTransaction, ColumnConversionPlan, CommitResolution, Datum, SnapshotBatch,
+    SnapshotBoundary, SnapshotTable, TargetApplyErrorKind, TargetCapabilityFailure,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     io,
     sync::mpsc::{Receiver, sync_channel},
     sync::{
@@ -301,16 +302,7 @@ macro_rules! sink_adapter {
 sink_adapter!(mysql_5_7, mysql_5_7::sql_with_plans);
 sink_adapter!(mysql_8_0, mysql_8_0::sql_with_plans);
 sink_adapter!(mysql_8_4, mysql_8_4::sql_with_plans);
-sink_adapter!(
-    postgresql_15,
-    |validated: &change_event::ValidatedTransaction, plans: &[ColumnConversionPlan]| {
-        let converted =
-            change_event::convert_transaction_with_plans(validated.transaction().clone(), plans)
-                .map_err(io::Error::other)?;
-        let converted = change_event::validate(converted).map_err(io::Error::other)?;
-        postgresql_15::sql(&converted)
-    }
-);
+sink_adapter!(postgresql_15, postgresql_15::sql_with_plans);
 
 fn open_sink(
     endpoint: &Endpoint,
@@ -514,32 +506,198 @@ fn failure(error: impl std::fmt::Display) -> Error {
 const MAX_APPLY_RETRIES: u8 = 3;
 
 #[derive(Serialize)]
+struct PlanDiagnostic {
+    digest: String,
+    configuration_revision: String,
+    capability: String,
+    rule: String,
+    qualification: change_event::QualificationLevel,
+    risk: change_event::RiskLevel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    risk_code: Option<String>,
+    target_type: String,
+}
+
+#[derive(Serialize)]
 struct ApplyDiagnostic<'a> {
     task_id: &'a str,
     source_transaction_id: &'a str,
+    source_cursor: &'a str,
+    source_cursor_format: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
     plan_set_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<PlanDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    risk: Option<change_event::RiskLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_category: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_type: Option<String>,
+    reason: String,
+    retry_advice: &'static str,
     kind: TargetApplyErrorKind,
     class: change_event::FailureClass,
     phase: change_event::FailurePhase,
     retry: change_event::RetryClassification,
-    code: &'static str,
+    code: String,
 }
 
 fn apply_diagnostic(
     task_id: &str,
-    transaction_id: &str,
+    transaction: &ChangeTransaction,
     plan_set_digest: Option<&str>,
+    plans: &[ColumnConversionPlan],
     kind: TargetApplyErrorKind,
+    error: &io::Error,
 ) -> String {
+    let failure = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<TargetCapabilityFailure>());
+    let plan = failure
+        .and_then(|failure| failure.source_field_lineage.as_deref())
+        .and_then(|lineage| {
+            plans
+                .iter()
+                .find(|plan| plan.source_field.lineage_id == lineage)
+        })
+        .or_else(|| {
+            if kind != TargetApplyErrorKind::Conversion {
+                return None;
+            }
+            transaction
+                .changes
+                .iter()
+                .flat_map(|change| change.before.iter().chain(change.after.iter()))
+                .flatten()
+                .find_map(|column| {
+                    let lineage = format!(
+                        "catalog:{}.{}.{}",
+                        transaction.changes.first()?.schema,
+                        transaction.changes.first()?.table,
+                        column.name
+                    );
+                    plans
+                        .iter()
+                        .find(|plan| plan.source_field.lineage_id == lineage)
+                })
+        });
+    let field = failure
+        .and_then(|failure| failure.source_field_lineage.as_deref())
+        .and_then(|lineage| lineage.rsplit('.').next().map(str::to_owned))
+        .or_else(|| {
+            plan.and_then(|plan| {
+                plan.source_field
+                    .lineage_id
+                    .rsplit('.')
+                    .next()
+                    .map(str::to_owned)
+            })
+        });
+    let value_category = field.as_deref().and_then(|field| {
+        transaction
+            .changes
+            .iter()
+            .flat_map(|change| change.before.iter().chain(change.after.iter()))
+            .flatten()
+            .find(|column| column.name == field)
+            .map(|column| match &column.datum {
+                Datum::Value(_) => "value",
+                Datum::Null => "null",
+                Datum::Unchanged => "unchanged",
+                Datum::Unavailable => "unavailable",
+            })
+    });
+    let plan_summary = plan.map(|plan| PlanDiagnostic {
+        digest: plan.plan_digest.clone(),
+        configuration_revision: plan.configuration_revision.clone(),
+        capability: plan.capability_code.clone(),
+        rule: format!("{}@{}", plan.rule.id, plan.rule.version),
+        qualification: plan.qualification,
+        risk: plan.risk,
+        risk_code: plan.risk_code.clone(),
+        target_type: plan.target.native_type.clone(),
+    });
+    let reason = failure
+        .and_then(|failure| failure.cause.clone())
+        .unwrap_or_else(|| match kind {
+            TargetApplyErrorKind::Conversion => {
+                "the saved conversion plan rejected a captured value".into()
+            }
+            TargetApplyErrorKind::Capability => {
+                "the target capability or saved plan is not valid for this route".into()
+            }
+            TargetApplyErrorKind::Constraint => {
+                "the target rejected the complete transaction because of a constraint".into()
+            }
+            TargetApplyErrorKind::Sql => {
+                "the target rejected the transaction; driver details are intentionally redacted"
+                    .into()
+            }
+            TargetApplyErrorKind::Connection => {
+                "the target connection failed before the transaction was durably acknowledged"
+                    .into()
+            }
+            TargetApplyErrorKind::LockTimeout => {
+                "the target transaction lost a lock or deadlock retry window".into()
+            }
+            TargetApplyErrorKind::CommitUnknown => {
+                "the target commit acknowledgement was lost and requires checkpoint resolution"
+                    .into()
+            }
+            TargetApplyErrorKind::CheckpointConflict => {
+                "the authoritative target checkpoint changed outside this route".into()
+            }
+        });
+    let retry_classification = failure
+        .map(|failure| failure.retry)
+        .unwrap_or_else(|| kind.retry_classification());
+    let retry_advice = match retry_classification {
+        change_event::RetryClassification::Retryable => {
+            "retry the complete transaction from the last durable checkpoint"
+        }
+        change_event::RetryClassification::CommitUnknown => {
+            "resolve the target checkpoint/control record; never blindly retry the commit"
+        }
+        change_event::RetryClassification::NotRetryable => {
+            "route is blocked; fix or requalify the saved plan before resuming"
+        }
+    };
     serde_json::to_string(&ApplyDiagnostic {
         task_id,
-        source_transaction_id: transaction_id,
+        source_transaction_id: &transaction.id,
+        source_cursor: &transaction.commit_cursor.display,
+        source_cursor_format: &transaction.commit_cursor.format,
+        object: {
+            let objects = transaction
+                .changes
+                .iter()
+                .map(|change| format!("{}.{}", change.schema, change.table))
+                .collect::<BTreeSet<_>>();
+            (!objects.is_empty()).then(|| objects.into_iter().collect::<Vec<_>>().join(","))
+        },
+        field,
         plan_set_digest,
+        risk: plan.map(|plan| plan.risk),
+        value_category,
+        target_type: plan.map(|plan| plan.target.native_type.clone()),
+        plan: plan_summary,
+        reason,
+        retry_advice,
         kind,
-        class: kind.failure_class(),
-        phase: kind.phase(),
-        retry: kind.retry_classification(),
-        code: kind.stable_code(),
+        class: failure
+            .map(|failure| failure.class)
+            .unwrap_or_else(|| kind.failure_class()),
+        phase: failure
+            .map(|failure| failure.phase)
+            .unwrap_or_else(|| kind.phase()),
+        retry: retry_classification,
+        code: failure
+            .map(|failure| failure.code.clone())
+            .unwrap_or_else(|| kind.stable_code().to_owned()),
     })
     .unwrap_or_else(|_| kind.stable_code().to_owned())
 }
@@ -569,6 +727,17 @@ fn validate_runtime_plans(
         return Err(io::Error::other(TargetCapabilityFailure::new(
             "task has no saved ColumnConversionPlan",
         )));
+    }
+    let expected_plan_set_digest = crate::tasks::computed_plan_set_digest(task);
+    if task.plan_set_digest.as_deref() != Some(expected_plan_set_digest.as_str()) {
+        return Err(io::Error::other(
+            TargetCapabilityFailure::new(
+                "saved ColumnConversionPlan set digest does not match the active route",
+            )
+            .with_code("target_capability.plan_set_digest_invalid")
+            .with_route(task.id.clone())
+            .with_plan_digest(expected_plan_set_digest),
+        ));
     }
     for plan in &task.plans {
         if !plan.verify_digest()
@@ -958,15 +1127,17 @@ pub(crate) fn run(store: &Store, actor: i64, id: &str, stop: &Arc<AtomicBool>) -
             continue;
         }
         let validated = change_event::validate(tx.clone()).map_err(failure)?;
-        if let Err(_error) = validate_runtime_plans(&task, &tx, &source, &sink) {
+        if let Err(error) = validate_runtime_plans(&task, &tx, &source, &sink) {
             let diagnostic = apply_diagnostic(
                 id,
-                &tx.id,
+                &tx,
                 task.plan_set_digest.as_deref(),
+                &task.plans,
                 TargetApplyErrorKind::Capability,
+                &error,
             );
             store.log_task(id, "error", &diagnostic)?;
-            return Err(Error::Validation(diagnostic));
+            return Err(Error::Blocked(diagnostic));
         }
         store.append_task_file(id, "change_event.log", &safe_change_event_log(&validated))?;
         let (cp, _sql, rows, replayed) = match apply_with_recovery(
@@ -985,10 +1156,22 @@ pub(crate) fn run(store: &Store, actor: i64, id: &str, stop: &Arc<AtomicBool>) -
                     return Ok(());
                 }
                 let kind = classify_endpoint_error(&sink, &error);
-                let diagnostic =
-                    apply_diagnostic(id, &tx.id, task.plan_set_digest.as_deref(), kind);
+                let diagnostic = apply_diagnostic(
+                    id,
+                    &tx,
+                    task.plan_set_digest.as_deref(),
+                    &task.plans,
+                    kind,
+                    &error,
+                );
                 store.log_task(id, "error", &diagnostic)?;
-                return Err(Error::Validation(diagnostic));
+                return Err(match kind.retry_classification() {
+                    change_event::RetryClassification::NotRetryable
+                    | change_event::RetryClassification::CommitUnknown => {
+                        Error::Blocked(diagnostic)
+                    }
+                    change_event::RetryClassification::Retryable => Error::Validation(diagnostic),
+                });
             }
         };
         // A failure in local logging cannot roll back an already committed Sink transaction.
@@ -1045,10 +1228,22 @@ pub(crate) fn run(store: &Store, actor: i64, id: &str, stop: &Arc<AtomicBool>) -
             Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(()),
             Err(error) => {
                 let kind = classify_endpoint_error(&sink, &error);
-                let diagnostic =
-                    apply_diagnostic(id, &tx.id, task.plan_set_digest.as_deref(), kind);
+                let diagnostic = apply_diagnostic(
+                    id,
+                    &tx,
+                    task.plan_set_digest.as_deref(),
+                    &task.plans,
+                    kind,
+                    &error,
+                );
                 store.log_task(id, "error", &diagnostic)?;
-                return Err(Error::Validation(diagnostic));
+                return Err(match kind.retry_classification() {
+                    change_event::RetryClassification::NotRetryable
+                    | change_event::RetryClassification::CommitUnknown => {
+                        Error::Blocked(diagnostic)
+                    }
+                    change_event::RetryClassification::Retryable => Error::Validation(diagnostic),
+                });
             }
         };
         store.save_checkpoint(id, &cp, 0)?;
@@ -1063,7 +1258,11 @@ mod qualification_recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use change_event::{Operation, RowChange, Source, SourceCursor};
+    use change_event::{
+        ColumnDatum, ConnectorIdentity, DefinitionReference, FailurePolicy, LocatorImpact,
+        LogicalValue, LossAssessment, Operation, PlanConfirmationState, QualificationLevel,
+        RiskLevel, RowChange, RuleReference, Source, SourceCursor, TargetRepresentation,
+    };
     use std::sync::Mutex;
 
     fn test_checkpoint() -> Checkpoint {
@@ -1108,6 +1307,50 @@ mod tests {
                 after: Some(Vec::new()),
             }],
         }
+    }
+
+    fn diagnostic_plan() -> ColumnConversionPlan {
+        let mut plan = ColumnConversionPlan {
+            format: "cdc.column-conversion-plan.v1".into(),
+            route_id: "task-1".into(),
+            configuration_revision: "task-1:r1".into(),
+            source_field: DefinitionReference::new(
+                "catalog:source.items.message",
+                "source-definition",
+            ),
+            target_field: DefinitionReference::new(
+                "catalog:sink.items.message",
+                "target-definition",
+            ),
+            source_connector: ConnectorIdentity::new("mysql", "5.7"),
+            sink_connector: ConnectorIdentity::new("postgresql", "15"),
+            source_build: None,
+            target_build: None,
+            source_mapping_id: "mysql.text".into(),
+            source_mapping_version: "1".into(),
+            target: TargetRepresentation::new("character varying(40)"),
+            rule: RuleReference {
+                id: "text.value_preserved".into(),
+                version: "1".into(),
+            },
+            rule_digest: "rule-digest".into(),
+            capability_code: "postgresql15.text.varchar".into(),
+            capability_manifest_digest: "manifest-digest".into(),
+            target_probe_digest: None,
+            qualification: QualificationLevel::RangeChecked,
+            risk: RiskLevel::Low,
+            risk_code: Some("text.length".into()),
+            loss: LossAssessment::default(),
+            examples: Vec::new(),
+            locator_impact: LocatorImpact::NotUsed,
+            confirmation: PlanConfirmationState::NotRequired,
+            parameters: std::collections::BTreeMap::new(),
+            failure_policy: FailurePolicy::Reject,
+            input_digest: "input-digest".into(),
+            plan_digest: String::new(),
+        };
+        plan.plan_digest = plan.computed_digest();
+        plan
     }
 
     struct InjectedSink {
@@ -1220,5 +1463,58 @@ mod tests {
         );
         assert_eq!(rows, 1);
         assert!(!replayed);
+    }
+
+    #[test]
+    fn apply_diagnostic_identifies_plan_context_without_logging_the_value() {
+        let mut transaction = test_transaction();
+        transaction.changes[0].after = Some(vec![ColumnDatum {
+            ordinal: 0,
+            name: "message".into(),
+            native_type: "varchar(40)".into(),
+            primary_key_ordinal: None,
+            generated: false,
+            collation: None,
+            datum: change_event::Datum::Value(LogicalValue::Text {
+                charset: "utf8mb4".into(),
+                bytes_base64url: "c2Vuc2l0aXZlLXZhbHVl".into(),
+                text: Some("sensitive-value".into()),
+            }),
+        }]);
+        let plan = diagnostic_plan();
+        let mut failure = TargetCapabilityFailure::new("the value exceeds the qualified length");
+        failure.source_field_lineage = Some(plan.source_field.lineage_id.clone());
+        failure.target_field_lineage = Some(plan.target_field.lineage_id.clone());
+        let error = io::Error::other(
+            failure
+                .with_code("target_capability.length_exceeded")
+                .with_route("task-1")
+                .with_plan_digest(plan.plan_digest.clone()),
+        );
+
+        let diagnostic = apply_diagnostic(
+            "task-1",
+            &transaction,
+            Some("plan-set-digest"),
+            &[plan.clone()],
+            TargetApplyErrorKind::Conversion,
+            &error,
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&diagnostic).expect("diagnostic should be JSON");
+        assert_eq!(value["task_id"], "task-1");
+        assert_eq!(value["source_cursor"], "200");
+        assert_eq!(value["object"], "source.items");
+        assert_eq!(value["field"], "message");
+        assert_eq!(value["plan"]["digest"], plan.plan_digest);
+        assert_eq!(value["plan"]["target_type"], "character varying(40)");
+        assert_eq!(value["value_category"], "value");
+        assert_eq!(value["reason"], "the value exceeds the qualified length");
+        assert_eq!(
+            value["retry_advice"],
+            "route is blocked; fix or requalify the saved plan before resuming"
+        );
+        assert!(!diagnostic.contains("sensitive-value"));
+        assert!(!diagnostic.contains("c2Vuc2l0aXZlLXZhbHVl"));
     }
 }

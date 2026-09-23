@@ -194,18 +194,37 @@ impl Store {
         Ok(())
     }
     pub(crate) fn finish_task(&self, id: &str, error: Option<&str>) -> Result<()> {
+        self.finish_task_with_state(id, error, false)
+    }
+
+    pub(crate) fn finish_task_with_state(
+        &self,
+        id: &str,
+        error: Option<&str>,
+        blocked: bool,
+    ) -> Result<()> {
         self.db()?.execute(
             "UPDATE task_runtime SET state=?2,last_error=?3,stopped_at=?4 WHERE task_id=?1",
             params![
                 id,
-                if error.is_some() { "failed" } else { "stopped" },
+                if blocked {
+                    "blocked"
+                } else if error.is_some() {
+                    "failed"
+                } else {
+                    "stopped"
+                },
                 error,
                 now()
             ],
         )?;
         self.log_task(
             id,
-            if error.is_some() { "error" } else { "info" },
+            if blocked || error.is_some() {
+                "error"
+            } else {
+                "info"
+            },
             error.unwrap_or("任务已停止，进度保存在目的端 CDC.log_info"),
         )
     }

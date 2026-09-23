@@ -285,6 +285,7 @@ pub fn sql_with_plans_for_version(
     plans: &[ColumnConversionPlan],
 ) -> io::Result<SqlTransaction> {
     validate_plan_headers(plans, target_version)?;
+    validate_plan_coverage(validated, plans)?;
     let converted =
         change_event::convert_transaction_with_plans(validated.transaction().clone(), plans)
             .map_err(io::Error::other)?;
@@ -292,7 +293,42 @@ pub fn sql_with_plans_for_version(
     sql_for_version(target_version, &converted)
 }
 
+fn validate_plan_coverage(
+    validated: &ValidatedTransaction,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<()> {
+    for change in &validated.transaction().changes {
+        for image in [&change.before, &change.after].into_iter().flatten() {
+            for column in image.iter().filter(|column| !column.generated) {
+                let lineage = format!("catalog:{}.{}.{}", change.schema, change.table, column.name);
+                if !plans
+                    .iter()
+                    .any(|plan| plan.source_field.lineage_id == lineage)
+                {
+                    return Err(io::Error::other(
+                        TargetCapabilityFailure::new(format!(
+                            "no ColumnConversionPlan covers {}.{}.{}",
+                            change.schema, change.table, column.name
+                        ))
+                        .with_code("target_capability.plan_missing_for_column"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_plan_headers(plans: &[ColumnConversionPlan], target_version: &str) -> io::Result<()> {
+    if plans.is_empty() {
+        return Err(io::Error::other(
+            TargetCapabilityFailure::new(
+                "a plan-backed PostgreSQL apply requires at least one ColumnConversionPlan",
+            )
+            .with_code("target_capability.plans_missing"),
+        ));
+    }
+    let mut expected_target_build: Option<&ServerBuildIdentity> = None;
     for plan in plans {
         if !plan.verify_digest() {
             return Err(plan_failure(
@@ -311,6 +347,35 @@ fn validate_plan_headers(plans: &[ColumnConversionPlan], target_version: &str) -
                     plan.sink_connector.kind, plan.sink_connector.version, target_version
                 ),
             ));
+        }
+        let Some(target_build) = plan.target_build.as_ref() else {
+            return Err(plan_failure(
+                plan,
+                "target_capability.target_build_missing",
+                "a plan-backed PostgreSQL apply requires an exact target build identity",
+            ));
+        };
+        if target_build.product != "postgresql" || !target_build.version.starts_with(target_version)
+        {
+            return Err(plan_failure(
+                plan,
+                "target_capability.target_build_mismatch",
+                format!(
+                    "the plan targets PostgreSQL build {}, not version {}",
+                    target_build.version, target_version
+                ),
+            ));
+        }
+        if let Some(expected) = expected_target_build {
+            if expected != target_build {
+                return Err(plan_failure(
+                    plan,
+                    "target_capability.target_build_mismatch",
+                    "all ColumnConversionPlan values must target the same exact server build",
+                ));
+            }
+        } else {
+            expected_target_build = Some(target_build);
         }
         if plan.qualification == QualificationLevel::Unsupported {
             return Err(plan_failure(

@@ -69,12 +69,19 @@ impl Store {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::task_worker::run(&store, actor, &task_id, &thread_cancel)
                 }));
-                let error = match outcome {
-                    Ok(Ok(())) => None,
-                    Ok(Err(e)) => Some(e.to_string()),
-                    Err(_) => Some("任务线程异常退出；再次启动将从目的端 CDC.log_info 恢复".into()),
+                let (error, blocked) = match outcome {
+                    Ok(Ok(())) => (None, false),
+                    Ok(Err(crate::Error::Blocked(message))) => (Some(message), true),
+                    Ok(Err(e)) => (Some(e.to_string()), false),
+                    Err(_) => (
+                        Some("任务线程异常退出；再次启动将从目的端 CDC.log_info 恢复".into()),
+                        false,
+                    ),
                 };
-                if store.finish_task(&task_id, error.as_deref()).is_err() {
+                if store
+                    .finish_task_with_state(&task_id, error.as_deref(), blocked)
+                    .is_err()
+                {
                     eprintln!("[web] could not persist final task state");
                 }
             })

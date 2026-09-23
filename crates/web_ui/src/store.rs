@@ -181,7 +181,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 11 {
+        if version > 12 {
             return Err(Error::Invalid("SQLite 数据版本比当前程序新"));
         }
         match version {
@@ -219,6 +219,9 @@ impl Store {
         }
         if version < 11 {
             migrate_task_configuration_revisions(&mut conn)?;
+        }
+        if version < 12 {
+            conn.execute_batch(include_str!("migration_12.sql"))?;
         }
         conn.execute("UPDATE task_runtime SET state='stopped',stopped_at=?1 WHERE state IN ('starting','running','stopping')", [now()])?;
         let verifier: Option<Vec<u8>> = conn
