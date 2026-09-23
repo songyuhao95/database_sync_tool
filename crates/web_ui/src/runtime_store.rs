@@ -211,11 +211,63 @@ impl Store {
     }
     pub(crate) fn begin_task(&self, actor: i64, id: &str) -> Result<()> {
         let task = self.task(id)?;
+        self.begin_task_at_revision(actor, id, task.configuration_revision, false)
+    }
+
+    pub(crate) fn activate_task(&self, actor: i64, id: &str, desired_revision: i64) -> Result<()> {
+        self.begin_task_at_revision(actor, id, desired_revision, true)
+    }
+
+    fn begin_task_at_revision(
+        &self,
+        actor: i64,
+        id: &str,
+        expected_revision: i64,
+        require_valid_plan: bool,
+    ) -> Result<()> {
+        let task = self.task(id)?;
         let mut conn = self.db()?;
         let tx = conn.transaction()?;
         admin(&tx, actor)?;
-        if task.configuration_changed {
+        let current: (i64, i64, i64, i64, i64, i64, String, Option<String>, i64) = tx.query_row(
+            "SELECT t.configuration_revision,t.desired_configuration_revision,
+                    t.source_revision,t.sink_revision,s.revision,d.revision,
+                    t.plan_status,t.plan_version,json_array_length(t.plans_json)
+             FROM replication_tasks t
+             JOIN instances s ON s.id=t.source_id
+             JOIN instances d ON d.id=t.sink_id
+             WHERE t.id=?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )?;
+        if current.0 != expected_revision || current.1 != expected_revision {
+            return Err(Error::Conflict(
+                "Desired Configuration 已变化，请重新预检后再启动",
+            ));
+        }
+        if current.2 != current.4 || current.3 != current.5 {
             return Err(Error::Conflict("关联实例配置已变化，请重新创建任务"));
+        }
+        if require_valid_plan
+            && (current.6 != "valid"
+                || current.7.as_deref() != Some(crate::tasks::TASK_PLAN_VERSION)
+                || current.8 <= 0)
+        {
+            return Err(Error::Conflict(
+                "任务没有有效的 ColumnConversionPlan，请先重新预检",
+            ));
         }
         let active: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM task_runtime WHERE task_id=?1 AND state IN ('starting','running','stopping'))",[id],|r|r.get(0))?;
         if active {
@@ -233,6 +285,10 @@ impl Store {
                 return Err(Error::Conflict("另一个运行任务正在写入相同的目的表"));
             }
         }
+        tx.execute(
+            "UPDATE replication_tasks SET effective_configuration_revision=?2 WHERE id=?1",
+            params![id, expected_revision],
+        )?;
         tx.execute("INSERT INTO task_runtime(task_id,state,started_at) VALUES(?1,'starting',?2) ON CONFLICT(task_id) DO UPDATE SET state='starting',last_error=NULL,started_at=?2,stopped_at=NULL",params![id,now()])?;
         tx.commit()?;
         Ok(())

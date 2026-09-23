@@ -452,6 +452,43 @@ pub(crate) fn field_compatibility_with_source_evidence(
     parameters: &BTreeMap<String, String>,
     confirmations: &[change_event::RiskConfirmation],
 ) -> Result<CompatibilityResult, CompatibilityError> {
+    field_compatibility_with_source_evidence_and_target_probe(
+        source_connector,
+        sink_connector,
+        source,
+        sink,
+        source_column,
+        sink_column,
+        route_id,
+        configuration_revision,
+        source_build,
+        target_build,
+        source_catalog,
+        source_environment_fingerprint,
+        parameters,
+        confirmations,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn field_compatibility_with_source_evidence_and_target_probe(
+    source_connector: &ConnectorDescriptor,
+    sink_connector: &ConnectorDescriptor,
+    source: &CatalogTable,
+    sink: &CatalogTable,
+    source_column: &CatalogColumn,
+    sink_column: &CatalogColumn,
+    route_id: &str,
+    configuration_revision: &str,
+    source_build: Option<ServerBuildIdentity>,
+    target_build: Option<ServerBuildIdentity>,
+    source_catalog: Option<&postgresql_15::SourceTypeCatalog>,
+    source_environment_fingerprint: Option<&str>,
+    parameters: &BTreeMap<String, String>,
+    confirmations: &[change_event::RiskConfirmation],
+    target_probe: Option<&change_event::TargetCapabilityProbe>,
+) -> Result<CompatibilityResult, CompatibilityError> {
     // The task JSON keeps the selected rule beside its user-facing
     // conversion parameters. These reserved keys are consumed here and are
     // never forwarded to the rule option validator as arbitrary parameters.
@@ -510,6 +547,7 @@ pub(crate) fn field_compatibility_with_source_evidence(
         source_column,
         source_mapping.logical_type.clone(),
         source_key,
+        None,
     );
     let target_field = field_definition(
         sink,
@@ -521,15 +559,19 @@ pub(crate) fn field_compatibility_with_source_evidence(
                 format: "catalog-native".into(),
             }),
         target_key,
+        target_probe.map(|probe| probe.column_metadata.definition_fingerprint.as_str()),
     );
-    let manifest_build = target_build.clone().unwrap_or_else(|| {
-        ServerBuildIdentity::new(
-            sink_connector.identity.kind,
-            "catalog",
-            sink_connector.identity.version,
-            "catalog",
-        )
-    });
+    let manifest_build = target_probe
+        .map(|probe| probe.target_build.clone())
+        .or(target_build.clone())
+        .unwrap_or_else(|| {
+            ServerBuildIdentity::new(
+                sink_connector.identity.kind,
+                "catalog",
+                sink_connector.identity.version,
+                "catalog",
+            )
+        });
     let manifest = sink_connector.structured_manifest(manifest_build);
     change_event::plan_field_compatibility(FieldCompatibilityInput {
         source_field,
@@ -560,7 +602,7 @@ pub(crate) fn field_compatibility_with_source_evidence(
             selected_rule,
             parameters: planner_parameters,
             confirmations: confirmations.to_vec(),
-            target_probe: None,
+            target_probe: target_probe.cloned(),
         },
     })
 }
@@ -570,8 +612,11 @@ fn field_definition(
     column: &CatalogColumn,
     logical_type: LogicalType,
     primary_key_ordinal: Option<usize>,
+    schema_fingerprint: Option<&str>,
 ) -> FieldDefinition {
-    let fingerprint = fingerprint(table);
+    let fingerprint = schema_fingerprint
+        .map(str::to_owned)
+        .unwrap_or_else(|| fingerprint(table));
     FieldDefinition {
         reference: DefinitionReference::new(
             format!("catalog:{}.{}.{}", table.schema, table.name, column.name),

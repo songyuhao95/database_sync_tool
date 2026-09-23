@@ -129,6 +129,8 @@ pub(crate) struct ReplicationTask {
     pub plan_status: String,
     pub plan_invalid_reason: Option<String>,
     pub configuration_revision: i64,
+    pub desired_configuration_revision: i64,
+    pub effective_configuration_revision: Option<i64>,
     pub source_metadata_fingerprint: Option<String>,
     pub sink_metadata_fingerprint: Option<String>,
     pub connector_summary_json: String,
@@ -141,7 +143,7 @@ pub(crate) struct ReplicationTask {
     pub plan_needs_requalification: bool,
     pub runtime: crate::runtime_store::RuntimeInfo,
 }
-const FIELDS: &str = "t.id,t.name,t.source_id,t.sink_id,t.source_database,t.sink_database,s.name,d.name,t.source_revision,t.sink_revision,t.start_mode,t.mappings_json,t.status,t.created_at,(t.source_revision<>s.revision OR t.sink_revision<>d.revision),t.auto_start,t.plan_version,t.plan_status,t.plan_invalid_reason,t.configuration_revision,t.source_metadata_fingerprint,t.sink_metadata_fingerprint,t.connector_summary_json,t.capability_summary_json,t.capability_manifest_digest,t.rule_summary_digest,t.plan_set_digest,t.plans_json,t.risk_confirmations_json";
+const FIELDS: &str = "t.id,t.name,t.source_id,t.sink_id,t.source_database,t.sink_database,s.name,d.name,t.source_revision,t.sink_revision,t.start_mode,t.mappings_json,t.status,t.created_at,(t.source_revision<>s.revision OR t.sink_revision<>d.revision),t.auto_start,t.plan_version,t.plan_status,t.plan_invalid_reason,t.configuration_revision,t.desired_configuration_revision,t.effective_configuration_revision,t.source_metadata_fingerprint,t.sink_metadata_fingerprint,t.connector_summary_json,t.capability_summary_json,t.capability_manifest_digest,t.rule_summary_digest,t.plan_set_digest,t.plans_json,t.risk_confirmations_json";
 const JOINS: &str =
     "replication_tasks t JOIN instances s ON s.id=t.source_id JOIN instances d ON d.id=t.sink_id";
 fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReplicationTask> {
@@ -149,13 +151,13 @@ fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReplicationTask> {
     let mappings = serde_json::from_str(&json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
     })?;
-    let plans_json: String = r.get(27)?;
+    let plans_json: String = r.get(29)?;
     let plans = serde_json::from_str(&plans_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(27, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(29, rusqlite::types::Type::Text, Box::new(e))
     })?;
-    let confirmations_json: String = r.get(28)?;
+    let confirmations_json: String = r.get(30)?;
     let risk_confirmations = serde_json::from_str(&confirmations_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(28, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(30, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let configuration_changed: bool = r.get(14)?;
     let stored_plan_status: String = r.get(17)?;
@@ -191,13 +193,15 @@ fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReplicationTask> {
         plan_status: plan_status.clone(),
         plan_invalid_reason,
         configuration_revision: r.get(19)?,
-        source_metadata_fingerprint: r.get(20)?,
-        sink_metadata_fingerprint: r.get(21)?,
-        connector_summary_json: r.get(22)?,
-        capability_summary_json: r.get(23)?,
-        capability_manifest_digest: r.get(24)?,
-        rule_summary_digest: r.get(25)?,
-        plan_set_digest: r.get(26)?,
+        desired_configuration_revision: r.get(20)?,
+        effective_configuration_revision: r.get(21)?,
+        source_metadata_fingerprint: r.get(22)?,
+        sink_metadata_fingerprint: r.get(23)?,
+        connector_summary_json: r.get(24)?,
+        capability_summary_json: r.get(25)?,
+        capability_manifest_digest: r.get(26)?,
+        rule_summary_digest: r.get(27)?,
+        plan_set_digest: r.get(28)?,
         plans,
         risk_confirmations,
         plan_needs_requalification: plan_status != "valid",
@@ -346,6 +350,10 @@ fn default_sink_connector(sink: &CatalogTable) -> &'static ConnectorDescriptor {
         .expect("default Web sink connector is registered")
 }
 
+fn target_probe_key(schema: &str, table: &str, column: &str) -> String {
+    format!("{schema}.{table}.{column}")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_field_for_sink(
     source_connector: &ConnectorDescriptor,
@@ -362,10 +370,12 @@ fn plan_field_for_sink(
     target_build: Option<change_event::ServerBuildIdentity>,
     source_type_catalog: Option<&postgresql_15::SourceTypeCatalog>,
     source_environment_fingerprint: Option<&str>,
+    target_probe: Option<&change_event::TargetCapabilityProbe>,
+    allow_unconfirmed: bool,
 ) -> Result<change_event::ColumnConversionPlan> {
     let fail =
         |reason: &str| Error::Validation(format!("{}.{}：{reason}", source.schema, source.name));
-    let compatibility = crate::registry::field_compatibility_with_source_evidence(
+    let compatibility = crate::registry::field_compatibility_with_source_evidence_and_target_probe(
         source_connector,
         sink_connector,
         source,
@@ -380,12 +390,18 @@ fn plan_field_for_sink(
         source_environment_fingerprint,
         parameters,
         confirmations,
+        target_probe,
     )
     .map_err(|error| fail(&format!("字段 {} 无法规划：{error}", source_column.name)))?;
     if !matches!(
         compatibility.status,
         change_event::CompatibilityStatus::Compatible
-    ) {
+    ) && !(allow_unconfirmed
+        && matches!(
+            compatibility.status,
+            change_event::CompatibilityStatus::NeedsConfirmation
+        ))
+    {
         return Err(fail(&format!(
             "字段 {} 无法规划：{}",
             source_column.name, compatibility.explanation
@@ -413,6 +429,8 @@ fn plan_pair_for_sink(
     target_build: Option<change_event::ServerBuildIdentity>,
     source_type_catalog: Option<&postgresql_15::SourceTypeCatalog>,
     source_environment_fingerprint: Option<&str>,
+    target_probes: &BTreeMap<String, change_event::TargetCapabilityProbe>,
+    allow_unconfirmed: bool,
 ) -> Result<Vec<change_event::ColumnConversionPlan>> {
     let fail =
         |reason: &str| Error::Validation(format!("{}.{}：{reason}", source.schema, source.name));
@@ -451,6 +469,8 @@ fn plan_pair_for_sink(
             target_build.clone(),
             source_type_catalog,
             source_environment_fingerprint,
+            target_probes.get(&target_probe_key(&sink.schema, &sink.name, &b.name)),
+            allow_unconfirmed,
         )?);
     }
     Ok(plans)
@@ -476,6 +496,8 @@ fn validate_pair_for_sink(
         None,
         None,
         None,
+        &BTreeMap::new(),
+        false,
     )
     .map(|_| ())
 }
@@ -505,6 +527,8 @@ fn plan_selected_pair_for_sink(
     target_build: Option<change_event::ServerBuildIdentity>,
     source_type_catalog: Option<&postgresql_15::SourceTypeCatalog>,
     source_environment_fingerprint: Option<&str>,
+    target_probes: &BTreeMap<String, change_event::TargetCapabilityProbe>,
+    allow_unconfirmed: bool,
 ) -> Result<Vec<change_event::ColumnConversionPlan>> {
     if columns.is_empty() {
         return plan_pair_for_sink(
@@ -520,6 +544,8 @@ fn plan_selected_pair_for_sink(
             target_build,
             source_type_catalog,
             source_environment_fingerprint,
+            target_probes,
+            allow_unconfirmed,
         );
     }
     let fail =
@@ -567,6 +593,8 @@ fn plan_selected_pair_for_sink(
             target_build.clone(),
             source_type_catalog,
             source_environment_fingerprint,
+            target_probes.get(&target_probe_key(&sink.schema, &sink.name, &b.name)),
+            allow_unconfirmed,
         )?);
     }
     for column in &sink.columns {
@@ -608,6 +636,8 @@ fn validate_selected_pair_for_sink(
         None,
         None,
         None,
+        &BTreeMap::new(),
+        false,
     )
     .map(|_| ())
 }
@@ -644,12 +674,15 @@ fn plan_snapshot(
     mappings: &[TableMapping],
     source_tables: &BTreeMap<(String, String), CatalogTable>,
     sink_tables: &BTreeMap<(String, String), CatalogTable>,
+    source_metadata: &crate::model::Metadata,
+    sink_metadata: &crate::model::Metadata,
+    source_type_catalog_digest: Option<&str>,
     plans: Vec<change_event::ColumnConversionPlan>,
     confirmations: &[change_event::RiskConfirmation],
     source_build: change_event::ServerBuildIdentity,
     target_build: change_event::ServerBuildIdentity,
 ) -> Result<TaskPlanSnapshot> {
-    let source_metadata = mappings
+    let source_catalog = mappings
         .iter()
         .map(|mapping| {
             let table = source_tables
@@ -661,7 +694,7 @@ fn plan_snapshot(
             )
         })
         .collect::<Vec<_>>();
-    let sink_metadata = mappings
+    let sink_catalog = mappings
         .iter()
         .map(|mapping| {
             let table = sink_tables
@@ -673,14 +706,33 @@ fn plan_snapshot(
             )
         })
         .collect::<Vec<_>>();
-    let source_metadata_fingerprint = digest_serialized(&source_metadata);
-    let sink_metadata_fingerprint = digest_serialized(&sink_metadata);
-    let manifest = sink_connector.structured_manifest(target_build.clone());
+    // Catalog tables alone do not cover the evidence used by the source type
+    // mapper or the target session. Keep the complete probe metadata in the
+    // snapshot so a requalification observes extension, type-directory,
+    // server/environment, and target-session changes as stale inputs.
+    let source_metadata_fingerprint =
+        digest_serialized(&(source_metadata, source_type_catalog_digest, source_catalog));
+    let target_probe_digests = plans
+        .iter()
+        .map(|plan| {
+            (
+                plan.target_field.lineage_id.clone(),
+                plan.target_probe_digest.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sink_metadata_fingerprint =
+        digest_serialized(&(sink_metadata, sink_catalog, target_probe_digests));
+    let manifest_build = plans
+        .iter()
+        .find_map(|plan| plan.target_build.clone())
+        .unwrap_or(target_build);
+    let manifest = sink_connector.structured_manifest(manifest_build.clone());
     let connector_summary_json = serde_json::to_string(&serde_json::json!({
         "source": source_connector.identity,
         "sink": sink_connector.identity,
         "source_build": source_build,
-        "target_build": target_build,
+        "target_build": manifest_build,
     }))
     .map_err(|_| Error::Internal)?;
     let capability_summary_json = serde_json::to_string(&serde_json::json!({
@@ -767,7 +819,7 @@ fn persist_plan_snapshot(
     let confirmations_json =
         serde_json::to_string(&snapshot.confirmations).map_err(|_| Error::Internal)?;
     tx.execute(
-        "UPDATE replication_tasks SET plan_version=?2,plan_status='valid',plan_invalid_reason=NULL,configuration_revision=?3,source_metadata_fingerprint=?4,sink_metadata_fingerprint=?5,connector_summary_json=?6,capability_summary_json=?7,capability_manifest_digest=?8,rule_summary_digest=?9,plan_set_digest=?10,plans_json=?11,risk_confirmations_json=?12 WHERE id=?1",
+        "UPDATE replication_tasks SET plan_version=?2,plan_status='valid',plan_invalid_reason=NULL,configuration_revision=?3,desired_configuration_revision=?3,source_metadata_fingerprint=?4,sink_metadata_fingerprint=?5,connector_summary_json=?6,capability_summary_json=?7,capability_manifest_digest=?8,rule_summary_digest=?9,plan_set_digest=?10,plans_json=?11,risk_confirmations_json=?12 WHERE id=?1",
         params![
             task_id,
             snapshot.plan_version,
@@ -784,6 +836,99 @@ fn persist_plan_snapshot(
         ],
     )?;
     persist_plan_rows(tx, task_id, snapshot)
+}
+
+fn persist_configuration_revision(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    actor: i64,
+    input: &TaskInput,
+    snapshot: Option<&TaskPlanSnapshot>,
+) -> Result<()> {
+    let revision = snapshot.map_or(1, |snapshot| snapshot.configuration_revision);
+    let mappings_json = serde_json::to_string(&input.mappings).map_err(|_| Error::Internal)?;
+    let (
+        plan_version,
+        plan_status,
+        plan_invalid_reason,
+        source_metadata_fingerprint,
+        sink_metadata_fingerprint,
+        connector_summary_json,
+        capability_summary_json,
+        capability_manifest_digest,
+        rule_summary_digest,
+        plan_set_digest,
+        plans_json,
+        risk_confirmations_json,
+    ) = if let Some(snapshot) = snapshot {
+        (
+            Some(snapshot.plan_version.clone()),
+            "valid".to_owned(),
+            None::<String>,
+            Some(snapshot.source_metadata_fingerprint.clone()),
+            Some(snapshot.sink_metadata_fingerprint.clone()),
+            snapshot.connector_summary_json.clone(),
+            snapshot.capability_summary_json.clone(),
+            Some(snapshot.capability_manifest_digest.clone()),
+            Some(snapshot.rule_summary_digest.clone()),
+            Some(snapshot.plan_set_digest.clone()),
+            serde_json::to_string(&snapshot.plans).map_err(|_| Error::Internal)?,
+            serde_json::to_string(&snapshot.confirmations).map_err(|_| Error::Internal)?,
+        )
+    } else {
+        (
+            None,
+            "legacy".to_owned(),
+            None,
+            None,
+            None,
+            "{}".to_owned(),
+            "{}".to_owned(),
+            None,
+            None,
+            None,
+            "[]".to_owned(),
+            serde_json::to_string(&input.confirmations).map_err(|_| Error::Internal)?,
+        )
+    };
+    tx.execute(
+        "INSERT INTO task_configuration_revisions(
+             task_id,revision,name,source_id,sink_id,source_database,sink_database,
+             source_revision,sink_revision,start_mode,mappings_json,plan_version,plan_status,
+             plan_invalid_reason,source_metadata_fingerprint,sink_metadata_fingerprint,
+             connector_summary_json,capability_summary_json,capability_manifest_digest,
+             rule_summary_digest,plan_set_digest,plans_json,risk_confirmations_json,
+             created_at,created_by
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+        params![
+            task_id,
+            revision,
+            input.name.trim(),
+            input.source_id,
+            input.sink_id,
+            input.source_database,
+            input.sink_database,
+            input.source_revision,
+            input.sink_revision,
+            input.start_mode,
+            mappings_json,
+            plan_version,
+            plan_status,
+            plan_invalid_reason,
+            source_metadata_fingerprint,
+            sink_metadata_fingerprint,
+            connector_summary_json,
+            capability_summary_json,
+            capability_manifest_digest,
+            rule_summary_digest,
+            plan_set_digest,
+            plans_json,
+            risk_confirmations_json,
+            now(),
+            actor,
+        ],
+    )?;
+    Ok(())
 }
 
 fn input_from_task(task: &ReplicationTask) -> TaskInput {
@@ -977,6 +1122,33 @@ impl Store {
         route_id: &str,
         configuration_revision: i64,
     ) -> Result<TaskPlanSnapshot> {
+        self.preflight_task_with_snapshot_mode(
+            actor,
+            input,
+            route_id,
+            configuration_revision,
+            false,
+        )
+    }
+
+    pub(crate) fn preflight_task_preview(
+        &self,
+        actor: i64,
+        input: &TaskInput,
+        route_id: &str,
+        configuration_revision: i64,
+    ) -> Result<TaskPlanSnapshot> {
+        self.preflight_task_with_snapshot_mode(actor, input, route_id, configuration_revision, true)
+    }
+
+    fn preflight_task_with_snapshot_mode(
+        &self,
+        actor: i64,
+        input: &TaskInput,
+        route_id: &str,
+        configuration_revision: i64,
+        allow_unconfirmed: bool,
+    ) -> Result<TaskPlanSnapshot> {
         {
             let conn = self.db()?;
             admin(&conn, actor)?;
@@ -1039,8 +1211,12 @@ impl Store {
         let source_build = server_build_identity(source_connector, &source.metadata);
         let target_build = server_build_identity(sink_connector, &sink.metadata);
         let source_type_catalog = source.source_type_catalog.clone();
+        let source_type_catalog_digest = source_type_catalog
+            .as_ref()
+            .map(postgresql_15::SourceTypeCatalog::evidence_digest);
         let source_environment_fingerprint =
             source_environment_fingerprint(&source.metadata).map(str::to_owned);
+        let mut target_probes = BTreeMap::new();
         for schema in input
             .mappings
             .iter()
@@ -1052,6 +1228,32 @@ impl Store {
             }
             for table in sink.tables(schema)? {
                 sink_tables.insert((table.schema.clone(), table.name.clone()), table);
+            }
+        }
+        for mapping in &input.mappings {
+            let sink_table = sink_tables
+                .get(&(mapping.sink_schema.clone(), mapping.sink_table.clone()))
+                .ok_or_else(|| {
+                    Error::Validation(format!(
+                        "目的表 {}.{} 不存在或无权访问",
+                        mapping.sink_schema, mapping.sink_table
+                    ))
+                })?;
+            let columns = if mapping.columns.is_empty() {
+                sink_table
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>()
+            } else {
+                mapping.columns.iter().map(String::as_str).collect()
+            };
+            for column in columns {
+                let probe = sink.probe_target(&mapping.sink_schema, &mapping.sink_table, column)?;
+                target_probes.insert(
+                    target_probe_key(&mapping.sink_schema, &mapping.sink_table, column),
+                    probe,
+                );
             }
         }
         let configuration_revision_label = format!("{route_id}:r{configuration_revision}");
@@ -1087,6 +1289,8 @@ impl Store {
                 Some(target_build.clone()),
                 source_type_catalog.as_ref(),
                 source_environment_fingerprint.as_deref(),
+                &target_probes,
+                allow_unconfirmed,
             )?);
         }
         let snapshot = plan_snapshot(
@@ -1097,6 +1301,9 @@ impl Store {
             &input.mappings,
             &source_tables,
             &sink_tables,
+            &source.metadata,
+            &sink.metadata,
+            source_type_catalog_digest.as_deref(),
             plans,
             &input.confirmations,
             source_build,
@@ -1155,6 +1362,7 @@ impl Store {
         if let Some(snapshot) = snapshot {
             persist_plan_snapshot(&tx, &id, snapshot)?;
         }
+        persist_configuration_revision(&tx, &id, actor, &input, snapshot)?;
         tx.commit()?;
         drop(conn);
         self.task(&id)
@@ -1213,7 +1421,7 @@ impl Store {
             }
         }
         let changed = tx.execute(
-            "UPDATE replication_tasks SET source_revision=?2,sink_revision=?3,source_database=?4,sink_database=?5,start_mode=?6,mappings_json=?7 WHERE id=?1",
+            "UPDATE replication_tasks SET source_revision=?2,sink_revision=?3,source_database=?4,sink_database=?5,start_mode=?6,mappings_json=?7 WHERE id=?1 AND configuration_revision=?8 AND desired_configuration_revision=?8",
             params![
                 id,
                 input.source_revision,
@@ -1222,15 +1430,41 @@ impl Store {
                 input.sink_database,
                 input.start_mode,
                 serde_json::to_string(&input.mappings).map_err(|_| Error::Internal)?,
+                task.configuration_revision,
             ],
         )?;
         if changed != 1 {
-            return Err(Error::NotFound);
+            return Err(Error::Conflict("重新预检期间任务配置已变化，请重试"));
         }
         persist_plan_snapshot(&tx, id, &snapshot)?;
+        persist_configuration_revision(&tx, id, actor, &input, Some(&snapshot))?;
         tx.commit()?;
         drop(conn);
         self.task(id)
+    }
+
+    pub(crate) fn preview_requalify_task(&self, actor: i64, id: &str) -> Result<TaskPlanSnapshot> {
+        self.require_admin(actor)?;
+        let task = self.task(id)?;
+        let active: bool = self.db()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_runtime WHERE task_id=?1 AND state IN ('starting','running','stopping'))",
+            [id],
+            |row| row.get(0),
+        )?;
+        if active {
+            return Err(Error::Conflict("任务运行期间不能重新预检"));
+        }
+        let (source_revision, sink_revision): (i64, i64) = self.db()?.query_row(
+            "SELECT s.revision,d.revision FROM replication_tasks t JOIN instances s ON s.id=t.source_id JOIN instances d ON d.id=t.sink_id WHERE t.id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut input = input_from_task(&task);
+        input.source_revision = source_revision;
+        input.sink_revision = sink_revision;
+        input.confirmations.clear();
+        let next_revision = task.configuration_revision.max(1) + 1;
+        self.preflight_task_preview(actor, &input, id, next_revision)
     }
 
     fn mark_plan_stale(&self, id: &str, reason: &str) -> Result<()> {
@@ -1258,6 +1492,110 @@ impl Store {
                 "任务没有有效的 ColumnConversionPlan，请先重新预检",
             ));
         }
+        if task.desired_configuration_revision != task.configuration_revision {
+            return Err(Error::Conflict(
+                "任务 Desired Configuration revision 不一致，请先重新预检",
+            ));
+        }
+        let mappings_json = serde_json::to_string(&task.mappings).map_err(|_| Error::Internal)?;
+        let plans_json = serde_json::to_string(&task.plans).map_err(|_| Error::Internal)?;
+        let confirmations_json =
+            serde_json::to_string(&task.risk_confirmations).map_err(|_| Error::Internal)?;
+        let revision_matches: bool = self.db()?.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM task_configuration_revisions
+                  WHERE task_id=?1 AND revision=?2
+                    AND name=?3 AND source_id=?4 AND sink_id=?5
+                    AND source_database=?6 AND sink_database=?7
+                    AND source_revision=?8 AND sink_revision=?9
+                    AND start_mode=?10 AND mappings_json=?11
+                    AND plan_version IS ?12 AND plan_status=?13
+                    AND plan_invalid_reason IS ?14
+                    AND source_metadata_fingerprint IS ?15
+                    AND sink_metadata_fingerprint IS ?16
+                    AND connector_summary_json=?17
+                    AND capability_summary_json=?18
+                    AND capability_manifest_digest IS ?19
+                    AND rule_summary_digest IS ?20
+                    AND plan_set_digest IS ?21
+                    AND plans_json=?22
+                    AND risk_confirmations_json=?23
+             )",
+            params![
+                task.id,
+                task.desired_configuration_revision,
+                task.name,
+                task.source_id,
+                task.sink_id,
+                task.source_database,
+                task.sink_database,
+                task.source_revision,
+                task.sink_revision,
+                task.start_mode,
+                mappings_json,
+                task.plan_version.as_deref(),
+                task.plan_status,
+                task.plan_invalid_reason.as_deref(),
+                task.source_metadata_fingerprint.as_deref(),
+                task.sink_metadata_fingerprint.as_deref(),
+                task.connector_summary_json,
+                task.capability_summary_json,
+                task.capability_manifest_digest.as_deref(),
+                task.rule_summary_digest.as_deref(),
+                task.plan_set_digest.as_deref(),
+                plans_json,
+                confirmations_json,
+            ],
+            |row| row.get(0),
+        )?;
+        if !revision_matches {
+            return Err(Error::Conflict(
+                "任务配置 revision 不存在或内容已损坏，请先重新预检",
+            ));
+        }
+        let persisted_plan_rows: Vec<(i64, String, String, String, String)> = {
+            let conn = self.db()?;
+            let mut statement = conn.prepare(
+                "SELECT ordinal,source_field_lineage,target_field_lineage,plan_digest,plan_json
+                 FROM task_conversion_plans WHERE task_id=?1 ORDER BY ordinal",
+            )?;
+            statement
+                .query_map([&task.id], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let plan_rows_match = persisted_plan_rows.len() == task.plans.len()
+            && persisted_plan_rows.iter().zip(&task.plans).enumerate().all(
+                |(ordinal, (row, plan))| {
+                    row.0 == ordinal as i64
+                        && row.1 == plan.source_field.lineage_id
+                        && row.2 == plan.target_field.lineage_id
+                        && row.3 == plan.plan_digest
+                        && serde_json::from_str::<change_event::ColumnConversionPlan>(&row.4)
+                            .map(|stored| stored == *plan)
+                            .unwrap_or(false)
+                },
+            );
+        if !plan_rows_match {
+            return Err(Error::Conflict(
+                "任务保存的 ColumnConversionPlan 明细不完整或已损坏，请先重新预检",
+            ));
+        }
+        if task.plans.iter().any(|plan| {
+            !plan.verify_digest()
+                || (plan.confirmation == change_event::PlanConfirmationState::Required)
+        }) {
+            return Err(Error::Conflict(
+                "任务的 ColumnConversionPlan 不完整或缺少风险确认，请先重新预检",
+            ));
+        }
         let input = input_from_task(task);
         let current = match self.preflight_task_with_snapshot(
             actor,
@@ -1281,6 +1619,8 @@ impl Store {
                 == Some(current.capability_manifest_digest.as_str())
             && task.rule_summary_digest.as_deref() == Some(current.rule_summary_digest.as_str())
             && task.plan_set_digest.as_deref() == Some(current.plan_set_digest.as_str())
+            && task.connector_summary_json == current.connector_summary_json
+            && task.capability_summary_json == current.capability_summary_json
             && task.plans == current.plans;
         if !matches {
             self.mark_plan_stale(&task.id, "源/目的元数据、连接器、能力清单或转换规则已变化")?;

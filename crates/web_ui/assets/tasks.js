@@ -27,7 +27,13 @@ function taskRequalifyAction(task,refresh) {
   const button=node('button','btn','重新预检');button.type='button';button.title='重新读取源/目的元数据并生成完整 ColumnConversionPlan';
   button.addEventListener('click',async()=>{
     button.disabled=true;
-    try{await api('/api/tasks/'+encodeURIComponent(task.id)+'/requalify',{method:'POST',body:JSON.stringify({confirmations:task.risk_confirmations||[]})});await refresh();}
+    try{
+      const preview=await api('/api/tasks/'+encodeURIComponent(task.id)+'/requalify/preview',{method:'POST'});
+      const required=(preview.plans||[]).filter(plan=>plan.confirmation==='required');
+      if(required.length&&!window.confirm('重新预检发现 '+required.length+' 个需要确认的转换风险。确认后才会保存新的配置 revision。')){button.disabled=false;return;}
+      const confirmations=required.map(plan=>({source_field_lineage:plan.source_field.lineage_id,target_field_lineage:plan.target_field.lineage_id,rule:plan.rule,plan_digest:plan.plan_digest,actor:state.me.user.username,confirmed_at:new Date().toISOString(),reason:'重新预检确认兼容转换风险'}));
+      await api('/api/tasks/'+encodeURIComponent(task.id)+'/requalify',{method:'POST',body:JSON.stringify({confirmations})});await refresh();
+    }
     catch(reason){toast(reason.message);button.disabled=false;}
   });return button;
 }

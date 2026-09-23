@@ -58,7 +58,7 @@ impl Store {
         if let Some(old) = workers.remove(&id) {
             let _ = old.handle.join();
         }
-        self.begin_task(actor, &id)?;
+        self.activate_task(actor, &id, task.configuration_revision)?;
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
         let store = self.clone();

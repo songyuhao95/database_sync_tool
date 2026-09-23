@@ -116,6 +116,10 @@ pub fn router(store: Arc<Store>, config: WebConfig) -> Result<Router> {
         .route("/api/tasks", get(tasks).post(create_task))
         .route("/api/compatibility/preview", post(preview_field))
         .route("/api/tasks/{id}", get(task).delete(delete_task))
+        .route(
+            "/api/tasks/{id}/requalify/preview",
+            post(preview_requalify_task),
+        )
         .route("/api/tasks/{id}/requalify", post(requalify_task))
         .route("/api/tasks/{id}/preflight", post(requalify_task))
         .route(
@@ -547,6 +551,17 @@ async fn requalify_task(
 ) -> Result<Json<crate::tasks::ReplicationTask>> {
     state
         .run(move |store| store.requalify_task(session.user.id, &id, input.confirmations))
+        .await
+        .map(Json)
+}
+
+async fn preview_requalify_task(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::tasks::TaskPlanSnapshot>> {
+    state
+        .run(move |store| store.preview_requalify_task(session.user.id, &id))
         .await
         .map(Json)
 }

@@ -285,7 +285,7 @@ CREATE TABLE instances (
         .unwrap();
     assert_eq!(owner, "admin");
     assert!(note.is_empty());
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -330,7 +330,7 @@ CREATE TABLE instances (
         )
         .unwrap();
     assert!(note.is_empty());
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 async fn response_json(response: axum::response::Response) -> Value {

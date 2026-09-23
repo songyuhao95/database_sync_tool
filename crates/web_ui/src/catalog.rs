@@ -100,6 +100,12 @@ pub(crate) struct CatalogConnection {
     pub database: Option<String>,
     pub metadata: Metadata,
     pub source_type_catalog: Option<postgresql_15::SourceTypeCatalog>,
+    host: String,
+    port: u16,
+    kind: String,
+    version: String,
+    username: String,
+    password: String,
     conn: CatalogBackend,
 }
 
@@ -190,6 +196,11 @@ impl Store {
         }
         .ok_or(Error::Invalid("Web 未注册该数据库连接器"))?;
         if kind == "postgresql" {
+            let probe_host = host.clone();
+            let probe_kind = kind.clone();
+            let probe_version = version.clone();
+            let probe_username = username.clone();
+            let probe_password = password.clone();
             let database_for_connection = database.clone();
             let (runtime, conn, metadata, source_type_catalog) = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -245,6 +256,12 @@ impl Store {
                 database: Some(database),
                 metadata: Metadata::Postgresql(metadata),
                 source_type_catalog: Some(source_type_catalog),
+                host: probe_host,
+                port,
+                kind: probe_kind,
+                version: probe_version,
+                username: probe_username,
+                password: probe_password,
                 conn: CatalogBackend::Postgresql {
                     runtime: Some(runtime),
                     conn,
@@ -256,10 +273,10 @@ impl Store {
         }
         let mut conn = Conn::new(
             OptsBuilder::new()
-                .ip_or_hostname(Some(host))
+                .ip_or_hostname(Some(host.clone()))
                 .tcp_port(port)
-                .user(Some(username))
-                .pass(Some(password))
+                .user(Some(username.clone()))
+                .pass(Some(password.clone()))
                 .tcp_connect_timeout(Some(Duration::from_secs(3)))
                 .read_timeout(Some(Duration::from_secs(5)))
                 .write_timeout(Some(Duration::from_secs(5))),
@@ -283,6 +300,12 @@ impl Store {
                 gtid_mode: gtid,
             },
             source_type_catalog: None,
+            host,
+            port,
+            kind,
+            version,
+            username,
+            password,
             conn: CatalogBackend::Mysql(conn),
         })
     }
@@ -311,6 +334,81 @@ impl Store {
 }
 
 impl CatalogConnection {
+    pub(crate) fn probe_target(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Result<change_event::TargetCapabilityProbe> {
+        let probe = match (self.kind.as_str(), self.version.as_str()) {
+            ("mysql", "5.7") => mysql_5_7::probe_target(
+                &mysql_5_7::TargetConfig {
+                    host: self.host.clone(),
+                    port: self.port,
+                    user: self.username.clone(),
+                    password: self.password.clone(),
+                },
+                schema,
+                table,
+                column,
+            ),
+            ("mysql", "8.0") => mysql_8_0::probe_target(
+                &mysql_8_0::TargetConfig {
+                    host: self.host.clone(),
+                    port: self.port,
+                    user: self.username.clone(),
+                    password: self.password.clone(),
+                },
+                schema,
+                table,
+                column,
+            ),
+            ("mysql", "8.4") => mysql_8_4::probe_target(
+                &mysql_8_4::TargetConfig {
+                    host: self.host.clone(),
+                    port: self.port,
+                    user: self.username.clone(),
+                    password: self.password.clone(),
+                },
+                schema,
+                table,
+                column,
+            ),
+            ("postgresql", target_version) => {
+                let database = self
+                    .database
+                    .as_deref()
+                    .ok_or(Error::Invalid("PostgreSQL 目的端缺少连接数据库"))?;
+                let config = postgresql_15::TargetConfig::new(
+                    &self.host,
+                    database,
+                    &self.username,
+                    &self.password,
+                )
+                .with_port(self.port);
+                let runtime = match &self.conn {
+                    CatalogBackend::Postgresql { runtime, .. } => {
+                        runtime.as_ref().expect("catalog runtime")
+                    }
+                    CatalogBackend::Mysql(_) => return Err(Error::Internal),
+                };
+                postgres_block_on(runtime, async {
+                    postgresql_15::probe_target_for_version(
+                        &config,
+                        schema,
+                        table,
+                        column,
+                        target_version,
+                    )
+                    .await
+                })
+            }
+            _ => return Err(Error::Invalid("Web 未注册该数据库连接器")),
+        }
+        .map_err(|_| Error::Invalid("读取目的端能力与会话配置失败，请检查账号权限"))?;
+        Ok(probe)
+    }
+
     pub(crate) fn schemas(&mut self) -> Result<Vec<String>> {
         match &mut self.conn {
             CatalogBackend::Mysql(conn) => conn.query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE LOWER(SCHEMA_NAME) NOT IN ('information_schema','performance_schema','mysql','sys','cdc') ORDER BY SCHEMA_NAME")

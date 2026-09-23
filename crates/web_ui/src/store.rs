@@ -111,6 +111,68 @@ fn migrate_task_plans(conn: &mut Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+fn migrate_task_configuration_revisions(conn: &mut Connection) -> Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_configuration_revisions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(include_str!("migration_11.sql"))?;
+        return Ok(());
+    }
+
+    let has_desired_revision: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('replication_tasks') WHERE name='desired_configuration_revision')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_desired_revision {
+        conn.execute_batch(
+            "ALTER TABLE replication_tasks
+             ADD COLUMN desired_configuration_revision INTEGER NOT NULL DEFAULT 1
+             CHECK(desired_configuration_revision > 0);",
+        )?;
+    }
+    let has_effective_revision: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('replication_tasks') WHERE name='effective_configuration_revision')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_effective_revision {
+        conn.execute_batch(
+            "ALTER TABLE replication_tasks
+             ADD COLUMN effective_configuration_revision INTEGER
+             CHECK(effective_configuration_revision IS NULL OR effective_configuration_revision > 0);",
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO task_configuration_revisions (
+             task_id,revision,name,source_id,sink_id,source_database,sink_database,
+             source_revision,sink_revision,start_mode,mappings_json,plan_version,plan_status,
+             plan_invalid_reason,source_metadata_fingerprint,sink_metadata_fingerprint,
+             connector_summary_json,capability_summary_json,capability_manifest_digest,
+             rule_summary_digest,plan_set_digest,plans_json,risk_confirmations_json,
+             created_at,created_by
+         )
+         SELECT id,configuration_revision,name,source_id,sink_id,source_database,sink_database,
+                source_revision,sink_revision,start_mode,mappings_json,plan_version,plan_status,
+                plan_invalid_reason,source_metadata_fingerprint,sink_metadata_fingerprint,
+                connector_summary_json,capability_summary_json,capability_manifest_digest,
+                rule_summary_digest,plan_set_digest,plans_json,risk_confirmations_json,
+                created_at,created_by
+           FROM replication_tasks",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE replication_tasks SET desired_configuration_revision=configuration_revision",
+        [],
+    )?;
+    conn.pragma_update(None, "user_version", 11)?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>, key: [u8; 32]) -> Result<Self> {
         let mut conn = Connection::open(path.as_ref())?;
@@ -119,7 +181,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 10 {
+        if version > 11 {
             return Err(Error::Invalid("SQLite 数据版本比当前程序新"));
         }
         match version {
@@ -154,6 +216,9 @@ impl Store {
         }
         if version < 10 {
             migrate_task_plans(&mut conn)?;
+        }
+        if version < 11 {
+            migrate_task_configuration_revisions(&mut conn)?;
         }
         conn.execute("UPDATE task_runtime SET state='stopped',stopped_at=?1 WHERE state IN ('starting','running','stopping')", [now()])?;
         let verifier: Option<Vec<u8>> = conn
