@@ -461,12 +461,13 @@ impl ChangeTransaction {
 fn canonicalize_transaction(transaction: &ChangeTransaction) -> ChangeTransaction {
     let mut canonical = transaction.clone();
     for change in &mut canonical.changes {
-        for image in [&mut change.before, &mut change.after] {
-            if let Some(image) = image {
-                for column in image {
-                    if let Datum::Value(value) = &mut column.datum {
-                        *value = canonicalize_logical_value(value);
-                    }
+        for image in [&mut change.before, &mut change.after]
+            .into_iter()
+            .flatten()
+        {
+            for column in image {
+                if let Datum::Value(value) = &mut column.datum {
+                    *value = canonicalize_logical_value(value);
                 }
             }
         }

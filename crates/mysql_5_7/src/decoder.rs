@@ -609,6 +609,7 @@ fn parse_decimal(text: &str) -> io::Result<LogicalValue> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn decode_temporal_components(
     data_type: &str,
     year: u16,

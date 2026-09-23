@@ -260,6 +260,7 @@ pub struct TargetCapabilityProbe {
 }
 
 impl TargetCapabilityProbe {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<I, J>(
         target_build: ServerBuildIdentity,
         database: impl Into<String>,
@@ -327,6 +328,7 @@ impl TargetCapabilityProbe {
             })
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn validate(&self) -> Result<(), TargetCapabilityFailure> {
         if !self.verify_digest() {
             return Err(
@@ -1186,7 +1188,7 @@ pub enum RiskLevel {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct LossAssessment {
     /// Whether the selected representation can lose source value semantics.
     pub value: bool,
@@ -1197,18 +1199,6 @@ pub struct LossAssessment {
     /// Whether source constraints require an explicit target policy.
     pub constraints: bool,
     pub explanation: String,
-}
-
-impl Default for LossAssessment {
-    fn default() -> Self {
-        Self {
-            value: false,
-            comparison: false,
-            ordering: false,
-            constraints: false,
-            explanation: String::new(),
-        }
-    }
 }
 
 impl LossAssessment {
@@ -1255,33 +1245,23 @@ pub struct ConversionExample {
     pub target: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum LocatorImpact {
     Preserved,
+    #[default]
     NotUsed,
     ValueOnly,
     Blocked,
 }
 
-impl Default for LocatorImpact {
-    fn default() -> Self {
-        Self::NotUsed
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanConfirmationState {
+    #[default]
     NotRequired,
     Required,
     Confirmed,
-}
-
-impl Default for PlanConfirmationState {
-    fn default() -> Self {
-        Self::NotRequired
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
