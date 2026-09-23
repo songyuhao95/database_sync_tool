@@ -3,8 +3,10 @@ use std::io;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use change_event::{
-    CapabilityManifest, ColumnDatum, Datum, JsonEntry, JsonValue, LogicalValue, Operation,
-    RowChange, TargetCapabilityFailure, ValidatedTransaction,
+    CapabilityManifest, CapabilityProbeEntry, CapabilityProbeStatus, ColumnConversionPlan,
+    ColumnDatum, Datum, JsonEntry, JsonValue, LogicalValue, Operation, PlanConfirmationState,
+    QualificationLevel, RowChange, ServerBuildIdentity, TargetCapabilityFailure,
+    TargetCapabilityProbe, TargetColumnMetadata, TargetSessionProfile, ValidatedTransaction,
 };
 use mysql_driver::prelude::Queryable;
 use mysql_driver::{Conn, OptsBuilder, TxOpts, Value};
@@ -178,6 +180,7 @@ struct PreparedQuery {
 pub struct SqlTransaction {
     source_transaction_id: String,
     pub(crate) source_uuid: String,
+    target_build: Option<ServerBuildIdentity>,
     pub(crate) commit_cursor: change_event::SourceCursor,
     tables: Vec<(String, String)>,
     statements: Vec<PlannedStatement>,
@@ -243,6 +246,7 @@ pub fn sql(validated: &ValidatedTransaction) -> io::Result<SqlTransaction> {
     Ok(SqlTransaction {
         source_transaction_id: transaction.id.clone(),
         source_uuid: transaction.source.id.clone(),
+        target_build: None,
         commit_cursor: transaction.commit_cursor.clone(),
         tables: transaction
             .changes
@@ -255,8 +259,217 @@ pub fn sql(validated: &ValidatedTransaction) -> io::Result<SqlTransaction> {
     })
 }
 
+pub fn sql_with_plans(
+    validated: &ValidatedTransaction,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<SqlTransaction> {
+    validate_plan_headers(plans)?;
+    validate_plan_coverage(validated, plans)?;
+    let converted =
+        change_event::convert_transaction_with_plans(validated.transaction().clone(), plans)
+            .map_err(io::Error::other)?;
+    let converted = change_event::validate(converted).map_err(io::Error::other)?;
+    planned_sql(&converted, plans)
+}
+
+fn planned_sql(
+    validated: &ValidatedTransaction,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<SqlTransaction> {
+    let transaction = validated.transaction();
+    let mut statements = Vec::with_capacity(transaction.changes.len());
+    for change in &transaction.changes {
+        ensure_supported_change_with_plans(change, plans)?;
+        let (rendered, params) = SqlRenderer.write_change_with_plans(change, plans)?;
+        let probe = match change.operation {
+            Operation::Insert => None,
+            Operation::Update | Operation::Delete => {
+                let (predicates, params) = key_predicates_with_plans(
+                    &change.schema,
+                    &change.table,
+                    change.before.as_ref().expect("validated image"),
+                    plans,
+                )?;
+                Some(PreparedQuery {
+                    sql: format!(
+                        "SELECT 1 FROM {} WHERE {predicates} LIMIT 2 FOR UPDATE",
+                        qualified_table(&change.schema, &change.table),
+                    ),
+                    params,
+                })
+            }
+        };
+        statements.push(PlannedStatement {
+            sql: rendered,
+            params,
+            probe,
+            operation: change.operation,
+        });
+    }
+    Ok(SqlTransaction {
+        source_transaction_id: transaction.id.clone(),
+        source_uuid: transaction.source.id.clone(),
+        target_build: plans.first().and_then(|plan| plan.target_build.clone()),
+        commit_cursor: transaction.commit_cursor.clone(),
+        tables: transaction
+            .changes
+            .iter()
+            .map(|c| (c.schema.clone(), c.table.clone()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        statements,
+    })
+}
+
+fn validate_plan_headers(plans: &[ColumnConversionPlan]) -> io::Result<()> {
+    if plans.is_empty() {
+        return Err(io::Error::other(
+            TargetCapabilityFailure::new(
+                "a plan-backed MySQL apply requires at least one ColumnConversionPlan",
+            )
+            .with_code("target_capability.plans_missing"),
+        ));
+    }
+    for plan in plans {
+        if !plan.verify_digest() {
+            return Err(plan_failure(
+                plan,
+                "target_capability.plan_digest_invalid",
+                "the stored ColumnConversionPlan digest is invalid",
+            ));
+        }
+        if plan.sink_connector.kind != "mysql" || plan.sink_connector.version != TARGET_VERSION {
+            return Err(plan_failure(
+                plan,
+                "target_capability.sink_connector_mismatch",
+                format!(
+                    "the plan targets mysql {}, not mysql {}",
+                    plan.sink_connector.version, TARGET_VERSION
+                ),
+            ));
+        }
+        let Some(target_build) = plan.target_build.as_ref() else {
+            return Err(plan_failure(
+                plan,
+                "target_capability.target_build_missing",
+                "a plan-backed MySQL apply requires an exact target build identity",
+            ));
+        };
+        if target_build.product != "mysql" || !target_build.version.starts_with(TARGET_VERSION) {
+            return Err(plan_failure(
+                plan,
+                "target_capability.target_build_mismatch",
+                format!("the plan targets a different MySQL server build than {TARGET_VERSION}"),
+            ));
+        }
+        if plan.qualification == QualificationLevel::Unsupported {
+            return Err(plan_failure(
+                plan,
+                "target_capability.unsupported_plan",
+                "an unsupported conversion plan cannot be applied",
+            ));
+        }
+        if plan.confirmation == PlanConfirmationState::Required {
+            return Err(plan_failure(
+                plan,
+                "target_capability.confirmation_required",
+                "the conversion plan requires route confirmation before apply",
+            ));
+        }
+    }
+    let expected_build = plans[0].target_build.as_ref();
+    if plans
+        .iter()
+        .any(|plan| plan.target_build.as_ref() != expected_build)
+    {
+        return Err(plan_failure(
+            &plans[0],
+            "target_capability.target_build_mismatch",
+            "all column conversion plans must target the same exact server build",
+        ));
+    }
+    Ok(())
+}
+
+fn plan_failure(plan: &ColumnConversionPlan, code: &str, message: impl Into<String>) -> io::Error {
+    io::Error::other(
+        TargetCapabilityFailure::new(message)
+            .with_code(code)
+            .with_route(plan.route_id.clone())
+            .with_plan_digest(plan.plan_digest.clone()),
+    )
+}
+
+fn column_plan<'a>(
+    schema: &str,
+    table: &str,
+    column: &ColumnDatum,
+    plans: &'a [ColumnConversionPlan],
+) -> Option<&'a ColumnConversionPlan> {
+    let lineage = format!("catalog:{schema}.{table}.{}", column.name);
+    plans
+        .iter()
+        .find(|plan| plan.source_field.lineage_id == lineage)
+}
+
+fn value_placeholder(change: &RowChange, column: &ColumnDatum, plans: &[ColumnConversionPlan]) -> String {
+    value_placeholder_for_key(&change.schema, &change.table, column, plans)
+}
+
+fn value_placeholder_for_key(
+    schema: &str,
+    table: &str,
+    column: &ColumnDatum,
+    plans: &[ColumnConversionPlan],
+) -> String {
+    let Some(plan) = column_plan(schema, table, column, plans) else {
+        return "?".into();
+    };
+    if TARGET_VERSION == "5.7"
+        || plan
+            .target
+            .parameters
+            .get("conversion_kind")
+            .map(String::as_str)
+            != Some("spatial")
+    {
+        return "?".into();
+    }
+    plan.target
+        .parameters
+        .get("target_srid")
+        .filter(|srid| srid.parse::<i32>().is_ok())
+        .map_or_else(
+            || "ST_GeomFromWKB(?)".into(),
+            |srid| format!("ST_GeomFromWKB(?, {srid})"),
+        )
+}
+
+fn validate_plan_coverage(
+    validated: &ValidatedTransaction,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<()> {
+    for change in &validated.transaction().changes {
+        for image in [&change.before, &change.after].into_iter().flatten() {
+            for column in image.iter().filter(|column| !column.generated) {
+                if column_plan(&change.schema, &change.table, column, plans).is_none() {
+                    return Err(io::Error::other(
+                        TargetCapabilityFailure::new(format!(
+                            "no ColumnConversionPlan covers {}.{}.{}",
+                            change.schema, change.table, column.name
+                        ))
+                        .with_code("target_capability.plan_missing_for_column"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn execute(config: &TargetConfig, plan: &SqlTransaction) -> io::Result<ApplyResult> {
-    let mut conn = connect(config)?;
+    let mut conn = connect(config, plan.target_build.as_ref())?;
     let mut tx = conn
         .start_transaction(TxOpts::default())
         .map_err(io::Error::other)?;
@@ -268,7 +481,22 @@ pub fn execute(config: &TargetConfig, plan: &SqlTransaction) -> io::Result<Apply
     })
 }
 
-pub(crate) fn connect(config: &TargetConfig) -> io::Result<Conn> {
+/// Convert and apply one complete transaction using the immutable route
+/// plans. Conversion happens before the target transaction is opened, so a
+/// failed plan cannot leave a partial write behind.
+pub fn execute_with_plans(
+    config: &TargetConfig,
+    validated: &ValidatedTransaction,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<ApplyResult> {
+    let plan = sql_with_plans(validated, plans)?;
+    execute(config, &plan)
+}
+
+pub(crate) fn connect(
+    config: &TargetConfig,
+    expected_build: Option<&ServerBuildIdentity>,
+) -> io::Result<Conn> {
     let opts = OptsBuilder::new()
         .ip_or_hostname(Some(config.host.clone()))
         .tcp_port(config.port)
@@ -282,7 +510,9 @@ pub(crate) fn connect(config: &TargetConfig) -> io::Result<Conn> {
         .query_first("SELECT VERSION()")
         .map_err(io::Error::other)?
         .ok_or_else(|| io::Error::other("target returned no version"))?;
-    if !version.starts_with(TARGET_VERSION) {
+    if !version.starts_with(TARGET_VERSION)
+        || expected_build.is_some_and(|build| build.version != version)
+    {
         return Err(capability_failure(format!(
             "mysql_{TARGET_VERSION} cannot write target version {version}"
         )));
@@ -294,6 +524,223 @@ pub(crate) fn connect(config: &TargetConfig) -> io::Result<Conn> {
     )
     .map_err(io::Error::other)?;
     Ok(conn)
+}
+
+/// Read-only target catalog evidence used to qualify a persisted plan. The
+/// target table is user-owned; this probe never creates or alters it.
+pub fn probe_target(
+    config: &TargetConfig,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> io::Result<TargetCapabilityProbe> {
+    let mut conn = connect(config, None)?;
+    let (version, version_comment, time_zone, sql_mode): (String, String, String, String) = conn
+        .query_first("SELECT VERSION(), @@version_comment, @@time_zone, @@sql_mode")
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("target returned no server identity"))?;
+    let engine: Option<String> = conn
+        .exec_first(
+            "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",
+            (schema, table),
+        )
+        .map_err(io::Error::other)?;
+    let engine = engine.ok_or_else(|| capability_failure("target table was not found"))?;
+    let triggers: u64 = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=? AND EVENT_OBJECT_TABLE=?",
+            (schema, table),
+        )
+        .map_err(io::Error::other)?
+        .unwrap_or(0);
+    let foreign_keys: u64 = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE (TABLE_SCHEMA=? AND TABLE_NAME=? AND REFERENCED_TABLE_NAME IS NOT NULL) OR (REFERENCED_TABLE_SCHEMA=? AND REFERENCED_TABLE_NAME=?)",
+            (schema, table, schema, table),
+        )
+        .map_err(io::Error::other)?
+        .unwrap_or(0);
+    let row: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+        Option<i64>,
+        Option<u64>,
+        Option<u64>,
+        String,
+        String,
+    )> = conn
+        .exec_first(
+            "SELECT COLUMN_TYPE, DATA_TYPE, CHARACTER_SET_NAME, COLLATION_NAME, NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION, IS_NULLABLE, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=?",
+            (schema, table, column),
+        )
+        .map_err(io::Error::other)?;
+    let Some((
+        native_type,
+        data_type,
+        charset,
+        collation,
+        precision,
+        scale,
+        length,
+        temporal_precision,
+        is_nullable,
+        extra,
+    )) = row
+    else {
+        return Err(capability_failure("target table or column was not found"));
+    };
+    let indexes: Vec<String> = conn
+        .exec_map(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=? ORDER BY INDEX_NAME",
+            (schema, table, column),
+            |name: String| name,
+        )
+        .map_err(io::Error::other)?;
+    let target_build = ServerBuildIdentity::new(
+        "mysql",
+        if version_comment.trim().is_empty() {
+            "oracle"
+        } else {
+            version_comment.trim()
+        },
+        version.clone(),
+        format!("mysql-{version}"),
+    );
+    let manifest = crate::compatibility::compatibility_manifest(target_build.clone());
+    let is_spatial_target = matches!(
+        data_type.to_ascii_lowercase().as_str(),
+        "geometry"
+            | "point"
+            | "linestring"
+            | "polygon"
+            | "multipoint"
+            | "multilinestring"
+            | "multipolygon"
+            | "geometrycollection"
+    );
+    let qualified = engine.eq_ignore_ascii_case("InnoDB") && triggers == 0 && foreign_keys == 0;
+    let mut capabilities = manifest
+        .capabilities
+        .iter()
+        .filter(|capability| {
+            capability
+                .target
+                .native_type
+                .eq_ignore_ascii_case(&native_type)
+                || (capability
+                    .target
+                    .parameters
+                    .get("target_storage")
+                    .map(String::as_str)
+                    == Some("mysql_geometry")
+                    && is_spatial_target)
+                || (matches!(capability.target.native_type.as_str(), "enum" | "set")
+                    && data_type.eq_ignore_ascii_case(&capability.target.native_type)
+                    && native_type
+                        .to_ascii_lowercase()
+                        .starts_with(&data_type.to_ascii_lowercase()))
+        })
+        .map(|capability| {
+            let status = if qualified {
+                CapabilityProbeStatus::Qualified
+            } else {
+                CapabilityProbeStatus::Missing
+            };
+            CapabilityProbeEntry::new(capability.code.clone(), status)
+                .with_version(version.clone())
+                .with_evidence_digest(change_event::stable_digest(&(
+                    &native_type,
+                    &engine,
+                    triggers,
+                    foreign_keys,
+                )))
+        })
+        .collect::<Vec<_>>();
+    if capabilities.is_empty() {
+        capabilities.push(
+            CapabilityProbeEntry::new(
+                format!("target_type:{}", data_type.to_ascii_lowercase()),
+                CapabilityProbeStatus::Detected,
+            )
+            .with_version(version.clone())
+            .with_evidence_digest(change_event::stable_digest(&(
+                &native_type,
+                &engine,
+                triggers,
+                foreign_keys,
+            ))),
+        );
+    }
+    let constraints = [
+        (!qualified && !engine.eq_ignore_ascii_case("InnoDB")).then_some("engine:not_innodb"),
+        (triggers != 0).then_some("triggers:present"),
+        (foreign_keys != 0).then_some("foreign_keys:present"),
+        (is_nullable.eq_ignore_ascii_case("NO")).then_some("not_null"),
+        (!extra.trim().is_empty()).then_some("extra_definition"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let definition_fingerprint = change_event::stable_digest(&(
+        (
+            schema,
+            table,
+            column,
+            &native_type,
+            &data_type,
+            &charset,
+            &collation,
+        ),
+        (
+            precision,
+            scale,
+            length,
+            temporal_precision,
+            &is_nullable,
+            &extra,
+            &engine,
+            triggers,
+            foreign_keys,
+            &indexes,
+        ),
+    ));
+    let mut metadata = TargetColumnMetadata::new(definition_fingerprint)
+        .with_native_type(native_type)
+        .with_constraints(constraints)
+        .with_indexes(indexes);
+    if let Some(precision) = precision.and_then(|value| u32::try_from(value).ok()) {
+        metadata = metadata.with_precision(precision);
+    }
+    if let Some(scale) = scale.and_then(|value| i32::try_from(value).ok()) {
+        metadata = metadata.with_scale(scale);
+    }
+    if let Some(length) = length {
+        metadata = metadata.with_length(length);
+    }
+    if let Some(charset) = charset {
+        metadata = metadata.with_charset(charset);
+    }
+    if let Some(collation) = collation {
+        metadata = metadata.with_collation(collation);
+    }
+    let session = TargetSessionProfile::new(
+        format!("mysql-{TARGET_VERSION};version={version}"),
+        [("time_zone", time_zone), ("sql_mode", sql_mode)],
+    );
+    Ok(TargetCapabilityProbe::new(
+        target_build,
+        schema,
+        table,
+        column,
+        metadata,
+        capabilities,
+        Vec::<CapabilityProbeEntry>::new(),
+        session,
+    ))
 }
 
 pub(crate) fn execute_statements(
@@ -367,6 +814,85 @@ impl SqlRenderer {
             Operation::Insert => self.write_insert(&table, change),
             Operation::Update => self.write_update(&table, change),
             Operation::Delete => self.write_delete(&table, change),
+        }
+    }
+
+    fn write_change_with_plans(
+        &self,
+        change: &RowChange,
+        plans: &[ColumnConversionPlan],
+    ) -> io::Result<(String, Vec<Value>)> {
+        let table = qualified_table(&change.schema, &change.table);
+        match change.operation {
+            Operation::Insert => {
+                let after = change.after.as_ref().ok_or_else(|| {
+                    io::Error::other("INSERT ChangeEvent is missing its after image")
+                })?;
+                ensure_non_empty_row(after, "INSERT")?;
+                let writable = writable_columns(after);
+                if writable.is_empty() {
+                    return Err(capability_failure("INSERT has no writable columns"));
+                }
+                let mut params = Vec::with_capacity(writable.len());
+                let mut values = Vec::with_capacity(writable.len());
+                for column in writable {
+                    values.push(value_placeholder(change, column, plans));
+                    params.push(bind_column_with_plan(change, column, plans)?);
+                }
+                Ok((
+                    format!(
+                        "INSERT INTO {table} ({}) VALUES ({});",
+                        column_list(&writable_columns(after)),
+                        values.join(", ")
+                    ),
+                    params,
+                ))
+            }
+            Operation::Update => {
+                let before = change.before.as_ref().ok_or_else(|| {
+                    io::Error::other("UPDATE ChangeEvent is missing its before image")
+                })?;
+                let after = change.after.as_ref().ok_or_else(|| {
+                    io::Error::other("UPDATE ChangeEvent is missing its after image")
+                })?;
+                ensure_non_empty_row(before, "UPDATE before")?;
+                ensure_non_empty_row(after, "UPDATE after")?;
+                let writable = writable_columns(after);
+                if writable.is_empty() {
+                    return Err(capability_failure("UPDATE has no writable columns"));
+                }
+                let assignments = writable
+                    .iter()
+                    .map(|column| {
+                        format!(
+                            "{} = {}",
+                            quote_identifier(&column.name),
+                            value_placeholder(change, column, plans)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut params = writable
+                    .iter()
+                    .map(|column| bind_column_with_plan(change, column, plans))
+                    .collect::<io::Result<Vec<_>>>()?;
+                let (predicates, key_params) =
+                    key_predicates_with_plans(&change.schema, &change.table, before, plans)?;
+                params.extend(key_params);
+                Ok((
+                    format!("UPDATE {table} SET {assignments} WHERE {predicates};"),
+                    params,
+                ))
+            }
+            Operation::Delete => {
+                let before = change.before.as_ref().ok_or_else(|| {
+                    io::Error::other("DELETE ChangeEvent is missing its before image")
+                })?;
+                ensure_non_empty_row(before, "DELETE before")?;
+                let (predicates, params) =
+                    key_predicates_with_plans(&change.schema, &change.table, before, plans)?;
+                Ok((format!("DELETE FROM {table} WHERE {predicates};"), params))
+            }
         }
     }
 
@@ -514,6 +1040,188 @@ fn bind_columns(row: &[&ColumnDatum]) -> io::Result<Vec<Value>> {
     row.iter().map(|column| bind_datum(&column.datum)).collect()
 }
 
+fn bind_column_with_plan(
+    change: &RowChange,
+    column: &ColumnDatum,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<Value> {
+    bind_datum_with_plan(&change.schema, &change.table, column, plans)
+}
+
+fn bind_datum_with_plan(
+    schema: &str,
+    table: &str,
+    column: &ColumnDatum,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<Value> {
+    let plan = column_plan(schema, table, column, plans);
+    match &column.datum {
+        Datum::Unavailable | Datum::Unchanged => Err(capability_failure(
+            "cannot render an unavailable or unchanged datum",
+        )),
+        Datum::Null => Ok(Value::NULL),
+        Datum::Value(value) => match plan {
+            Some(plan)
+                if plan
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("spatial") =>
+            {
+                mysql_spatial_value(value)
+            }
+            Some(plan)
+                if plan
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("recursive") => Ok(Value::Bytes(logical_value_json(value)?.into_bytes())),
+            _ => bind_logical_value(value),
+        },
+    }
+}
+
+fn key_predicates_with_plans(
+    schema: &str,
+    table: &str,
+    row: &[ColumnDatum],
+    plans: &[ColumnConversionPlan],
+) -> io::Result<(String, Vec<Value>)> {
+    let mut keys: Vec<_> = row
+        .iter()
+        .filter(|column| column.primary_key_ordinal.is_some())
+        .collect();
+    keys.sort_by_key(|column| column.primary_key_ordinal);
+    if keys.is_empty() {
+        return Err(capability_failure(
+            "table has no primary key; first Sink version requires one",
+        ));
+    }
+    let mut params = Vec::new();
+    let predicates = keys
+        .into_iter()
+        .map(|column| {
+            let name = quote_identifier(&column.name);
+            match &column.datum {
+                Datum::Unavailable | Datum::Unchanged => Err(capability_failure(
+                    "cannot use an absent value as a predicate",
+                )),
+                Datum::Null => Ok(format!("{name} IS NULL")),
+                Datum::Value(LogicalValue::Text { .. } | LogicalValue::Binary { .. }) => {
+                    params.push(bind_datum_with_plan(schema, table, column, plans)?);
+                    Ok(format!(
+                        "CAST({name} AS BINARY) = CAST({} AS BINARY)",
+                        value_placeholder_for_key(schema, table, column, plans)
+                    ))
+                }
+                Datum::Value(_) => {
+                    params.push(bind_datum_with_plan(schema, table, column, plans)?);
+                    Ok(format!(
+                        "{name} = {}",
+                        value_placeholder_for_key(schema, table, column, plans)
+                    ))
+                }
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok((predicates.join(" AND "), params))
+}
+
+fn ensure_supported_change_with_plans(
+    change: &RowChange,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<()> {
+    let identity = change
+        .after
+        .as_ref()
+        .or(change.before.as_ref())
+        .expect("validated image");
+    ensure_supported_image_with_plans(change, identity, plans)?;
+    if let Some(before) = &change.before {
+        ensure_supported_image_with_plans(change, before, plans)?;
+    }
+    if let Some(after) = &change.after {
+        ensure_supported_image_with_plans(change, after, plans)?;
+    }
+    Ok(())
+}
+
+fn ensure_supported_image_with_plans(
+    change: &RowChange,
+    image: &[ColumnDatum],
+    plans: &[ColumnConversionPlan],
+) -> io::Result<()> {
+    if !image
+        .iter()
+        .any(|column| column.primary_key_ordinal.is_some())
+    {
+        return Err(capability_failure("row has no primary key"));
+    }
+    for column in image.iter().filter(|column| !column.generated) {
+        if let Datum::Value(value) = &column.datum {
+            if let Some(plan) = column_plan(&change.schema, &change.table, column, plans) {
+                if plan
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("recursive")
+                    || plan
+                        .target
+                        .parameters
+                        .get("conversion_kind")
+                        .map(String::as_str)
+                        == Some("spatial")
+                {
+                    bind_column_with_plan(change, column, plans)?;
+                    continue;
+                }
+            }
+            ensure_source_value_type(&column.native_type, value, column.primary_key_ordinal)?;
+            bind_logical_value(value)
+                .map_err(|error| capability_failure(format!("column {}: {error}", column.name)))?;
+        }
+    }
+    Ok(())
+}
+
+fn logical_value_json(value: &LogicalValue) -> io::Result<String> {
+    serde_json::to_string(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn mysql_spatial_value(value: &LogicalValue) -> io::Result<Value> {
+    let LogicalValue::Spatial {
+        format,
+        bytes_base64url,
+        srid,
+        ..
+    } = value
+    else {
+        return Err(capability_failure(
+            "the spatial conversion plan received another LogicalValue family",
+        ));
+    };
+    if *format != change_event::SpatialFormat::Wkb {
+        return Err(capability_failure(
+            "MySQL spatial writes require a qualified WKB value",
+        ));
+    }
+    let srid = srid
+        .ok_or_else(|| capability_failure("MySQL spatial writes require an SRID"))?;
+    let srid = u32::try_from(srid)
+        .map_err(|_| capability_failure("MySQL spatial SRID is outside the native range"))?;
+    let wkb = decode_bytes(bytes_base64url)?;
+    let mut bytes = if TARGET_VERSION == "5.7" {
+        srid.to_le_bytes().to_vec()
+    } else {
+        Vec::new()
+    };
+    bytes.extend_from_slice(&wkb);
+    Ok(Value::Bytes(bytes))
+}
+
 fn bind_datum(datum: &Datum) -> io::Result<Value> {
     match datum {
         Datum::Unavailable | Datum::Unchanged => Err(capability_failure(
@@ -619,6 +1327,12 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
             *second,
             *microsecond,
         )),
+        LogicalValue::LocalTime {
+            hour,
+            minute,
+            second,
+            microsecond,
+        } => Ok(Value::Time(false, 0, *hour, *minute, *second, *microsecond)),
         LogicalValue::Duration {
             negative,
             hours,
@@ -654,7 +1368,6 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
         | LogicalValue::Range { .. }
         | LogicalValue::MultiRange { .. }
         | LogicalValue::Null
-        | LogicalValue::LocalTime { .. }
         | LogicalValue::InvalidTemporal { .. }
         | LogicalValue::Network { .. }
         | LogicalValue::Xml { .. }

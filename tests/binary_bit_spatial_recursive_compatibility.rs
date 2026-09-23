@@ -1,7 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{
     BitOrder, BitPadding, CapabilityEntry, ChangeTransaction, ColumnDatum, ConnectorIdentity,
-    ConversionRule, Datum, DefinitionReference, FailurePolicy, FieldCompatibilityInput,
+    CompatibilityInput, ConversionRule, Datum, DefinitionReference, FailurePolicy,
+    FieldCompatibilityInput,
     FieldDefinition, LogicalType, LogicalValue, Operation, PresenceState, QualificationLevel,
     RiskLevel, RouteOptions, RowChange, ServerBuildIdentity, Source, SourceCursor,
     SourceTypeMapping, SpatialFormat, TargetCapabilityManifest, TargetRepresentation,
@@ -104,6 +105,78 @@ fn options(route_id: &str) -> RouteOptions {
         configuration_revision: format!("{route_id}:r1"),
         ..RouteOptions::default()
     }
+}
+
+fn mysql_id_plan(
+    transaction: &change_event::ValidatedTransaction,
+    manifest: &TargetCapabilityManifest,
+) -> change_event::ColumnConversionPlan {
+    let mapping = if transaction.transaction().source.kind == "postgresql" {
+        SourceTypeMapping::new(
+            ConnectorIdentity::new("postgresql", "15"),
+            "int",
+            LogicalType::integer(true, 32),
+            "postgresql15.source-type.integer",
+            "postgresql-test.v1",
+        )
+    } else {
+        mysql_5_7::source_type_mapping("int", None, None).unwrap()
+    };
+    let source_field = FieldDefinition {
+        reference: DefinitionReference::new("catalog:s.t.id", "source-id"),
+        ordinal: 0,
+        name: "id".into(),
+        native_type: "int".into(),
+        logical_type: mapping.logical_type.clone(),
+        nullable: false,
+        collation: None,
+        generated: false,
+        primary_key_ordinal: Some(0),
+        unique: false,
+        row_locator: false,
+    };
+    let target_field = FieldDefinition {
+        reference: DefinitionReference::new("catalog:s.t.id-target", "target-id"),
+        ordinal: 0,
+        name: "id".into(),
+        native_type: "int".into(),
+        logical_type: mapping.logical_type.clone(),
+        nullable: false,
+        collation: None,
+        generated: false,
+        primary_key_ordinal: Some(0),
+        unique: false,
+        row_locator: false,
+    };
+    let result = change_event::plan_compatibility(CompatibilityInput {
+        transaction,
+        source_field,
+        target_field,
+        source_type_mapping: mapping.clone(),
+        source_connector: mapping.connector.clone(),
+        sink_connector: manifest.connector.clone(),
+        source_build: Some(if transaction.transaction().source.kind == "postgresql" {
+            ServerBuildIdentity::new(
+                "postgresql",
+                "community",
+                "15.19",
+                "postgres-15.19",
+            )
+        } else {
+            ServerBuildIdentity::new(
+                "mysql",
+                "oracle",
+                "5.7.44",
+                "mysql-5.7.44",
+            )
+        }),
+        target_build: Some(manifest.target_build.clone()),
+        manifest,
+        options: options("mysql-id-route"),
+    })
+    .unwrap();
+    assert_eq!(result.status, change_event::CompatibilityStatus::Compatible);
+    result.plan.expect("id must have a conversion plan")
 }
 
 fn input<'a>(
@@ -383,6 +456,139 @@ fn recursive_types_fail_closed_without_an_explicit_structure_rule() {
         result.reason_code,
         "target_capability.recursive_structure_unqualified"
     );
+}
+
+#[test]
+fn mysql_sink_uses_json_value_carrier_for_a_qualified_recursive_plan() {
+    let logical = LogicalType::Array {
+        element: Box::new(LogicalType::integer(true, 32)),
+    };
+    let mapping = SourceTypeMapping::new(
+        ConnectorIdentity::new("postgresql", "15"),
+        "integer[]",
+        logical.clone(),
+        "postgresql15.source-type.array",
+        "postgresql-test.v1",
+    );
+    let transaction = change_event::validate(transaction(
+        LogicalValue::Array {
+            elements: vec![LogicalValue::Integer {
+                signed: true,
+                bits: 32,
+                value: "1".into(),
+            }],
+        },
+        "integer[]",
+        Source {
+            kind: "postgresql".into(),
+            version: "15.19".into(),
+            id: "source".into(),
+        },
+    ))
+    .unwrap();
+    let manifest = mysql_8_0::compatibility_manifest(ServerBuildIdentity::new(
+        "mysql",
+        "oracle",
+        "8.0.36",
+        "mysql-8.0.36",
+    ));
+    let source = field("integer[]", logical, None);
+    let target = target_field("json", LogicalType::json(), None);
+    let result = change_event::plan_compatibility(CompatibilityInput {
+        transaction: &transaction,
+        source_field: source,
+        target_field: target,
+        source_type_mapping: mapping,
+        source_connector: ConnectorIdentity::new("postgresql", "15"),
+        sink_connector: manifest.connector.clone(),
+        source_build: Some(ServerBuildIdentity::new(
+            "postgresql",
+            "community",
+            "15.19",
+            "postgres-15.19",
+        )),
+        target_build: Some(manifest.target_build.clone()),
+        manifest: &manifest,
+        options: options("mysql-recursive-route"),
+    })
+    .unwrap();
+    assert_eq!(result.status, change_event::CompatibilityStatus::NeedsConfirmation);
+    let mut plan = result.plan.expect("recursive JSON carrier should qualify");
+    assert_eq!(
+        plan.target.parameters.get("conversion_kind").map(String::as_str),
+        Some("recursive")
+    );
+    plan.confirmation = change_event::PlanConfirmationState::Confirmed;
+    let id_plan = mysql_id_plan(&transaction, &manifest);
+    let sql = mysql_8_0::sql_with_plans(&transaction, &[id_plan, plan]).unwrap();
+    assert!(sql.statements().all(|statement| statement.contains('?')));
+    assert!(sql.parameters().any(|parameters| {
+        parameters
+            .iter()
+            .any(|parameter| matches!(parameter, mysql::Value::Bytes(bytes) if bytes.starts_with(b"{\"type\":\"array\"")))
+    }));
+}
+
+#[test]
+fn mysql_sink_uses_native_spatial_wkb_binding_and_srid() {
+    let mapping = mysql_5_7::source_type_mapping("point srid 4326", None, None).unwrap();
+    let logical = mapping.logical_type.clone();
+    let value = LogicalValue::Spatial {
+        format: SpatialFormat::Wkb,
+        bytes_base64url: URL_SAFE_NO_PAD.encode([
+            1_u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0,
+        ]),
+        geometry_type: "point".into(),
+        dimensions: 2,
+        srid: Some(4326),
+        crs: Some("srid:4326".into()),
+    };
+    let transaction = change_event::validate(transaction(
+        value,
+        "point srid 4326",
+        Source {
+            kind: "mysql".into(),
+            version: "5.7.44".into(),
+            id: "source".into(),
+        },
+    ))
+    .unwrap();
+    let manifest = mysql_8_0::compatibility_manifest(ServerBuildIdentity::new(
+        "mysql",
+        "oracle",
+        "8.0.36",
+        "mysql-8.0.36",
+    ));
+    let result = change_event::plan_compatibility(CompatibilityInput {
+        transaction: &transaction,
+        source_field: field("point srid 4326", logical.clone(), None),
+        target_field: target_field("point srid 4326", logical, None),
+        source_type_mapping: mapping,
+        source_connector: ConnectorIdentity::new("mysql", "5.7"),
+        sink_connector: manifest.connector.clone(),
+        source_build: Some(ServerBuildIdentity::new(
+            "mysql",
+            "oracle",
+            "5.7.44",
+            "mysql-5.7.44",
+        )),
+        target_build: Some(manifest.target_build.clone()),
+        manifest: &manifest,
+        options: options("mysql-spatial-route"),
+    })
+    .unwrap();
+    assert_eq!(result.status, change_event::CompatibilityStatus::Compatible);
+    let id_plan = mysql_id_plan(&transaction, &manifest);
+    let sql = mysql_8_0::sql_with_plans(&transaction, &[id_plan, result.plan.unwrap()]).unwrap();
+    assert!(sql
+        .statements()
+        .any(|statement| statement.contains("ST_GeomFromWKB(?, 4326)")));
+    assert!(sql.parameters().any(|parameters| {
+        parameters.iter().any(|parameter| {
+            matches!(parameter, mysql::Value::Bytes(bytes) if bytes.starts_with(&[1, 1, 0, 0, 0]))
+        })
+    }));
 }
 
 #[test]

@@ -743,7 +743,7 @@ fn spatial(
         )?;
     }
     ensure(
-        embedded_srid == expected_srid,
+        format == SpatialFormat::Wkb || embedded_srid == expected_srid,
         "spatial SRID does not match its declaration",
     )
 }

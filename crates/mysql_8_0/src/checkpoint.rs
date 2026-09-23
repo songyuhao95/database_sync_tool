@@ -116,7 +116,7 @@ impl CheckpointWriter {
                 "invalid task identity or configuration binding",
             ));
         }
-        let mut conn = sql::connect(config)?;
+        let mut conn = sql::connect(config, None)?;
         let sink_uuid: String = conn
             .query_first("SELECT @@server_uuid")
             .map_err(io::Error::other)?

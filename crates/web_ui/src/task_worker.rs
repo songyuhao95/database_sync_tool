@@ -7,8 +7,8 @@ use crate::{
     tasks::TableMapping,
 };
 use change_event::{
-    ChangeTransaction, ColumnConversionPlan, CommitResolution, SinkAdapter as _, SnapshotBatch,
-    SnapshotBoundary, SnapshotTable, TargetApplyErrorKind, TargetCapabilityFailure,
+    ChangeTransaction, ColumnConversionPlan, CommitResolution, SnapshotBatch, SnapshotBoundary,
+    SnapshotTable, TargetApplyErrorKind, TargetCapabilityFailure,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -270,14 +270,12 @@ macro_rules! sink_adapter {
                         "stored ColumnConversionPlan is missing or has an invalid digest",
                     )));
                 }
-                // Conversion is applied from the same immutable plans that
-                // Web persisted.  The converted transaction is ephemeral;
-                // retries always start from the original captured values and
-                // rebuild the same result before opening the target txn.
-                let converted = change_event::convert_transaction_with_plans(tx.clone(), plans)
-                    .map_err(io::Error::other)?;
-                let validated = change_event::validate(converted).map_err(io::Error::other)?;
-                let plan = ($planner)(&validated)?;
+                // The selected SinkAdapter owns the final plan-backed
+                // conversion/rendering seam. Retries always start from the
+                // original captured values and rebuild the same result
+                // before opening the target transaction.
+                let validated = change_event::validate(tx.clone()).map_err(io::Error::other)?;
+                let plan = ($planner)(&validated, plans)?;
                 let result = self.apply(&plan)?;
                 Ok((
                     Checkpoint::from(&result.checkpoint),
@@ -300,19 +298,19 @@ macro_rules! sink_adapter {
         }
     };
 }
-sink_adapter!(mysql_5_7, |validated| {
-    let sink = mysql_5_7::SinkAdapter::new();
-    sink.plan(validated)
-});
-sink_adapter!(mysql_8_0, |validated| {
-    let sink = mysql_8_0::SinkAdapter::new();
-    sink.plan(validated)
-});
-sink_adapter!(mysql_8_4, |validated| {
-    let sink = mysql_8_4::SinkAdapter::new();
-    sink.plan(validated)
-});
-sink_adapter!(postgresql_15, postgresql_15::sql);
+sink_adapter!(mysql_5_7, mysql_5_7::sql_with_plans);
+sink_adapter!(mysql_8_0, mysql_8_0::sql_with_plans);
+sink_adapter!(mysql_8_4, mysql_8_4::sql_with_plans);
+sink_adapter!(
+    postgresql_15,
+    |validated: &change_event::ValidatedTransaction, plans: &[ColumnConversionPlan]| {
+        let converted =
+            change_event::convert_transaction_with_plans(validated.transaction().clone(), plans)
+                .map_err(io::Error::other)?;
+        let converted = change_event::validate(converted).map_err(io::Error::other)?;
+        postgresql_15::sql(&converted)
+    }
+);
 
 fn open_sink(
     endpoint: &Endpoint,

@@ -360,6 +360,8 @@ pub fn capability_manifest(
         code_prefix,
         connector_version,
     );
+    add_spatial(&mut capabilities, code_prefix, connector_version);
+    add_recursive_json_value_carrier(&mut capabilities, code_prefix, connector_version);
     add_enum_set(&mut capabilities, false, code_prefix, connector_version);
     add_enum_set(&mut capabilities, true, code_prefix, connector_version);
 
@@ -501,6 +503,92 @@ fn add_structured_json(
         failure_policy: FailurePolicy::Reject,
         evidence_digest: evidence_digest(connector_version, &code, &logical, &target),
     };
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        rule,
+        supported_operations: operations(),
+        supported_presence: presence(),
+    });
+}
+
+fn add_spatial(
+    capabilities: &mut Vec<CapabilityEntry>,
+    code_prefix: &str,
+    connector_version: &str,
+) {
+    let code = format!("{code_prefix}.exact.spatial.geometry");
+    let mut target = TargetRepresentation::new("geometry");
+    target
+        .parameters
+        .insert("source_spatial_format".into(), "wkb".into());
+    target
+        .parameters
+        .insert("target_spatial_format".into(), "wkb".into());
+    target
+        .parameters
+        .insert("target_storage".into(), "mysql_geometry".into());
+    let logical = LogicalType::Spatial {
+        subtype: "*".into(),
+        srid: None,
+        dimensions: 0,
+    };
+    let rule = ConversionRule {
+        id: format!("{code_prefix}.conversion.spatial.geometry"),
+        version: format!("mysql-{connector_version}.sink-conversion.v2"),
+        qualification: QualificationLevel::Exact,
+        risk: RiskLevel::None,
+        risk_code: None,
+        requires_confirmation: false,
+        options: Vec::new(),
+        supported_operations: operations(),
+        supported_presence: presence(),
+        allows_key: true,
+        failure_policy: FailurePolicy::Reject,
+        evidence_digest: evidence_digest(connector_version, &code, &logical, &target),
+    };
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        rule,
+        supported_operations: operations(),
+        supported_presence: presence(),
+    });
+}
+
+fn add_recursive_json_value_carrier(
+    capabilities: &mut Vec<CapabilityEntry>,
+    code_prefix: &str,
+    connector_version: &str,
+) {
+    let code = format!("{code_prefix}.explicit.recursive.json_value_carrier");
+    let mut target = TargetRepresentation::new("json");
+    target
+        .parameters
+        .insert("conversion_kind".into(), "recursive".into());
+    target
+        .parameters
+        .insert("recursive_kind".into(), "*".into());
+    target
+        .parameters
+        .insert("structure_mapping".into(), "json_value_carrier".into());
+    target
+        .parameters
+        .insert("value_strategy".into(), "structured_json".into());
+    let logical = LogicalType::Opaque {
+        source_type: "*".into(),
+        format: "recursive".into(),
+    };
+    let rule = explicit_rule(
+        &code,
+        logical.clone(),
+        target.clone(),
+        Vec::new(),
+        code_prefix,
+        connector_version,
+    );
     capabilities.push(CapabilityEntry {
         code,
         source_logical_type: logical,

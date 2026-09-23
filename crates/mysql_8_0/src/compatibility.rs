@@ -273,6 +273,8 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
         "year".to_owned(),
     );
     add_structured_json(&mut capabilities);
+    add_spatial(&mut capabilities);
+    add_recursive_json_value_carrier(&mut capabilities);
     add_enum_set(&mut capabilities, false);
     add_enum_set(&mut capabilities, true);
     add_exact(
@@ -529,6 +531,77 @@ fn add_structured_json(capabilities: &mut Vec<CapabilityEntry>) {
         failure_policy: FailurePolicy::Reject,
         evidence_digest: evidence_digest(&code, &logical, &target),
     };
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        supported_operations: operations(),
+        supported_presence: presence(),
+        rule,
+    });
+}
+
+fn add_spatial(capabilities: &mut Vec<CapabilityEntry>) {
+    let code = "mysql80.exact.spatial.geometry".to_owned();
+    let mut target = TargetRepresentation::new("geometry");
+    target
+        .parameters
+        .insert("source_spatial_format".into(), "wkb".into());
+    target
+        .parameters
+        .insert("target_spatial_format".into(), "wkb".into());
+    target
+        .parameters
+        .insert("target_storage".into(), "mysql_geometry".into());
+    let logical = LogicalType::Spatial {
+        subtype: "*".into(),
+        srid: None,
+        dimensions: 0,
+    };
+    let rule = ConversionRule {
+        id: "mysql80.conversion.spatial.geometry".into(),
+        version: "mysql-8.0.sink-conversion.v2".into(),
+        qualification: QualificationLevel::Exact,
+        risk: RiskLevel::None,
+        risk_code: None,
+        requires_confirmation: false,
+        options: Vec::new(),
+        supported_operations: operations(),
+        supported_presence: presence(),
+        allows_key: true,
+        failure_policy: FailurePolicy::Reject,
+        evidence_digest: evidence_digest(&code, &logical, &target),
+    };
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        supported_operations: operations(),
+        supported_presence: presence(),
+        rule,
+    });
+}
+
+fn add_recursive_json_value_carrier(capabilities: &mut Vec<CapabilityEntry>) {
+    let code = "mysql80.explicit.recursive.json_value_carrier".to_owned();
+    let mut target = TargetRepresentation::new("json");
+    target
+        .parameters
+        .insert("conversion_kind".into(), "recursive".into());
+    target
+        .parameters
+        .insert("recursive_kind".into(), "*".into());
+    target
+        .parameters
+        .insert("structure_mapping".into(), "json_value_carrier".into());
+    target
+        .parameters
+        .insert("value_strategy".into(), "structured_json".into());
+    let logical = LogicalType::Opaque {
+        source_type: "*".into(),
+        format: "recursive".into(),
+    };
+    let rule = explicit_rule(&code, logical.clone(), target.clone(), Vec::new());
     capabilities.push(CapabilityEntry {
         code,
         source_logical_type: logical,

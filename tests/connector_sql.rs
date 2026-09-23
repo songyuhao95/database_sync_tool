@@ -5,6 +5,137 @@ use change_event::validate;
 use contract::*;
 use mysql::prelude::Queryable;
 
+fn binary_plan(
+    transaction: &change_event::ValidatedTransaction,
+    target_manifest: &change_event::TargetCapabilityManifest,
+    target_mapping: &change_event::SourceTypeMapping,
+    ordinal: usize,
+) -> change_event::ColumnConversionPlan {
+    let source_mapping =
+        ::mysql_5_7::source_type_mapping("varbinary(32)", None, None).unwrap();
+    let source_field = change_event::FieldDefinition {
+        reference: change_event::DefinitionReference::new(
+            "catalog:CDC_test.cdc_contract.bytes",
+            "source-bytes",
+        ),
+        ordinal,
+        name: "bytes".into(),
+        native_type: source_mapping.native_type.clone(),
+        logical_type: source_mapping.logical_type.clone(),
+        nullable: false,
+        collation: None,
+        generated: false,
+        primary_key_ordinal: None,
+        unique: false,
+        row_locator: false,
+    };
+    let target_field = change_event::FieldDefinition {
+        reference: change_event::DefinitionReference::new(
+            "catalog:CDC_test.cdc_contract.bytes-target",
+            "target-bytes",
+        ),
+        ordinal,
+        name: "bytes".into(),
+        native_type: target_mapping.native_type.clone(),
+        logical_type: target_mapping.logical_type.clone(),
+        nullable: false,
+        collation: None,
+        generated: false,
+        primary_key_ordinal: None,
+        unique: false,
+        row_locator: false,
+    };
+    let result = change_event::plan_compatibility(change_event::CompatibilityInput {
+        transaction,
+        source_field,
+        target_field,
+        source_type_mapping: source_mapping.clone(),
+        source_connector: source_mapping.connector.clone(),
+        sink_connector: target_manifest.connector.clone(),
+        source_build: Some(change_event::ServerBuildIdentity::new(
+            "mysql",
+            "oracle",
+            "5.7.44",
+            "mysql-5.7.44",
+        )),
+        target_build: Some(target_manifest.target_build.clone()),
+        manifest: target_manifest,
+        options: change_event::RouteOptions {
+            route_id: "mysql-sink-plan-test".into(),
+            configuration_revision: "test-revision".into(),
+            ..change_event::RouteOptions::default()
+        },
+    })
+    .unwrap();
+    assert_eq!(result.status, change_event::CompatibilityStatus::Compatible);
+    result.plan.expect("binary field must have a conversion plan")
+}
+
+fn integer_plan(
+    transaction: &change_event::ValidatedTransaction,
+    target_manifest: &change_event::TargetCapabilityManifest,
+    target_mapping: &change_event::SourceTypeMapping,
+) -> change_event::ColumnConversionPlan {
+    let source_mapping =
+        ::mysql_5_7::source_type_mapping("bigint unsigned", None, None).unwrap();
+    let source_field = change_event::FieldDefinition {
+        reference: change_event::DefinitionReference::new(
+            "catalog:CDC_test.cdc_contract.id",
+            "source-id",
+        ),
+        ordinal: 0,
+        name: "id".into(),
+        native_type: source_mapping.native_type.clone(),
+        logical_type: source_mapping.logical_type.clone(),
+        nullable: false,
+        collation: None,
+        generated: false,
+        primary_key_ordinal: Some(0),
+        unique: false,
+        row_locator: false,
+    };
+    let target_field = change_event::FieldDefinition {
+        reference: change_event::DefinitionReference::new(
+            "catalog:CDC_test.cdc_contract.id-target",
+            "target-id",
+        ),
+        ordinal: 0,
+        name: "id".into(),
+        native_type: target_mapping.native_type.clone(),
+        logical_type: target_mapping.logical_type.clone(),
+        nullable: false,
+        collation: None,
+        generated: false,
+        primary_key_ordinal: Some(0),
+        unique: false,
+        row_locator: false,
+    };
+    let result = change_event::plan_compatibility(change_event::CompatibilityInput {
+        transaction,
+        source_field,
+        target_field,
+        source_type_mapping: source_mapping.clone(),
+        source_connector: source_mapping.connector.clone(),
+        sink_connector: target_manifest.connector.clone(),
+        source_build: Some(change_event::ServerBuildIdentity::new(
+            "mysql",
+            "oracle",
+            "5.7.44",
+            "mysql-5.7.44",
+        )),
+        target_build: Some(target_manifest.target_build.clone()),
+        manifest: target_manifest,
+        options: change_event::RouteOptions {
+            route_id: "mysql-sink-id-plan-test".into(),
+            configuration_revision: "test-revision".into(),
+            ..change_event::RouteOptions::default()
+        },
+    })
+    .unwrap();
+    assert_eq!(result.status, change_event::CompatibilityStatus::Compatible);
+    result.plan.expect("integer field must have a conversion plan")
+}
+
 macro_rules! target_tests {
     ($adapter:ident, $version:literal, $port_key:literal, $port:literal, $expected:literal) => {
         mod $adapter {
@@ -180,4 +311,123 @@ fn mysql_sinks_honor_unchanged_columns_without_binding_them() {
     assert_unchanged!(mysql_5_7);
     assert_unchanged!(mysql_8_0);
     assert_unchanged!(mysql_8_4);
+}
+
+#[test]
+fn mysql_versioned_sinks_consume_column_conversion_plans() {
+    let mut raw = fixture("5.7.44", "cdc_contract");
+    for change in &mut raw.changes {
+        for image in [&mut change.before, &mut change.after]
+            .into_iter()
+            .flatten()
+        {
+            image.retain(|column| matches!(column.name.as_str(), "id" | "bytes"));
+            for (ordinal, column) in image.iter_mut().enumerate() {
+                column.ordinal = ordinal;
+                column.primary_key_ordinal = (column.name == "id").then_some(0);
+            }
+        }
+    }
+    let transaction = validate(raw).unwrap();
+
+    macro_rules! assert_planned_sink {
+        ($adapter:ident, $version:literal) => {{
+            let manifest = ::$adapter::compatibility_manifest(
+                change_event::ServerBuildIdentity::new(
+                    "mysql",
+                    "oracle",
+                    $version,
+                    concat!("mysql-", $version),
+                ),
+            );
+            assert!(manifest.capabilities.iter().any(|capability| {
+                capability
+                    .target
+                    .parameters
+                    .get("target_storage")
+                    .map(String::as_str)
+                    == Some("mysql_geometry")
+            }));
+            assert!(manifest.capabilities.iter().any(|capability| {
+                capability
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("recursive")
+            }));
+            let mapping = ::$adapter::source_type_mapping("varbinary(32)", None, None).unwrap();
+            let integer_mapping =
+                ::$adapter::source_type_mapping("bigint unsigned", None, None).unwrap();
+            let plans = [
+                integer_plan(&transaction, &manifest, &integer_mapping),
+                binary_plan(&transaction, &manifest, &mapping, 1),
+            ];
+            let sql = ::$adapter::sql_with_plans(&transaction, &plans).unwrap();
+            assert_eq!(sql.statements().count(), 3);
+            assert!(sql.statements().all(|statement| statement.contains('?')));
+            assert!(sql.parameters().all(|parameters| !parameters.is_empty()));
+        }};
+    }
+
+    assert_planned_sink!(mysql_5_7, "5.7");
+    assert_planned_sink!(mysql_8_0, "8.0");
+    assert_planned_sink!(mysql_8_4, "8.4");
+}
+
+#[test]
+fn mysql_versioned_sinks_reject_tampered_conversion_plans() {
+    let transaction = validate(fixture("5.7.44", "cdc_contract")).unwrap();
+    let manifest = ::mysql_8_0::compatibility_manifest(change_event::ServerBuildIdentity::new(
+        "mysql",
+        "oracle",
+        "8.0.36",
+        "mysql-8.0.36",
+    ));
+    let mapping = ::mysql_8_0::source_type_mapping("varbinary(32)", None, None).unwrap();
+    let mut plan = binary_plan(&transaction, &manifest, &mapping, 4);
+    plan.plan_digest.push('x');
+    let error = ::mysql_8_0::sql_with_plans(&transaction, &[plan]).unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<change_event::TargetCapabilityFailure>())
+            .map(|failure| failure.code.as_str()),
+        Some("target_capability.plan_digest_invalid")
+    );
+}
+
+#[test]
+fn mysql_versioned_sinks_require_plans_for_plan_backed_apply() {
+    let transaction = validate(fixture("5.7.44", "cdc_contract")).unwrap();
+    let error = ::mysql_5_7::sql_with_plans(&transaction, &[]).unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<change_event::TargetCapabilityFailure>())
+            .map(|failure| failure.code.as_str()),
+        Some("target_capability.plans_missing")
+    );
+
+    let manifest = ::mysql_5_7::compatibility_manifest(
+        change_event::ServerBuildIdentity::new(
+            "mysql",
+            "oracle",
+            "5.7.44",
+            "mysql-5.7.44",
+        ),
+    );
+    let mapping = ::mysql_5_7::source_type_mapping("varbinary(32)", None, None).unwrap();
+    let error = ::mysql_5_7::sql_with_plans(
+        &transaction,
+        &[binary_plan(&transaction, &manifest, &mapping, 4)],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<change_event::TargetCapabilityFailure>())
+            .map(|failure| failure.code.as_str()),
+        Some("target_capability.plan_missing_for_column")
+    );
 }

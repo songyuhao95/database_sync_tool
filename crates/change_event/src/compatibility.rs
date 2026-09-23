@@ -2162,13 +2162,18 @@ fn validate_spatial_plan_value(
             "the spatial value is not valid base64url wire bytes",
         )
     })?;
+    let wire_srid = if expected_format == SpatialFormat::Ewkb {
+        *srid
+    } else {
+        None
+    };
     validate_spatial_wire(
         plan,
         &bytes,
         expected_format,
         expected_geometry,
         expected_dimensions,
-        expected_srid.parse::<i32>().ok(),
+        wire_srid,
     )?;
     Ok(())
 }
@@ -5054,6 +5059,22 @@ fn plan_target_representation(
                 .parameters
                 .insert("structure_mapping".into(), "explicit".into());
         }
+        (source, LogicalType::Json { .. })
+            if recursive_type_kind(source).is_some()
+                && target_repr
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("recursive") =>
+        {
+            target_repr.parameters.insert(
+                "recursive_kind".into(),
+                recursive_type_kind(source).unwrap_or_default().into(),
+            );
+            target_repr
+                .parameters
+                .insert("structure_mapping".into(), "json_value_carrier".into());
+        }
         (
             LogicalType::Text {
                 charset: source_charset,
@@ -5233,13 +5254,34 @@ fn spatial_srid(srid: Option<i32>) -> String {
     srid.map_or_else(|| "unknown".into(), |value| value.to_string())
 }
 
+fn mysql_spatial_native_type(native_type: &str) -> bool {
+    let base = native_type
+        .trim()
+        .to_ascii_lowercase()
+        .split(['(', ' ', '\t'])
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    matches!(
+        base.as_str(),
+        "geometry"
+            | "point"
+            | "linestring"
+            | "polygon"
+            | "multipoint"
+            | "multilinestring"
+            | "multipolygon"
+            | "geometrycollection"
+    )
+}
+
 fn spatial_crs(srid: Option<i32>) -> String {
     srid.map_or_else(|| "unknown".into(), |value| format!("srid:{value}"))
 }
 
 fn recursive_type_kind(value: &LogicalType) -> Option<&'static str> {
     match value {
-        LogicalType::Array { .. } => Some("array"),
+        LogicalType::Array { .. } | LogicalType::ArrayWithMetadata { .. } => Some("array"),
         LogicalType::Struct { .. } => Some("struct"),
         LogicalType::Map { .. } => Some("map"),
         LogicalType::Range { .. } => Some("range"),
@@ -5851,6 +5893,12 @@ fn validate_explicit_parameters(
         Some("recursive") => {
             let source_kind = recursive_type_kind(&source.logical_type);
             let target_kind = recursive_type_kind(&destination.logical_type);
+            if source_kind.is_some()
+                && matches!(destination.logical_type, LogicalType::Json { .. })
+                && parameter("structure_mapping") == Some("json_value_carrier")
+            {
+                return Ok(());
+            }
             if source_kind.is_none() || source_kind != target_kind {
                 return Err("recursive source and target structures are not equivalent".into());
             }
@@ -6136,8 +6184,15 @@ fn target_representation_matches_binding(
         .get("conversion_kind")
         .map(String::as_str)
         == Some("spatial")
+        || capability
+            .target
+            .parameters
+            .get("target_storage")
+            .map(String::as_str)
+            == Some("mysql_geometry")
     {
-        return matches!(target.logical_type, LogicalType::Spatial { .. });
+        return matches!(target.logical_type, LogicalType::Spatial { .. })
+            && mysql_spatial_native_type(&target.native_type);
     }
     let capability_native = capability.target.native_type.to_ascii_lowercase();
     let target_native = target.native_type.trim().to_ascii_lowercase();
@@ -6177,6 +6232,12 @@ fn candidate_target(
         .get("conversion_kind")
         .map(String::as_str)
         == Some("spatial")
+        || capability
+            .target
+            .parameters
+            .get("target_storage")
+            .map(String::as_str)
+            == Some("mysql_geometry")
     {
         representation.native_type = target.native_type.clone();
     }
@@ -6260,6 +6321,12 @@ fn explicit_template_matches_binding(
             temporal_details(&input_source.logical_type).0 != "unknown"
                 && (selected_rule.is_some_and(|rule| rule.id == capability.rule.id)
                     || !temporal_binding_is_exact(input_source, input_target))
+        }
+        Some("recursive") => {
+            recursive_type_kind(&input_source.logical_type).is_some()
+                && matches!(input_target.logical_type, LogicalType::Json { .. })
+                && (selected_rule.is_none()
+                    || selected_rule.is_some_and(|rule| rule.id == capability.rule.id))
         }
         _ => false,
     }
@@ -6480,6 +6547,15 @@ fn capability_matches_source(capability: &CapabilityEntry, source: &LogicalType)
             },
             LogicalType::Spatial { .. },
         ) if subtype == "*" => true,
+        (
+            LogicalType::Opaque {
+                source_type,
+                format,
+            },
+            source,
+        ) if source_type == "*" && format == "recursive" => {
+            recursive_type_kind(source).is_some()
+        }
         _ => false,
     }
 }
