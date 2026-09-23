@@ -1,11 +1,10 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{
-    BitOrder, BitPadding, CapabilityEntry, ChangeTransaction, ColumnDatum, ConnectorIdentity,
-    CompatibilityInput, ConversionRule, Datum, DefinitionReference, FailurePolicy,
-    FieldCompatibilityInput,
-    FieldDefinition, LogicalType, LogicalValue, Operation, PresenceState, QualificationLevel,
-    RiskLevel, RouteOptions, RowChange, ServerBuildIdentity, Source, SourceCursor,
-    SourceTypeMapping, SpatialFormat, TargetCapabilityManifest, TargetRepresentation,
+    BitOrder, BitPadding, CapabilityEntry, ChangeTransaction, ColumnDatum, CompatibilityInput,
+    ConnectorIdentity, ConversionRule, Datum, DefinitionReference, FailurePolicy,
+    FieldCompatibilityInput, FieldDefinition, LogicalType, LogicalValue, Operation, PresenceState,
+    QualificationLevel, RiskLevel, RouteOptions, RowChange, ServerBuildIdentity, Source,
+    SourceCursor, SourceTypeMapping, SpatialFormat, TargetCapabilityManifest, TargetRepresentation,
 };
 
 fn cursor(value: &str) -> SourceCursor {
@@ -156,19 +155,9 @@ fn mysql_id_plan(
         source_connector: mapping.connector.clone(),
         sink_connector: manifest.connector.clone(),
         source_build: Some(if transaction.transaction().source.kind == "postgresql" {
-            ServerBuildIdentity::new(
-                "postgresql",
-                "community",
-                "15.19",
-                "postgres-15.19",
-            )
+            ServerBuildIdentity::new("postgresql", "community", "15.19", "postgres-15.19")
         } else {
-            ServerBuildIdentity::new(
-                "mysql",
-                "oracle",
-                "5.7.44",
-                "mysql-5.7.44",
-            )
+            ServerBuildIdentity::new("mysql", "oracle", "5.7.44", "mysql-5.7.44")
         }),
         target_build: Some(manifest.target_build.clone()),
         manifest,
@@ -512,10 +501,16 @@ fn mysql_sink_uses_json_value_carrier_for_a_qualified_recursive_plan() {
         options: options("mysql-recursive-route"),
     })
     .unwrap();
-    assert_eq!(result.status, change_event::CompatibilityStatus::NeedsConfirmation);
+    assert_eq!(
+        result.status,
+        change_event::CompatibilityStatus::NeedsConfirmation
+    );
     let mut plan = result.plan.expect("recursive JSON carrier should qualify");
     assert_eq!(
-        plan.target.parameters.get("conversion_kind").map(String::as_str),
+        plan.target
+            .parameters
+            .get("conversion_kind")
+            .map(String::as_str),
         Some("recursive")
     );
     plan.confirmation = change_event::PlanConfirmationState::Confirmed;
@@ -536,8 +531,7 @@ fn mysql_sink_uses_native_spatial_wkb_binding_and_srid() {
     let value = LogicalValue::Spatial {
         format: SpatialFormat::Wkb,
         bytes_base64url: URL_SAFE_NO_PAD.encode([
-            1_u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0,
+            1_u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ]),
         geometry_type: "point".into(),
         dimensions: 2,
@@ -581,9 +575,10 @@ fn mysql_sink_uses_native_spatial_wkb_binding_and_srid() {
     assert_eq!(result.status, change_event::CompatibilityStatus::Compatible);
     let id_plan = mysql_id_plan(&transaction, &manifest);
     let sql = mysql_8_0::sql_with_plans(&transaction, &[id_plan, result.plan.unwrap()]).unwrap();
-    assert!(sql
-        .statements()
-        .any(|statement| statement.contains("ST_GeomFromWKB(?, 4326)")));
+    assert!(
+        sql.statements()
+            .any(|statement| statement.contains("ST_GeomFromWKB(?, 4326)"))
+    );
     assert!(sql.parameters().any(|parameters| {
         parameters.iter().any(|parameter| {
             matches!(parameter, mysql::Value::Bytes(bytes) if bytes.starts_with(&[1, 1, 0, 0, 0]))

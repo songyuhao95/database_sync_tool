@@ -11,8 +11,7 @@ fn binary_plan(
     target_mapping: &change_event::SourceTypeMapping,
     ordinal: usize,
 ) -> change_event::ColumnConversionPlan {
-    let source_mapping =
-        ::mysql_5_7::source_type_mapping("varbinary(32)", None, None).unwrap();
+    let source_mapping = ::mysql_5_7::source_type_mapping("varbinary(32)", None, None).unwrap();
     let source_field = change_event::FieldDefinition {
         reference: change_event::DefinitionReference::new(
             "catalog:CDC_test.cdc_contract.bytes",
@@ -68,7 +67,9 @@ fn binary_plan(
     })
     .unwrap();
     assert_eq!(result.status, change_event::CompatibilityStatus::Compatible);
-    result.plan.expect("binary field must have a conversion plan")
+    result
+        .plan
+        .expect("binary field must have a conversion plan")
 }
 
 fn integer_plan(
@@ -76,8 +77,7 @@ fn integer_plan(
     target_manifest: &change_event::TargetCapabilityManifest,
     target_mapping: &change_event::SourceTypeMapping,
 ) -> change_event::ColumnConversionPlan {
-    let source_mapping =
-        ::mysql_5_7::source_type_mapping("bigint unsigned", None, None).unwrap();
+    let source_mapping = ::mysql_5_7::source_type_mapping("bigint unsigned", None, None).unwrap();
     let source_field = change_event::FieldDefinition {
         reference: change_event::DefinitionReference::new(
             "catalog:CDC_test.cdc_contract.id",
@@ -133,7 +133,9 @@ fn integer_plan(
     })
     .unwrap();
     assert_eq!(result.status, change_event::CompatibilityStatus::Compatible);
-    result.plan.expect("integer field must have a conversion plan")
+    result
+        .plan
+        .expect("integer field must have a conversion plan")
 }
 
 macro_rules! target_tests {
@@ -332,14 +334,13 @@ fn mysql_versioned_sinks_consume_column_conversion_plans() {
 
     macro_rules! assert_planned_sink {
         ($adapter:ident, $version:literal) => {{
-            let manifest = ::$adapter::compatibility_manifest(
-                change_event::ServerBuildIdentity::new(
+            let manifest =
+                ::$adapter::compatibility_manifest(change_event::ServerBuildIdentity::new(
                     "mysql",
                     "oracle",
                     $version,
                     concat!("mysql-", $version),
-                ),
-            );
+                ));
             assert!(manifest.capabilities.iter().any(|capability| {
                 capability
                     .target
@@ -409,14 +410,12 @@ fn mysql_versioned_sinks_require_plans_for_plan_backed_apply() {
         Some("target_capability.plans_missing")
     );
 
-    let manifest = ::mysql_5_7::compatibility_manifest(
-        change_event::ServerBuildIdentity::new(
-            "mysql",
-            "oracle",
-            "5.7.44",
-            "mysql-5.7.44",
-        ),
-    );
+    let manifest = ::mysql_5_7::compatibility_manifest(change_event::ServerBuildIdentity::new(
+        "mysql",
+        "oracle",
+        "5.7.44",
+        "mysql-5.7.44",
+    ));
     let mapping = ::mysql_5_7::source_type_mapping("varbinary(32)", None, None).unwrap();
     let error = ::mysql_5_7::sql_with_plans(
         &transaction,

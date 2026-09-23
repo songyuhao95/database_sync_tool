@@ -6553,9 +6553,7 @@ fn capability_matches_source(capability: &CapabilityEntry, source: &LogicalType)
                 format,
             },
             source,
-        ) if source_type == "*" && format == "recursive" => {
-            recursive_type_kind(source).is_some()
-        }
+        ) if source_type == "*" && format == "recursive" => recursive_type_kind(source).is_some(),
         _ => false,
     }
 }

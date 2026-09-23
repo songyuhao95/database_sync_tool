@@ -793,9 +793,7 @@ fn parameter_for(value: &LogicalValue, native_type: &str) -> io::Result<Paramete
         | LogicalValue::Xml { .. }
         | LogicalValue::Domain { .. } => Ok(Parameter::Structured(structured_text(value)?)),
         LogicalValue::Raw { carrier } => Ok(Parameter::CustomBinary(
-            carrier
-                .raw_bytes()
-                .map_err(|error| capability_failure(error))?,
+            carrier.raw_bytes().map_err(capability_failure)?,
         )),
         LogicalValue::Map { .. } | LogicalValue::Null | LogicalValue::InvalidTemporal { .. } => {
             Err(capability_failure(
@@ -1027,9 +1025,9 @@ fn value_input(value: &LogicalValue) -> io::Result<String> {
         | LogicalValue::Domain { .. }
         | LogicalValue::Xml { .. } => structured_text(value),
         LogicalValue::Json { value } => render_json(value),
-        LogicalValue::Raw { carrier } => Ok(hex(&carrier
-            .raw_bytes()
-            .map_err(|error| capability_failure(error))?)),
+        LogicalValue::Raw { carrier } => {
+            Ok(hex(&carrier.raw_bytes().map_err(capability_failure)?))
+        }
         LogicalValue::Spatial {
             bytes_base64url, ..
         } => Ok(hex(&decode_bytes(bytes_base64url)?)),
@@ -1216,9 +1214,7 @@ fn render_logical_value(value: &LogicalValue) -> io::Result<String> {
         }
         LogicalValue::Raw { carrier } => Ok(format!(
             "decode('{}', 'hex')",
-            hex(&carrier
-                .raw_bytes()
-                .map_err(|error| capability_failure(error))?)
+            hex(&carrier.raw_bytes().map_err(capability_failure)?)
         )),
         LogicalValue::Map { .. } | LogicalValue::Null | LogicalValue::InvalidTemporal { .. } => {
             Err(capability_failure(

@@ -426,7 +426,11 @@ fn column_plan<'a>(
         .find(|plan| plan.source_field.lineage_id == lineage)
 }
 
-fn value_placeholder(change: &RowChange, column: &ColumnDatum, plans: &[ColumnConversionPlan]) -> String {
+fn value_placeholder(
+    change: &RowChange,
+    column: &ColumnDatum,
+    plans: &[ColumnConversionPlan],
+) -> String {
     value_placeholder_for_key(&change.schema, &change.table, column, plans)
 }
 
@@ -542,6 +546,19 @@ pub(crate) fn connect(
 
 /// Read-only target catalog evidence used to qualify a persisted plan. The
 /// target table is user-owned; this probe never creates or alters it.
+type TargetColumnProbeRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+    Option<i64>,
+    Option<u64>,
+    Option<u64>,
+    String,
+    String,
+);
+
 pub fn probe_target(
     config: &TargetConfig,
     schema: &str,
@@ -574,18 +591,7 @@ pub fn probe_target(
         )
         .map_err(io::Error::other)?
         .unwrap_or(0);
-    let row: Option<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<u64>,
-        Option<i64>,
-        Option<u64>,
-        Option<u64>,
-        String,
-        String,
-    )> = conn
+    let row: Option<TargetColumnProbeRow> = conn
         .exec_first(
             "SELECT COLUMN_TYPE, DATA_TYPE, CHARACTER_SET_NAME, COLLATION_NAME, NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION, IS_NULLABLE, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=?",
             (schema, table, column),
@@ -1091,7 +1097,10 @@ fn bind_datum_with_plan(
                     .parameters
                     .get("conversion_kind")
                     .map(String::as_str)
-                    == Some("recursive") => Ok(Value::Bytes(logical_value_json(value)?.into_bytes())),
+                    == Some("recursive") =>
+            {
+                Ok(Value::Bytes(logical_value_json(value)?.into_bytes()))
+            }
             _ => bind_logical_value(value),
         },
     }
@@ -1175,8 +1184,8 @@ fn ensure_supported_image_with_plans(
     }
     for column in image.iter().filter(|column| !column.generated) {
         if let Datum::Value(value) = &column.datum {
-            if let Some(plan) = column_plan(&change.schema, &change.table, column, plans) {
-                if plan
+            if let Some(plan) = column_plan(&change.schema, &change.table, column, plans)
+                && (plan
                     .target
                     .parameters
                     .get("conversion_kind")
@@ -1187,11 +1196,10 @@ fn ensure_supported_image_with_plans(
                         .parameters
                         .get("conversion_kind")
                         .map(String::as_str)
-                        == Some("spatial")
-                {
-                    bind_column_with_plan(change, column, plans)?;
-                    continue;
-                }
+                        == Some("spatial"))
+            {
+                bind_column_with_plan(change, column, plans)?;
+                continue;
             }
             ensure_source_value_type(&column.native_type, value, column.primary_key_ordinal)?;
             bind_logical_value(value)
@@ -1222,8 +1230,7 @@ fn mysql_spatial_value(value: &LogicalValue) -> io::Result<Value> {
             "MySQL spatial writes require a qualified WKB value",
         ));
     }
-    let srid = srid
-        .ok_or_else(|| capability_failure("MySQL spatial writes require an SRID"))?;
+    let srid = srid.ok_or_else(|| capability_failure("MySQL spatial writes require an SRID"))?;
     let srid = u32::try_from(srid)
         .map_err(|_| capability_failure("MySQL spatial SRID is outside the native range"))?;
     let wkb = decode_bytes(bytes_base64url)?;

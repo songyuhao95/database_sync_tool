@@ -209,6 +209,7 @@ impl Store {
             error.unwrap_or("任务已停止，进度保存在目的端 CDC.log_info"),
         )
     }
+    #[cfg(test)]
     pub(crate) fn begin_task(&self, actor: i64, id: &str) -> Result<()> {
         let task = self.task(id)?;
         self.begin_task_at_revision(actor, id, task.configuration_revision, false)
