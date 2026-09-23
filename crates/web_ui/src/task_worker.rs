@@ -71,11 +71,21 @@ fn parse_postgresql_lsn(value: &str) -> io::Result<u64> {
     Ok((upper << 32) | lower)
 }
 
+fn postgresql_major(adapter: AdapterKind) -> Option<u16> {
+    match adapter {
+        AdapterKind::Postgresql15 => Some(15),
+        AdapterKind::Postgresql16 => Some(16),
+        AdapterKind::Postgresql17 => Some(17),
+        _ => None,
+    }
+}
+
 fn open_postgresql_source(
     endpoint: &Endpoint,
     task_id: &str,
     saved: Option<&Checkpoint>,
     stop: &Arc<AtomicBool>,
+    major: u16,
 ) -> io::Result<(Stream, Checkpoint)> {
     if let Some(saved) = saved
         && saved.mode != "postgresql_lsn"
@@ -92,7 +102,7 @@ fn open_postgresql_source(
         &endpoint.database,
         &endpoint.user,
         &endpoint.password,
-        "cdc_pg15_demo",
+        format!("cdc_pg{major}_demo"),
         slot,
     );
     config.create_slot = saved.is_none();
@@ -103,7 +113,7 @@ fn open_postgresql_source(
         .build()
         .map_err(io::Error::other)?;
     let mut replication = runtime
-        .block_on(postgresql_15::replication(config))
+        .block_on(postgresql_15::replication_for_version(config, major))
         .map_err(io::Error::other)?;
     drop(runtime);
     let source_uuid = replication.source().id.clone();
@@ -345,6 +355,9 @@ fn open_sink(
                 binding,
             )?))
         }
+        AdapterKind::Postgresql16 | AdapterKind::Postgresql17 => Err(io::Error::other(
+            "PostgreSQL 16/17 are source-only Web adapters",
+        )),
     }
 }
 fn capture(
@@ -437,7 +450,9 @@ fn capture(
         AdapterKind::Mysql57 => open!(mysql_5_7),
         AdapterKind::Mysql80 => open!(mysql_8_0),
         AdapterKind::Mysql84 => open!(mysql_8_4),
-        AdapterKind::Postgresql15 => open_postgresql_source(endpoint, id, saved, stop),
+        AdapterKind::Postgresql15 => open_postgresql_source(endpoint, id, saved, stop, 15),
+        AdapterKind::Postgresql16 => open_postgresql_source(endpoint, id, saved, stop, 16),
+        AdapterKind::Postgresql17 => open_postgresql_source(endpoint, id, saved, stop, 17),
     }
 }
 fn open_snapshot(
@@ -469,9 +484,9 @@ fn open_snapshot(
         AdapterKind::Mysql57 => open!(mysql_5_7),
         AdapterKind::Mysql80 => open!(mysql_8_0),
         AdapterKind::Mysql84 => open!(mysql_8_4),
-        AdapterKind::Postgresql15 => Err(io::Error::other(
-            "PostgreSQL SourceAdapter 不提供 Web 全量快照",
-        )),
+        AdapterKind::Postgresql15 | AdapterKind::Postgresql16 | AdapterKind::Postgresql17 => Err(
+            io::Error::other("PostgreSQL SourceAdapter 不提供 Web 全量快照"),
+        ),
     }
 }
 fn project(mut tx: ChangeTransaction, mappings: &[TableMapping]) -> ChangeTransaction {
@@ -608,7 +623,9 @@ fn classify_endpoint_error(endpoint: &Endpoint, error: &io::Error) -> TargetAppl
         AdapterKind::Mysql57 => mysql_5_7::classify_apply_error(error),
         AdapterKind::Mysql80 => mysql_8_0::classify_apply_error(error),
         AdapterKind::Mysql84 => mysql_8_4::classify_apply_error(error),
-        AdapterKind::Postgresql15 => postgresql_15::classify_apply_error(error),
+        AdapterKind::Postgresql15 | AdapterKind::Postgresql16 | AdapterKind::Postgresql17 => {
+            postgresql_15::classify_apply_error(error)
+        }
     }
 }
 
@@ -725,10 +742,19 @@ pub(crate) fn run(store: &Store, actor: i64, id: &str, stop: &Arc<AtomicBool>) -
         "writer",
         (!task.sink_database.is_empty()).then_some(task.sink_database.as_str()),
     )?;
-    let mut preopened_source = if source.connector.adapter == AdapterKind::Postgresql15 {
+    let mut preopened_source = if matches!(
+        source.connector.adapter,
+        AdapterKind::Postgresql15 | AdapterKind::Postgresql16 | AdapterKind::Postgresql17
+    ) {
         Some(
-            open_postgresql_source(&source, id, task.runtime.checkpoint.as_ref(), stop)
-                .map_err(failure)?,
+            open_postgresql_source(
+                &source,
+                id,
+                task.runtime.checkpoint.as_ref(),
+                stop,
+                postgresql_major(source.connector.adapter).expect("PostgreSQL adapter"),
+            )
+            .map_err(failure)?,
         )
     } else {
         None
@@ -774,8 +800,16 @@ pub(crate) fn run(store: &Store, actor: i64, id: &str, stop: &Arc<AtomicBool>) -
         // SQLite is only a UI mirror. If the sink has a newer authoritative
         // cursor, reopen the source from that cursor before consuming rows.
         drop(preopened_source.take());
-        preopened_source =
-            Some(open_postgresql_source(&source, id, Some(saved), stop).map_err(failure)?);
+        preopened_source = Some(
+            open_postgresql_source(
+                &source,
+                id,
+                Some(saved),
+                stop,
+                postgresql_major(source.connector.adapter).expect("PostgreSQL adapter"),
+            )
+            .map_err(failure)?,
+        );
     }
     if stop.load(Ordering::Acquire) {
         return Ok(());

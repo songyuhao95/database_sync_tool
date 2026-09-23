@@ -234,8 +234,14 @@ fn qualification_recovery_matrix() {
             let (tk, tv) = identity(sink_id);
             let supported =
                 SourceRegistry.find(&sk, &sv).is_some() && SinkRegistry.find(&tk, &tv).is_some();
-            let declared = config["implemented"].as_array().unwrap().contains(source)
-                && config["implemented"].as_array().unwrap().contains(sink);
+            let sink_is_source_only = config["source_only"]
+                .as_array()
+                .is_some_and(|values| values.contains(sink));
+            let implemented_source = config["implemented"].as_array().unwrap().contains(source);
+            let implemented_sink = config["implemented"].as_array().unwrap().contains(sink);
+            let source_only_source = config["source_only"].as_array().unwrap().contains(source);
+            let declared = (implemented_source && implemented_sink && !sink_is_source_only)
+                || (source_only_source && implemented_sink);
             assert_eq!(
                 supported, declared,
                 "registry and qualification roster disagree: {source_id} -> {sink_id}"
@@ -249,6 +255,8 @@ fn qualification_recovery_matrix() {
                 "mysql_8_0" => fixture::SourceVersion::Mysql80,
                 "mysql_8_4" => fixture::SourceVersion::Mysql84,
                 "postgresql_15" => fixture::SourceVersion::Postgresql15,
+                "postgresql_16" => fixture::SourceVersion::Postgresql16,
+                "postgresql_17" => fixture::SourceVersion::Postgresql17,
                 _ => panic!("registered source needs a fixed native fixture"),
             };
             let tx = fixture::validate_source(

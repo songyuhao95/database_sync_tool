@@ -10,7 +10,7 @@ CREATE TABLE instances_v7 (
     metadata_json TEXT, checked_at INTEGER, probe_error TEXT,
     revision INTEGER NOT NULL DEFAULT 1,
     CHECK((kind='mysql' AND version IN ('5.7','8.0','8.4') AND database_name='')
-       OR (kind='postgresql' AND version='15' AND length(database_name) BETWEEN 1 AND 63))
+       OR (kind='postgresql' AND version IN ('15','16','17') AND length(database_name) BETWEEN 1 AND 63))
 );
 INSERT INTO instances_v7
     (id,name,host,port,version,reader_username,reader_secret,writer_username,writer_secret,

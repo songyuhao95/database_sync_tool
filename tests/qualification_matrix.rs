@@ -20,6 +20,8 @@ fn connector(id: &str) -> Option<fixture::SourceVersion> {
         "mysql_8_0" => Some(Mysql80),
         "mysql_8_4" => Some(Mysql84),
         "postgresql_15" => Some(Postgresql15),
+        "postgresql_16" => Some(Postgresql16),
+        "postgresql_17" => Some(Postgresql17),
         _ => None,
     }
 }
@@ -33,6 +35,8 @@ fn mapping(v: fixture::SourceVersion, native: &str) -> Result<SourceTypeMapping,
         Mysql80 => mysql_8_0::source_type_mapping(native, Some("utf8mb4"), None),
         Mysql84 => mysql_8_4::source_type_mapping(native, Some("utf8mb4"), None),
         Postgresql15 => postgresql_15::source_type_mapping(native).map_err(|e| e.to_string()),
+        Postgresql16 => postgresql_16::source_type_mapping(native).map_err(|e| e.to_string()),
+        Postgresql17 => postgresql_17::source_type_mapping(native).map_err(|e| e.to_string()),
     }
 }
 
@@ -53,6 +57,7 @@ fn manifest(v: fixture::SourceVersion) -> TargetCapabilityManifest {
         Mysql80 => mysql_8_0::compatibility_manifest(build),
         Mysql84 => mysql_8_4::compatibility_manifest(build),
         Postgresql15 => postgresql_15::compatibility_manifest(build),
+        Postgresql16 | Postgresql17 => postgresql_15::compatibility_manifest(build),
     }
 }
 
@@ -466,6 +471,9 @@ fn assert_dml(source: fixture::SourceVersion, sink: fixture::SourceVersion) {
         Mysql80 => check!(mysql_8_0),
         Mysql84 => check!(mysql_8_4),
         Postgresql15 => check!(postgresql_15),
+        Postgresql16 | Postgresql17 => {
+            panic!("PostgreSQL 16/17 fixtures are source-only")
+        }
     }
 }
 
@@ -484,17 +492,21 @@ fn six_by_six_qualification() {
             .as_array()
             .unwrap()
             .contains(&json!(id));
+        let source_only = config["source_only"]
+            .as_array()
+            .is_some_and(|values| values.contains(&json!(id)));
         let unsupported = config["unsupported"]
             .as_array()
             .unwrap()
             .contains(&json!(id));
         assert_ne!(
-            implemented, unsupported,
+            implemented || source_only,
+            unsupported,
             "every version must have an explicit support declaration"
         );
         assert_eq!(
             connector(id).is_some(),
-            implemented,
+            implemented || source_only,
             "new connector requires fixed source/sink fixtures"
         );
     }
@@ -549,6 +561,14 @@ fn new_version_adds_exactly_two_n_plus_one_directions() {
 }
 
 fn qualify_direction(source: &str, sink: &str) -> Value {
+    let config: Value = serde_json::from_str(include_str!("../scripts/qualification-matrix.json"))
+        .expect("qualification matrix must be valid JSON");
+    if config["source_only"]
+        .as_array()
+        .is_some_and(|values| values.iter().any(|value| value == sink))
+    {
+        return json!({"source":source,"sink":sink,"offline":"UNSUPPORTED","live":"UNSUPPORTED","qualification":"UNSUPPORTED/BLOCKED","code":"connector.not_implemented","cases":cases().iter().map(|c|json!({"case":c.id,"offline":"UNSUPPORTED","qualification":"UNSUPPORTED/BLOCKED","code":"connector.not_implemented"})).collect::<Vec<_>>(),"dml":"UNSUPPORTED","recovery":"UNSUPPORTED"});
+    }
     match (connector(source), connector(sink)) {
         (Some(s), Some(t)) => {
             let manifest = manifest(t);

@@ -52,6 +52,8 @@ pub(crate) enum AdapterKind {
     Mysql80,
     Mysql84,
     Postgresql15,
+    Postgresql16,
+    Postgresql17,
 }
 
 const MYSQL_LOGICAL_TYPES: &[&str] = &[
@@ -88,6 +90,16 @@ const POSTGRES_LOGICAL_TYPES: &[&str] = &[
     "year",
     "json",
     "enum",
+    "local_time",
+    "network",
+    "xml",
+    "spatial",
+    "array",
+    "struct",
+    "range",
+    "multi_range",
+    "domain",
+    "raw",
 ];
 const PRESENCE: &[&str] = &["value", "null", "unchanged", "unavailable"];
 const TRANSACTION_CAPABILITIES: ConnectorCapabilities = ConnectorCapabilities {
@@ -168,6 +180,18 @@ const SOURCES: &[ConnectorDescriptor] = &[
         "postgresql",
         "15",
         AdapterKind::Postgresql15,
+        POSTGRES_SOURCE_CAPABILITIES,
+    ),
+    source(
+        "postgresql",
+        "16",
+        AdapterKind::Postgresql16,
+        POSTGRES_SOURCE_CAPABILITIES,
+    ),
+    source(
+        "postgresql",
+        "17",
+        AdapterKind::Postgresql17,
         POSTGRES_SOURCE_CAPABILITIES,
     ),
 ];
@@ -251,7 +275,9 @@ impl ConnectorDescriptor {
             AdapterKind::Mysql57 => mysql_5_7::compatibility_manifest(target_build),
             AdapterKind::Mysql80 => mysql_8_0::compatibility_manifest(target_build),
             AdapterKind::Mysql84 => mysql_8_4::compatibility_manifest(target_build),
-            AdapterKind::Postgresql15 => postgresql_15::compatibility_manifest(target_build),
+            AdapterKind::Postgresql15 | AdapterKind::Postgresql16 | AdapterKind::Postgresql17 => {
+                postgresql_15::compatibility_manifest(target_build)
+            }
         }
     }
 
@@ -267,6 +293,10 @@ impl ConnectorDescriptor {
             )
             .map_err(|error| error.to_string()),
             AdapterKind::Postgresql15 => postgresql_15::source_type_mapping(&column.column_type)
+                .map_err(|error| error.to_string()),
+            AdapterKind::Postgresql16 => postgresql_16::source_type_mapping(&column.column_type)
+                .map_err(|error| error.to_string()),
+            AdapterKind::Postgresql17 => postgresql_17::source_type_mapping(&column.column_type)
                 .map_err(|error| error.to_string()),
             AdapterKind::Mysql80 => mysql_8_0::source_type_mapping(
                 &column.column_type,

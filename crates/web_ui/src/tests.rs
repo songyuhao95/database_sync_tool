@@ -483,9 +483,10 @@ async fn http_routes_require_session_and_csrf() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let connectors = response_json(response).await;
-    assert_eq!(connectors["sources"].as_array().unwrap().len(), 4);
+    assert_eq!(connectors["sources"].as_array().unwrap().len(), 6);
     assert_eq!(connectors["sinks"].as_array().unwrap().len(), 4);
     assert_eq!(connectors["sources"][3]["identity"]["kind"], "postgresql");
+    assert_eq!(connectors["sources"][5]["identity"]["version"], "17");
     assert_eq!(connectors["sinks"][3]["identity"]["version"], "15");
 
     let response = app

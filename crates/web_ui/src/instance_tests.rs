@@ -150,7 +150,6 @@ fn instance_versions_database_names_and_permissions_are_validated() {
     for (kind, version, database) in [
         ("mysql", "15", ""),
         ("postgresql", "5.7", "CDC_test"),
-        ("postgresql", "16", "CDC_test"),
         ("postgresql", "15", ""),
         ("postgresql", "15", "bad\0database"),
         ("unknown", "15", "CDC_test"),
@@ -161,6 +160,14 @@ fn instance_versions_database_names_and_permissions_are_validated() {
             Err(Error::Invalid(_))
         ));
     }
+    let pg16: InstanceInput = serde_json::from_value(
+        json!({"name":"pg16-new","host":"127.0.0.1","port":5432,"kind":"postgresql","version":"16","database":"CDC_test"}),
+    )
+    .unwrap();
+    assert_eq!(
+        store.save_instance(actor, None, pg16).unwrap().version,
+        "16"
+    );
     // Omitted type/database retains the historical MySQL API behavior.
     let legacy: InstanceInput = serde_json::from_value(
         json!({"name":"legacy","host":"127.0.0.1","port":3306,"version":"5.7"}),

@@ -84,7 +84,7 @@ fn validate(input: &InstanceInput) -> Result<()> {
     let valid_version = (registered_source || registered_sink) && valid_databases;
     if input.port == 0 || !valid_version {
         return Err(Error::Invalid(
-            "数据库类型、版本、端口或连接数据库无效；当前支持 MySQL 5.7/8.0/8.4 和 PostgreSQL 15",
+            "数据库类型、版本、端口或连接数据库无效；当前支持 MySQL 5.7/8.0/8.4 和 PostgreSQL 15/16/17",
         ));
     }
     for (user, pass) in [
@@ -138,8 +138,11 @@ impl Store {
     ) -> Result<Vec<String>> {
         let conn = self.db()?;
         admin(&conn, actor)?;
-        if input.kind != "postgresql" || input.version != "15" || input.port == 0 {
-            return Err(Error::Invalid("仅支持探测 PostgreSQL 15 数据库"));
+        if input.kind != "postgresql"
+            || SourceRegistry.find(&input.kind, &input.version).is_none()
+            || input.port == 0
+        {
+            return Err(Error::Invalid("仅支持探测 PostgreSQL 15/16/17 数据库"));
         }
         if input.host.is_empty()
             || input.host.len() > 253
@@ -175,14 +178,28 @@ impl Store {
             .enable_all()
             .build()
             .map_err(|_| Error::Internal)?;
-        runtime
-            .block_on(postgresql_15::databases(
+        let result = match input.version.as_str() {
+            "15" => runtime.block_on(postgresql_15::databases(
                 &input.host,
                 input.port,
                 &input.reader_username,
                 &password,
-            ))
-            .map_err(|_| Error::Invalid("PostgreSQL 数据库探测失败，请检查地址、读取账号和密码"))
+            )),
+            "16" => runtime.block_on(postgresql_16::databases(
+                &input.host,
+                input.port,
+                &input.reader_username,
+                &password,
+            )),
+            "17" => runtime.block_on(postgresql_17::databases(
+                &input.host,
+                input.port,
+                &input.reader_username,
+                &password,
+            )),
+            _ => return Err(Error::Invalid("未注册的 PostgreSQL SourceAdapter")),
+        };
+        result.map_err(|_| Error::Invalid("PostgreSQL 数据库探测失败，请检查地址、读取账号和密码"))
     }
 
     pub(crate) fn instances(&self) -> Result<Vec<Instance>> {
@@ -324,18 +341,33 @@ fn probe(d: &Instance, password: &str) -> std::result::Result<Metadata, &'static
             .enable_all()
             .build()
             .map_err(|_| "无法启动数据库探测")?;
-        return runtime
-            .block_on(postgresql_15::metadata(
+        let result = match d.version.as_str() {
+            "15" => runtime.block_on(postgresql_15::metadata(
                 &d.host,
                 d.port,
                 &d.database,
                 &d.reader_username,
                 password,
-            ))
-            .map(Metadata::Postgresql)
-            .map_err(
-                |_| "PostgreSQL 15 连接或元信息读取失败，请检查版本、地址、连接数据库及读取账号",
-            );
+            )),
+            "16" => runtime.block_on(postgresql_16::metadata(
+                &d.host,
+                d.port,
+                &d.database,
+                &d.reader_username,
+                password,
+            )),
+            "17" => runtime.block_on(postgresql_17::metadata(
+                &d.host,
+                d.port,
+                &d.database,
+                &d.reader_username,
+                password,
+            )),
+            _ => return Err("未注册的 PostgreSQL SourceAdapter"),
+        };
+        return result.map(Metadata::Postgresql).map_err(
+            |_| "PostgreSQL 15/16/17 连接或元信息读取失败，请检查版本、地址、连接数据库及读取账号",
+        );
     }
     let opts = OptsBuilder::new()
         .ip_or_hostname(Some(d.host.clone()))

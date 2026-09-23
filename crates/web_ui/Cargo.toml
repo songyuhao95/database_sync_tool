@@ -25,6 +25,8 @@ mysql_5_7 = { path = "../mysql_5_7" }
 mysql_8_0 = { path = "../mysql_8_0" }
 mysql_8_4 = { path = "../mysql_8_4" }
 postgresql_15 = { path = "../postgresql_15" }
+postgresql_16 = { path = "../postgresql_16" }
+postgresql_17 = { path = "../postgresql_17" }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 
 [dev-dependencies]

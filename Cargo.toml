@@ -35,3 +35,5 @@ mysql = { package = "mysql", version = "28.0.0", default-features = false, featu
 serde_json.workspace = true
 base64.workspace = true
 postgresql_15 = { path = "crates/postgresql_15" }
+postgresql_16 = { path = "crates/postgresql_16" }
+postgresql_17 = { path = "crates/postgresql_17" }

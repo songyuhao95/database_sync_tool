@@ -56,6 +56,8 @@ impl Store {
                 format!("mysql-{version}-binlog.log")
             }
             AdapterKind::Postgresql15 => "postgresql-15-source.log".into(),
+            AdapterKind::Postgresql16 => "postgresql-16-source.log".into(),
+            AdapterKind::Postgresql17 => "postgresql-17-source.log".into(),
         };
         let path = self.log_dir.join(id).join(filename);
         let metadata = match path.symlink_metadata() {

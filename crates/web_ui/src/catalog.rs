@@ -195,15 +195,31 @@ impl Store {
                     .enable_all()
                     .build()
                     .map_err(|_| Error::Internal)?;
-                let metadata = runtime
-                    .block_on(postgresql_15::metadata(
+                let metadata = match version.as_str() {
+                    "15" => runtime.block_on(postgresql_15::metadata(
                         &host,
                         port,
                         &database_for_connection,
                         &username,
                         &password,
-                    ))
-                    .map_err(|_| Error::Invalid("读取 PostgreSQL 配置失败，请检查账号权限"))?;
+                    )),
+                    "16" => runtime.block_on(postgresql_16::metadata(
+                        &host,
+                        port,
+                        &database_for_connection,
+                        &username,
+                        &password,
+                    )),
+                    "17" => runtime.block_on(postgresql_17::metadata(
+                        &host,
+                        port,
+                        &database_for_connection,
+                        &username,
+                        &password,
+                    )),
+                    _ => return Err(Error::Invalid("未注册的 PostgreSQL SourceAdapter")),
+                }
+                .map_err(|_| Error::Invalid("读取 PostgreSQL 配置失败，请检查账号权限"))?;
                 let options = PgConnectOptions::new()
                     .host(&host)
                     .port(port)

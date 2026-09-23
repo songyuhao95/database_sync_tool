@@ -18,6 +18,8 @@ pub enum SourceVersion {
     Mysql80,
     Mysql84,
     Postgresql15,
+    Postgresql16,
+    Postgresql17,
 }
 
 impl SourceVersion {
@@ -34,11 +36,16 @@ impl SourceVersion {
             Self::Mysql80 => "8.0.46",
             Self::Mysql84 => "8.4.8",
             Self::Postgresql15 => "15.19",
+            Self::Postgresql16 => "16.10",
+            Self::Postgresql17 => "17.6",
         }
     }
 
     pub fn is_postgresql(self) -> bool {
-        matches!(self, Self::Postgresql15)
+        matches!(
+            self,
+            Self::Postgresql15 | Self::Postgresql16 | Self::Postgresql17
+        )
     }
 }
 
@@ -322,6 +329,8 @@ pub fn validate_source(
         SourceVersion::Mysql80 => mysql_8_0::validate_change_event(transaction)?,
         SourceVersion::Mysql84 => mysql_8_4::validate_change_event(transaction)?,
         SourceVersion::Postgresql15 => postgresql_15::validate_change_event(transaction)?,
+        SourceVersion::Postgresql16 => postgresql_16::validate_change_event(transaction)?,
+        SourceVersion::Postgresql17 => postgresql_17::validate_change_event(transaction)?,
     })
 }
 
@@ -341,6 +350,8 @@ pub fn assert_source_adapters_exist() {
     assert_source_adapter::<mysql_8_0::BinlogStream>();
     assert_source_adapter::<mysql_8_4::BinlogStream>();
     assert_source_adapter::<postgresql_15::Replication>();
+    assert_source_adapter::<postgresql_16::Replication>();
+    assert_source_adapter::<postgresql_17::Replication>();
 }
 
 pub fn assert_target_capability_failure(error: std::io::Error) {
