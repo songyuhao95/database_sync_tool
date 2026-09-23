@@ -6130,10 +6130,23 @@ fn target_representation_matches_binding(
     {
         return true;
     }
-    match (
-        capability.target.native_type.to_ascii_lowercase().as_str(),
-        &target.logical_type,
-    ) {
+    if capability
+        .target
+        .parameters
+        .get("conversion_kind")
+        .map(String::as_str)
+        == Some("spatial")
+    {
+        return matches!(target.logical_type, LogicalType::Spatial { .. });
+    }
+    let capability_native = capability.target.native_type.to_ascii_lowercase();
+    let target_native = target.native_type.trim().to_ascii_lowercase();
+    if matches!(capability_native.as_str(), "geometry" | "geography")
+        && target_native.starts_with(&format!("{capability_native}("))
+    {
+        return matches!(target.logical_type, LogicalType::Spatial { .. });
+    }
+    match (capability_native.as_str(), &target.logical_type) {
         ("enum", LogicalType::Enum { .. }) => target
             .native_type
             .trim_start()
@@ -6157,6 +6170,22 @@ fn candidate_target(
         representation.native_type.to_ascii_lowercase().as_str(),
         "enum" | "set"
     ) {
+        representation.native_type = target.native_type.clone();
+    }
+    if representation
+        .parameters
+        .get("conversion_kind")
+        .map(String::as_str)
+        == Some("spatial")
+    {
+        representation.native_type = target.native_type.clone();
+    }
+    let target_native = target.native_type.trim().to_ascii_lowercase();
+    if matches!(
+        representation.native_type.as_str(),
+        "geometry" | "geography"
+    ) && target_native.starts_with(&format!("{}(", representation.native_type))
+    {
         representation.native_type = target.native_type.clone();
     }
     representation
@@ -6443,6 +6472,14 @@ fn capability_matches_source(capability: &CapabilityEntry, source: &LogicalType)
                 members: source_members,
             },
         ) if members.is_empty() => !source_members.is_empty(),
+        (
+            LogicalType::Spatial {
+                subtype,
+                srid: None,
+                dimensions: 0,
+            },
+            LogicalType::Spatial { .. },
+        ) if subtype == "*" => true,
         _ => false,
     }
 }

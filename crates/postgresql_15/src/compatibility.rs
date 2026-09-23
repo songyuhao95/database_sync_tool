@@ -12,8 +12,9 @@ const CONNECTOR_VERSION: &str = "15";
 const RULE_VERSION: &str = "postgresql-15.sink-conversion.v1";
 
 /// Build a content-addressed manifest for one exact PostgreSQL 15 target
-/// build.  It contains only representations supported by the public DML
-/// renderer; arrays and other recursive values intentionally have no entry.
+/// build. It contains only representations supported by the public DML
+/// renderer, including the structured and extension-backed values it can
+/// bind without string-splicing them into SQL.
 pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabilityManifest {
     let mut capabilities = Vec::new();
 
@@ -44,6 +45,7 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
     }
     add_structured_json(&mut capabilities);
     add_enum(&mut capabilities);
+    add_structured_capabilities(&mut capabilities);
     for (bits, native) in [(16, "smallint"), (32, "integer"), (64, "bigint")] {
         add_range_checked_integer(&mut capabilities, bits, native);
     }
@@ -217,6 +219,49 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
 
     TargetCapabilityManifest::new(
         change_event::ConnectorIdentity::new("postgresql", CONNECTOR_VERSION),
+        target_build,
+        capabilities,
+        true,
+    )
+}
+
+/// Build the same PostgreSQL Sink capability set for an exact supported
+/// server major.  The conversion rules are versioned and content-addressed;
+/// changing the connector identity, rule identity, or evidence version also
+/// changes the manifest digest.
+pub fn compatibility_manifest_for_version(
+    target_build: ServerBuildIdentity,
+    connector_version: &str,
+) -> TargetCapabilityManifest {
+    if connector_version == CONNECTOR_VERSION {
+        return compatibility_manifest(target_build);
+    }
+
+    let mut capabilities = compatibility_manifest(target_build.clone()).capabilities;
+    let connector_prefix = format!("postgresql{CONNECTOR_VERSION}");
+    let versioned_prefix = format!("postgresql{connector_version}");
+    let rule_version = format!("postgresql-{connector_version}.sink-conversion.v1");
+    for capability in &mut capabilities {
+        capability.code = capability
+            .code
+            .replace(&connector_prefix, &versioned_prefix);
+        capability.rule.id = capability
+            .rule
+            .id
+            .replace(&connector_prefix, &versioned_prefix);
+        capability.rule.version = capability
+            .rule
+            .version
+            .replace("postgresql-15", &format!("postgresql-{connector_version}"));
+        capability.rule.evidence_digest = evidence_digest_for(
+            &rule_version,
+            &capability.code,
+            &capability.source_logical_type,
+            &capability.target,
+        );
+    }
+    TargetCapabilityManifest::new(
+        change_event::ConnectorIdentity::new("postgresql", connector_version),
         target_build,
         capabilities,
         true,
@@ -409,6 +454,112 @@ fn add_enum(capabilities: &mut Vec<CapabilityEntry>) {
         supported_operations: operations(),
         supported_presence: presence(),
         rule,
+    });
+}
+
+fn add_structured_capabilities(capabilities: &mut Vec<CapabilityEntry>) {
+    add_exact(
+        capabilities,
+        LogicalType::Array {
+            element: Box::new(LogicalType::integer(true, 32)),
+        },
+        "integer[]",
+        "array.integer32",
+    );
+    add_exact(
+        capabilities,
+        LogicalType::array_with_metadata(LogicalType::integer(true, 32), 1, vec![1]),
+        "integer[]",
+        "array_with_metadata.integer32",
+    );
+    add_exact(
+        capabilities,
+        LogicalType::Struct {
+            fields: vec![change_event::LogicalField {
+                name: "value".into(),
+                logical_type: LogicalType::integer(true, 32),
+                nullable: false,
+            }],
+        },
+        "cdc_composite",
+        "composite.integer32",
+    );
+    add_exact(
+        capabilities,
+        LogicalType::domain(
+            "cdc_domain",
+            LogicalType::integer(true, 32),
+            Vec::new(),
+            false,
+            None,
+            "catalog-bound",
+        ),
+        "cdc_domain",
+        "domain.integer32",
+    );
+    add_exact(
+        capabilities,
+        LogicalType::Range {
+            element: Box::new(LogicalType::integer(true, 32)),
+        },
+        "int4range",
+        "range.integer32",
+    );
+    add_exact(
+        capabilities,
+        LogicalType::MultiRange {
+            element: Box::new(LogicalType::integer(true, 32)),
+        },
+        "int4multirange",
+        "multirange.integer32",
+    );
+    add_exact(
+        capabilities,
+        LogicalType::spatial("*", None, 0),
+        "geometry",
+        "spatial.geometry",
+    );
+    add_exact(
+        capabilities,
+        LogicalType::spatial("*", None, 0),
+        "geography",
+        "spatial.geography",
+    );
+    add_exact(
+        capabilities,
+        LogicalType::network("inet", false),
+        "inet",
+        "network.inet",
+    );
+    add_exact(capabilities, LogicalType::xml(), "xml", "xml");
+    add_exact(
+        capabilities,
+        LogicalType::raw(
+            "postgresql.user-defined.v1",
+            "USER-DEFINED",
+            "catalog-bound",
+            "binary",
+        ),
+        "USER-DEFINED",
+        "custom.raw",
+    );
+
+    let logical = LogicalType::Set {
+        members: Vec::new(),
+    };
+    let mut target = TargetRepresentation::new("text[]");
+    target
+        .parameters
+        .insert("set_strategy".into(), "ordered_text_array".into());
+    let code = "postgresql15.explicit.set.text_array".to_owned();
+    let rule = explicit_rule(&code, logical.clone(), target.clone(), Vec::new());
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        rule,
+        supported_operations: operations(),
+        supported_presence: presence(),
     });
 }
 
@@ -751,7 +902,16 @@ fn evidence_digest(
     logical_type: &LogicalType,
     target: &TargetRepresentation,
 ) -> String {
-    let bytes = serde_json::to_vec(&(RULE_VERSION, code, logical_type, target))
+    evidence_digest_for(RULE_VERSION, code, logical_type, target)
+}
+
+fn evidence_digest_for(
+    rule_version: &str,
+    code: &str,
+    logical_type: &LogicalType,
+    target: &TargetRepresentation,
+) -> String {
+    let bytes = serde_json::to_vec(&(rule_version, code, logical_type, target))
         .expect("PostgreSQL capability evidence is serializable");
     Sha256::digest(bytes)
         .iter()
@@ -783,13 +943,11 @@ mod tests {
     }
 
     #[test]
-    fn arrays_have_no_implicit_target_representation() {
+    fn arrays_have_a_qualified_target_representation() {
         let manifest = compatibility_manifest(build());
-        assert!(
-            !manifest
-                .capabilities
-                .iter()
-                .any(|entry| matches!(entry.source_logical_type, LogicalType::Array { .. }))
-        );
+        assert!(manifest.capabilities.iter().any(|entry| {
+            matches!(entry.source_logical_type, LogicalType::Array { .. })
+                && entry.target.native_type == "integer[]"
+        }));
     }
 }

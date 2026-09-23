@@ -13,15 +13,17 @@ mod types;
 pub use catalog::source_type_catalog;
 pub use checkpoint::{CheckpointApplyResult, CheckpointWriter, ReplicationCheckpoint};
 pub use compatibility::{
-    capability_manifest_for, compatibility_manifest, plan_compatibility,
-    structured_capability_manifest, target_capability_manifest,
+    capability_manifest_for, compatibility_manifest, compatibility_manifest_for_version,
+    plan_compatibility, structured_capability_manifest, target_capability_manifest,
 };
 pub use pg_walstream::CancellationToken;
 pub use replication::{Config, Replication, replication, replication_for_version};
 pub use sql::{
-    ApplyResult, CAPABILITY_MANIFEST, Parameter, SinkAdapter, SnapshotSql, SqlTransaction,
-    TargetConfig, capability_manifest, classify_apply_error, commit_outcome_unknown, execute,
-    snapshot_sql, sql,
+    ApplyResult, CAPABILITY_MANIFEST, CAPABILITY_MANIFEST_16, CAPABILITY_MANIFEST_17, Parameter,
+    SinkAdapter, SnapshotSql, SqlTransaction, TargetConfig, capability_manifest,
+    capability_manifest_for_version, classify_apply_error, commit_outcome_unknown, execute,
+    execute_for_version, probe_target, probe_target_for_version, snapshot_sql, sql,
+    sql_for_version, sql_with_plans, sql_with_plans_for_version,
 };
 pub use type_mapping::{
     MAPPING_VERSION, MAPPING_VERSION_16, MAPPING_VERSION_17, SourceExtension, SourceTypeCatalog,

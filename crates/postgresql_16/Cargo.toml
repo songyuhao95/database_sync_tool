@@ -7,3 +7,6 @@ rust-version.workspace = true
 [dependencies]
 change_event.workspace = true
 postgresql_15 = { path = "../postgresql_15" }
+
+[dev-dependencies]
+base64.workspace = true

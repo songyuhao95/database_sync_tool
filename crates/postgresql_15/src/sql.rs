@@ -1,7 +1,10 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{
-    BitOrder, CapabilityManifest, ColumnDatum, Datum, JsonEntry, JsonValue, LogicalValue,
-    Operation, RowChange, SourceCursor, TargetCapabilityFailure, ValidatedTransaction,
+    BitOrder, CapabilityManifest, CapabilityProbeEntry, CapabilityProbeStatus,
+    ColumnConversionPlan, ColumnDatum, Datum, JsonEntry, JsonValue, LogicalValue, Operation,
+    PlanConfirmationState, QualificationLevel, RowChange, ServerBuildIdentity, SourceCursor,
+    TargetCapabilityFailure, TargetCapabilityProbe, TargetColumnMetadata, TargetSessionProfile,
+    ValidatedTransaction,
 };
 use sqlx::{
     Connection, PgConnection, Postgres, Row,
@@ -10,39 +13,94 @@ use sqlx::{
 };
 use std::{collections::BTreeSet, io};
 
-const TARGET_VERSION: &str = "15";
+pub const POSTGRESQL_15_VERSION: &str = "15";
+
+const SUPPORTED_LOGICAL_TYPES: &[&str] = &[
+    "boolean",
+    "uuid",
+    "integer",
+    "decimal",
+    "float",
+    "text",
+    "binary",
+    "bit_string",
+    "date",
+    "local_time",
+    "local_datetime",
+    "instant",
+    "duration",
+    "year",
+    "json",
+    "enum",
+    "set",
+    "array",
+    "composite",
+    "domain",
+    "range",
+    "multirange",
+    "spatial",
+    "network",
+    "xml",
+    "custom",
+];
 
 pub const CAPABILITY_MANIFEST: CapabilityManifest = CapabilityManifest {
     connector: "postgresql_15",
     target: "postgresql-15",
     contract: change_event::FORMAT,
-    supported_logical_types: &[
-        "boolean",
-        "uuid",
-        "integer",
-        "decimal",
-        "float",
-        "text",
-        "binary",
-        "bit_string",
-        "date",
-        "local_datetime",
-        "instant",
-        "duration",
-        "year",
-        "json",
-        "enum",
-    ],
+    supported_logical_types: SUPPORTED_LOGICAL_TYPES,
     supported_presence: &["value", "null", "unchanged", "unavailable"],
     requires_primary_key: true,
 };
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SinkAdapter;
+pub const CAPABILITY_MANIFEST_16: CapabilityManifest = CapabilityManifest {
+    connector: "postgresql_16",
+    target: "postgresql-16",
+    contract: change_event::FORMAT,
+    supported_logical_types: SUPPORTED_LOGICAL_TYPES,
+    supported_presence: &["value", "null", "unchanged", "unavailable"],
+    requires_primary_key: true,
+};
+
+pub const CAPABILITY_MANIFEST_17: CapabilityManifest = CapabilityManifest {
+    connector: "postgresql_17",
+    target: "postgresql-17",
+    contract: change_event::FORMAT,
+    supported_logical_types: SUPPORTED_LOGICAL_TYPES,
+    supported_presence: &["value", "null", "unchanged", "unavailable"],
+    requires_primary_key: true,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub struct SinkAdapter {
+    target_version: &'static str,
+}
 
 impl SinkAdapter {
     pub const fn new() -> Self {
-        Self
+        Self::new_for_version(POSTGRESQL_15_VERSION)
+    }
+
+    pub const fn new_for_version(target_version: &'static str) -> Self {
+        Self { target_version }
+    }
+
+    pub const fn target_version(&self) -> &str {
+        self.target_version
+    }
+
+    pub fn sql_with_plans(
+        &self,
+        transaction: &ValidatedTransaction,
+        plans: &[ColumnConversionPlan],
+    ) -> io::Result<SqlTransaction> {
+        sql_with_plans_for_version(self.target_version, transaction, plans)
+    }
+}
+
+impl Default for SinkAdapter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -50,20 +108,29 @@ pub const fn capability_manifest() -> CapabilityManifest {
     CAPABILITY_MANIFEST
 }
 
+pub fn capability_manifest_for_version(target_version: &str) -> CapabilityManifest {
+    match target_version {
+        "15" => CAPABILITY_MANIFEST,
+        "16" => CAPABILITY_MANIFEST_16,
+        "17" => CAPABILITY_MANIFEST_17,
+        _ => CAPABILITY_MANIFEST,
+    }
+}
+
 impl change_event::SinkAdapter for SinkAdapter {
     type Plan = SqlTransaction;
     type Error = io::Error;
 
     fn capability_manifest(&self) -> CapabilityManifest {
-        CAPABILITY_MANIFEST
+        capability_manifest_for_version(self.target_version)
     }
 
     fn qualify(&self, transaction: &ValidatedTransaction) -> io::Result<()> {
-        sql(transaction).map(|_| ())
+        sql_for_version(self.target_version, transaction).map(|_| ())
     }
 
     fn plan(&self, transaction: &ValidatedTransaction) -> io::Result<SqlTransaction> {
-        sql(transaction)
+        sql_for_version(self.target_version, transaction)
     }
 }
 
@@ -78,11 +145,19 @@ pub enum Parameter {
     Text(String),
     Binary(Vec<u8>),
     Date(String),
+    Time(String),
     Timestamp(String),
     Timestamptz(String),
     Interval(String),
     Uuid(String),
     Json(String),
+    Structured(String),
+    CustomBinary(Vec<u8>),
+    Spatial {
+        bytes: Vec<u8>,
+        srid: Option<i32>,
+        format: change_event::SpatialFormat,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +180,7 @@ pub struct SqlTransaction {
     pub(crate) source_uuid: String,
     pub(crate) source_transaction_id: String,
     pub(crate) commit_cursor: SourceCursor,
+    pub(crate) target_version: &'static str,
     pub(crate) tables: Vec<(String, String)>,
     pub(crate) statements: Vec<PlannedStatement>,
 }
@@ -130,8 +206,9 @@ impl SqlTransaction {
     /// Diagnostic output may inline values for human inspection; it is never executed.
     pub fn script(&self) -> String {
         let mut output = format!(
-            "-- cdc transaction={} target=postgresql-{TARGET_VERSION}\nBEGIN;\n",
-            sanitize_comment(&self.source_transaction_id)
+            "-- cdc transaction={} target=postgresql-{}\nBEGIN;\n",
+            sanitize_comment(&self.source_transaction_id).to_owned(),
+            self.target_version,
         );
         for statement in &self.statements {
             output.push_str(&statement.diagnostic_sql);
@@ -154,8 +231,8 @@ struct StatementBuilder {
 }
 
 impl StatementBuilder {
-    fn datum(&mut self, datum: &Datum) -> io::Result<RenderedDatum> {
-        match datum {
+    fn datum(&mut self, column: &ColumnDatum) -> io::Result<RenderedDatum> {
+        match &column.datum {
             Datum::Unavailable | Datum::Unchanged => Err(capability_failure(
                 "unavailable or unchanged values cannot be written in this position",
             )),
@@ -164,12 +241,12 @@ impl StatementBuilder {
                 diagnostic_sql: "NULL".into(),
             }),
             Datum::Value(value) => {
-                let parameter = parameter_for(value)?;
-                let diagnostic_sql = render_logical_value(value).map_err(capability_failure)?;
+                let parameter = parameter_for(value, &column.native_type)?;
+                let diagnostic_sql = render_logical_value(value)?;
                 self.parameters.push(parameter.clone());
                 let index = self.parameters.len();
                 Ok(RenderedDatum {
-                    sql: parameter_expression(index, &parameter),
+                    sql: parameter_expression(index, &parameter, &column.native_type)?,
                     diagnostic_sql,
                 })
             }
@@ -188,6 +265,84 @@ struct RenderedStatement {
 }
 
 pub fn sql(validated: &ValidatedTransaction) -> io::Result<SqlTransaction> {
+    sql_for_version(POSTGRESQL_15_VERSION, validated)
+}
+
+/// Apply the saved ColumnConversionPlan values before rendering the
+/// parameterized PostgreSQL transaction. Plans are validated at this sink
+/// boundary so retries cannot silently use a stale or differently-targeted
+/// qualification result.
+pub fn sql_with_plans(
+    validated: &ValidatedTransaction,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<SqlTransaction> {
+    sql_with_plans_for_version(POSTGRESQL_15_VERSION, validated, plans)
+}
+
+pub fn sql_with_plans_for_version(
+    target_version: &'static str,
+    validated: &ValidatedTransaction,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<SqlTransaction> {
+    validate_plan_headers(plans, target_version)?;
+    let converted =
+        change_event::convert_transaction_with_plans(validated.transaction().clone(), plans)
+            .map_err(io::Error::other)?;
+    let converted = change_event::validate(converted).map_err(io::Error::other)?;
+    sql_for_version(target_version, &converted)
+}
+
+fn validate_plan_headers(plans: &[ColumnConversionPlan], target_version: &str) -> io::Result<()> {
+    for plan in plans {
+        if !plan.verify_digest() {
+            return Err(plan_failure(
+                plan,
+                "target_capability.plan_digest_invalid",
+                "the stored ColumnConversionPlan digest is invalid",
+            ));
+        }
+        if plan.sink_connector.kind != "postgresql" || plan.sink_connector.version != target_version
+        {
+            return Err(plan_failure(
+                plan,
+                "target_capability.sink_connector_mismatch",
+                format!(
+                    "the plan targets {} {}, not postgresql {}",
+                    plan.sink_connector.kind, plan.sink_connector.version, target_version
+                ),
+            ));
+        }
+        if plan.qualification == QualificationLevel::Unsupported {
+            return Err(plan_failure(
+                plan,
+                "target_capability.unsupported_plan",
+                "an unsupported conversion plan cannot be applied",
+            ));
+        }
+        if plan.confirmation == PlanConfirmationState::Required {
+            return Err(plan_failure(
+                plan,
+                "target_capability.confirmation_required",
+                "the conversion plan requires route confirmation before apply",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn plan_failure(plan: &ColumnConversionPlan, code: &str, message: impl Into<String>) -> io::Error {
+    io::Error::other(
+        TargetCapabilityFailure::new(message)
+            .with_code(code)
+            .with_route(plan.route_id.clone())
+            .with_plan_digest(plan.plan_digest.clone()),
+    )
+}
+
+pub fn sql_for_version(
+    target_version: &'static str,
+    validated: &ValidatedTransaction,
+) -> io::Result<SqlTransaction> {
     let transaction = validated.transaction();
     let mut statements = Vec::with_capacity(transaction.changes.len());
     for change in &transaction.changes {
@@ -212,6 +367,7 @@ pub fn sql(validated: &ValidatedTransaction) -> io::Result<SqlTransaction> {
         source_uuid: transaction.source.id.clone(),
         source_transaction_id: transaction.id.clone(),
         commit_cursor: transaction.commit_cursor.clone(),
+        target_version,
         tables: transaction
             .changes
             .iter()
@@ -244,7 +400,7 @@ fn render_insert(table: &str, change: &RowChange) -> io::Result<RenderedStatemen
     let mut builder = StatementBuilder::default();
     let values = columns
         .iter()
-        .map(|column| builder.datum(&column.datum))
+        .map(|column| builder.datum(column))
         .collect::<io::Result<Vec<_>>>()?;
     let parameters = builder.finish();
     Ok(RenderedStatement {
@@ -289,7 +445,7 @@ fn render_update(table: &str, change: &RowChange) -> io::Result<RenderedStatemen
     let mut assignments = Vec::with_capacity(columns.len());
     let mut diagnostic_assignments = Vec::with_capacity(columns.len());
     for column in columns {
-        let value = builder.datum(&column.datum)?;
+        let value = builder.datum(column)?;
         assignments.push(format!(
             "{} = {}",
             quote_identifier(&column.name),
@@ -374,7 +530,7 @@ fn render_verification(change: &RowChange) -> io::Result<Option<PreparedQuery>> 
         match &column.datum {
             Datum::Null => predicates.push(format!("{name} IS NULL")),
             Datum::Value(_) => {
-                let value = builder.datum(&column.datum)?;
+                let value = builder.datum(column)?;
                 predicates.push(format!("{name} IS NOT DISTINCT FROM {}", value.sql));
             }
             Datum::Unavailable | Datum::Unchanged => {
@@ -424,7 +580,7 @@ fn key_predicates(
                 ));
             }
             Datum::Value(_) => {
-                let value = builder.datum(&column.datum)?;
+                let value = builder.datum(column)?;
                 predicates.push(format!("{name} = {}", value.sql));
                 diagnostic_predicates.push(format!("{name} = {}", value.diagnostic_sql));
             }
@@ -486,14 +642,14 @@ fn ensure_supported_image(image: &[ColumnDatum]) -> io::Result<()> {
             )));
         }
         if let Datum::Value(value) = &column.datum {
-            parameter_for(value)
+            parameter_for(value, &column.native_type)
                 .map_err(|error| capability_failure(format!("column {}: {error}", column.name)))?;
         }
     }
     Ok(())
 }
 
-fn parameter_for(value: &LogicalValue) -> io::Result<Parameter> {
+fn parameter_for(value: &LogicalValue, native_type: &str) -> io::Result<Parameter> {
     match value {
         LogicalValue::Boolean { value } => Ok(Parameter::Boolean(*value)),
         LogicalValue::Uuid { value } => Ok(Parameter::Uuid(value.clone())),
@@ -558,6 +714,14 @@ fn parameter_for(value: &LogicalValue) -> io::Result<Parameter> {
         LogicalValue::Date { year, month, day } => {
             Ok(Parameter::Date(format!("{year:04}-{month:02}-{day:02}")))
         }
+        LogicalValue::LocalTime {
+            hour,
+            minute,
+            second,
+            microsecond,
+        } => Ok(Parameter::Time(format!(
+            "{hour:02}:{minute:02}:{second:02}.{microsecond:06}"
+        ))),
         LogicalValue::LocalDatetime {
             year,
             month,
@@ -601,47 +765,306 @@ fn parameter_for(value: &LogicalValue) -> io::Result<Parameter> {
         }
         LogicalValue::Year { value } => Ok(Parameter::Integer(i64::from(*value))),
         LogicalValue::Enum { label } => Ok(Parameter::Text(label.clone())),
-        LogicalValue::Set { .. } => Err(capability_failure(
-            "PostgreSQL 15 has no qualified SET target representation",
-        )),
-        LogicalValue::Spatial { .. }
-        | LogicalValue::Array { .. }
+        LogicalValue::Set { members } => Ok(Parameter::Structured(array_literal(members.clone()))),
+        LogicalValue::Spatial {
+            format,
+            bytes_base64url,
+            srid,
+            ..
+        } => {
+            let target = native_type.to_ascii_lowercase();
+            if !target.contains("geometry") && !target.contains("geography") {
+                return Err(capability_failure(
+                    "spatial values require a qualified PostGIS geometry/geography target",
+                ));
+            }
+            Ok(Parameter::Spatial {
+                bytes: decode_bytes(bytes_base64url)?,
+                srid: *srid,
+                format: *format,
+            })
+        }
+        LogicalValue::Array { .. }
         | LogicalValue::ArrayWithMetadata { .. }
         | LogicalValue::Struct { .. }
-        | LogicalValue::Map { .. }
         | LogicalValue::Range { .. }
         | LogicalValue::MultiRange { .. }
-        | LogicalValue::Null
-        | LogicalValue::LocalTime { .. }
-        | LogicalValue::InvalidTemporal { .. }
         | LogicalValue::Network { .. }
         | LogicalValue::Xml { .. }
-        | LogicalValue::Domain { .. }
-        | LogicalValue::Raw { .. } => Err(capability_failure(
-            "PostgreSQL 15 has no qualified target representation for this structured value",
+        | LogicalValue::Domain { .. } => Ok(Parameter::Structured(structured_text(value)?)),
+        LogicalValue::Raw { carrier } => Ok(Parameter::CustomBinary(
+            carrier
+                .raw_bytes()
+                .map_err(|error| capability_failure(error))?,
         )),
+        LogicalValue::Map { .. } | LogicalValue::Null | LogicalValue::InvalidTemporal { .. } => {
+            Err(capability_failure(
+                "PostgreSQL has no qualified target representation for this value",
+            ))
+        }
         LogicalValue::Json { value } => Ok(Parameter::Json(
             render_json(value).map_err(capability_failure)?,
         )),
     }
 }
 
-fn parameter_expression(index: usize, parameter: &Parameter) -> String {
+fn parameter_expression(
+    index: usize,
+    parameter: &Parameter,
+    native_type: &str,
+) -> io::Result<String> {
     let placeholder = format!("{}{}", "$", index);
-    match parameter {
+    Ok(match parameter {
         Parameter::Numeric(_) => format!("CAST({placeholder} AS numeric)"),
         Parameter::Date(_) => format!("CAST({placeholder} AS date)"),
+        Parameter::Time(_) => format!("CAST({placeholder} AS time)"),
         Parameter::Timestamp(_) => format!("CAST({placeholder} AS timestamp)"),
         Parameter::Timestamptz(_) => format!("CAST({placeholder} AS timestamptz)"),
         Parameter::Interval(_) => format!("CAST({placeholder} AS interval)"),
         Parameter::Uuid(_) => format!("CAST({placeholder} AS uuid)"),
         Parameter::Json(_) => format!("CAST({placeholder} AS jsonb)"),
+        Parameter::Structured(_) => format!(
+            "CAST({placeholder} AS {})",
+            safe_target_type(native_type, "text")?
+        ),
+        Parameter::CustomBinary(_) => format!(
+            "CAST({placeholder} AS {})",
+            safe_target_type(native_type, "bytea")?
+        ),
+        Parameter::Spatial { srid, format, .. } => {
+            let target = native_type.to_ascii_lowercase();
+            let function = if matches!(format, change_event::SpatialFormat::Ewkb) {
+                "ST_GeomFromEWKB"
+            } else {
+                "ST_GeomFromWKB"
+            };
+            let expression = if matches!(format, change_event::SpatialFormat::Ewkb) {
+                format!("{function}({placeholder})")
+            } else {
+                let srid = srid.ok_or_else(|| {
+                    capability_failure("WKB spatial values require an explicit SRID")
+                })?;
+                format!("{function}({placeholder}, {srid})")
+            };
+            if target.contains("geography") {
+                format!("{expression}::geography")
+            } else {
+                expression
+            }
+        }
         Parameter::Integer(_)
         | Parameter::Float32(_)
         | Parameter::Float64(_)
         | Parameter::Boolean(_)
         | Parameter::Text(_)
         | Parameter::Binary(_) => placeholder,
+    })
+}
+
+fn safe_target_type(native_type: &str, fallback: &str) -> io::Result<String> {
+    let candidate = if native_type.trim().is_empty()
+        || matches!(
+            native_type.trim().to_ascii_lowercase().as_str(),
+            "user-defined" | "set"
+        ) {
+        fallback
+    } else {
+        native_type.trim()
+    };
+    if candidate.is_empty()
+        || candidate.contains(';')
+        || candidate.contains("--")
+        || candidate.contains("/*")
+        || !candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.$[](), ".contains(&byte))
+    {
+        return Err(capability_failure(
+            "target type is not a safe PostgreSQL type name",
+        ));
+    }
+    Ok(candidate.to_owned())
+}
+
+fn structured_text(value: &LogicalValue) -> io::Result<String> {
+    match value {
+        LogicalValue::Set { members } => Ok(array_literal(members.clone())),
+        LogicalValue::Array { elements } => Ok(array_literal(
+            elements
+                .iter()
+                .map(value_input)
+                .collect::<io::Result<Vec<_>>>()?,
+        )),
+        LogicalValue::ArrayWithMetadata {
+            elements,
+            dimensions,
+            lower_bounds,
+        } => {
+            if *dimensions == 0 || usize::from(*dimensions) != lower_bounds.len() {
+                return Err(capability_failure(
+                    "array dimensions and lower bounds do not agree",
+                ));
+            }
+            let values = array_literal(
+                elements
+                    .iter()
+                    .map(value_input)
+                    .collect::<io::Result<Vec<_>>>()?,
+            );
+            let lower = lower_bounds[0];
+            let upper = lower + i32::try_from(elements.len()).unwrap_or(i32::MAX) - 1;
+            Ok(format!("[{lower}:{upper}]={values}"))
+        }
+        LogicalValue::Struct { fields } => Ok(format!(
+            "({})",
+            fields
+                .iter()
+                .map(|field| value_input(&field.value).map(|value| composite_item(&value)))
+                .collect::<io::Result<Vec<_>>>()?
+                .join(",")
+        )),
+        LogicalValue::Range {
+            empty,
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            if *empty {
+                Ok("empty".into())
+            } else {
+                Ok(format!(
+                    "{}{},{}{}",
+                    if *lower_inclusive { '[' } else { '(' },
+                    lower
+                        .as_deref()
+                        .map(value_input)
+                        .transpose()?
+                        .unwrap_or_default(),
+                    upper
+                        .as_deref()
+                        .map(value_input)
+                        .transpose()?
+                        .unwrap_or_default(),
+                    if *upper_inclusive { ']' } else { ')' },
+                ))
+            }
+        }
+        LogicalValue::MultiRange { ranges } => Ok(format!(
+            "{{{}}}",
+            ranges
+                .iter()
+                .map(structured_text)
+                .collect::<io::Result<Vec<_>>>()?
+                .join(",")
+        )),
+        LogicalValue::Network { address, .. } => Ok(address.clone()),
+        LogicalValue::Xml {
+            bytes_base64url, ..
+        } => {
+            let bytes = decode_bytes(bytes_base64url)?;
+            String::from_utf8(bytes).map_err(|_| capability_failure("XML value is not valid UTF-8"))
+        }
+        LogicalValue::Domain { value } => structured_text(value),
+        _ => value_input(value),
+    }
+}
+
+fn value_input(value: &LogicalValue) -> io::Result<String> {
+    match value {
+        LogicalValue::Null => Ok("NULL".into()),
+        LogicalValue::Boolean { value } => Ok(value.to_string()),
+        LogicalValue::Uuid { value }
+        | LogicalValue::Enum { label: value }
+        | LogicalValue::Network { address: value, .. } => Ok(value.clone()),
+        LogicalValue::Integer { value, .. } => Ok(value.clone()),
+        LogicalValue::Decimal { unscaled, scale } => render_decimal(unscaled, *scale),
+        LogicalValue::Float { bits, ieee754_hex } => render_float(*bits, ieee754_hex),
+        LogicalValue::Text {
+            charset,
+            bytes_base64url,
+            ..
+        } => {
+            if !matches!(charset.to_ascii_lowercase().as_str(), "utf8" | "utf8mb4") {
+                return Err(capability_failure("structured text value is not UTF-8"));
+            }
+            String::from_utf8(decode_bytes(bytes_base64url)?)
+                .map_err(|_| capability_failure("structured text value is not valid UTF-8"))
+        }
+        LogicalValue::Binary { bytes_base64url } => Ok(hex(&decode_bytes(bytes_base64url)?)),
+        LogicalValue::BitString {
+            bytes_base64url,
+            bit_length,
+            bit_order,
+            ..
+        } => bit_string_text(&decode_bytes(bytes_base64url)?, *bit_length, *bit_order),
+        LogicalValue::Date { year, month, day } => Ok(format!("{year:04}-{month:02}-{day:02}")),
+        LogicalValue::LocalTime {
+            hour,
+            minute,
+            second,
+            microsecond,
+        } => Ok(format!(
+            "{hour:02}:{minute:02}:{second:02}.{microsecond:06}"
+        )),
+        LogicalValue::LocalDatetime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            microsecond,
+        } => Ok(format!(
+            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{microsecond:06}"
+        )),
+        LogicalValue::Array { .. }
+        | LogicalValue::ArrayWithMetadata { .. }
+        | LogicalValue::Struct { .. }
+        | LogicalValue::Range { .. }
+        | LogicalValue::MultiRange { .. }
+        | LogicalValue::Set { .. }
+        | LogicalValue::Domain { .. }
+        | LogicalValue::Xml { .. } => structured_text(value),
+        LogicalValue::Json { value } => render_json(value),
+        LogicalValue::Raw { carrier } => Ok(hex(&carrier
+            .raw_bytes()
+            .map_err(|error| capability_failure(error))?)),
+        LogicalValue::Spatial {
+            bytes_base64url, ..
+        } => Ok(hex(&decode_bytes(bytes_base64url)?)),
+        LogicalValue::Duration { .. }
+        | LogicalValue::Instant { .. }
+        | LogicalValue::Map { .. }
+        | LogicalValue::InvalidTemporal { .. } => Err(capability_failure(
+            "value cannot be represented inside a PostgreSQL structured literal",
+        )),
+        LogicalValue::Year { value } => Ok(value.to_string()),
+    }
+}
+
+fn array_literal(values: Vec<String>) -> String {
+    format!(
+        "{{{}}}",
+        values
+            .into_iter()
+            .map(|value| {
+                if value.starts_with('{') || value == "NULL" {
+                    value
+                } else {
+                    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn composite_item(value: &str) -> String {
+    if value.is_empty() || value == "NULL" {
+        "\"\"".into()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
     }
 }
 
@@ -722,6 +1145,14 @@ fn render_logical_value(value: &LogicalValue) -> io::Result<String> {
         LogicalValue::Date { year, month, day } => {
             Ok(format!("DATE '{year:04}-{month:02}-{day:02}'"))
         }
+        LogicalValue::LocalTime {
+            hour,
+            minute,
+            second,
+            microsecond,
+        } => Ok(format!(
+            "TIME '{hour:02}:{minute:02}:{second:02}.{microsecond:06}'"
+        )),
         LogicalValue::LocalDatetime {
             year,
             month,
@@ -759,25 +1190,41 @@ fn render_logical_value(value: &LogicalValue) -> io::Result<String> {
         }
         LogicalValue::Year { value } => Ok(value.to_string()),
         LogicalValue::Enum { label } => Ok(quote_literal(label)),
-        LogicalValue::Set { .. } => Err(capability_failure(
-            "PostgreSQL 15 has no qualified SET target representation",
-        )),
-        LogicalValue::Spatial { .. }
+        LogicalValue::Set { .. }
         | LogicalValue::Array { .. }
         | LogicalValue::ArrayWithMetadata { .. }
         | LogicalValue::Struct { .. }
-        | LogicalValue::Map { .. }
         | LogicalValue::Range { .. }
         | LogicalValue::MultiRange { .. }
-        | LogicalValue::Null
-        | LogicalValue::LocalTime { .. }
-        | LogicalValue::InvalidTemporal { .. }
         | LogicalValue::Network { .. }
         | LogicalValue::Xml { .. }
-        | LogicalValue::Domain { .. }
-        | LogicalValue::Raw { .. } => Err(capability_failure(
-            "PostgreSQL 15 has no qualified SQL rendering for this structured value",
+        | LogicalValue::Domain { .. } => Ok(quote_literal(&structured_text(value)?)),
+        LogicalValue::Spatial {
+            bytes_base64url,
+            format,
+            srid,
+            ..
+        } => {
+            let bytes = hex(&decode_bytes(bytes_base64url)?);
+            if matches!(format, change_event::SpatialFormat::Ewkb) {
+                Ok(format!("ST_GeomFromEWKB(decode('{bytes}', 'hex'))"))
+            } else {
+                let srid =
+                    srid.ok_or_else(|| capability_failure("WKB spatial value has no SRID"))?;
+                Ok(format!("ST_GeomFromWKB(decode('{bytes}', 'hex'), {srid})"))
+            }
+        }
+        LogicalValue::Raw { carrier } => Ok(format!(
+            "decode('{}', 'hex')",
+            hex(&carrier
+                .raw_bytes()
+                .map_err(|error| capability_failure(error))?)
         )),
+        LogicalValue::Map { .. } | LogicalValue::Null | LogicalValue::InvalidTemporal { .. } => {
+            Err(capability_failure(
+                "PostgreSQL 15 has no qualified SQL rendering for this structured value",
+            ))
+        }
         LogicalValue::Json { value } => {
             Ok(format!("{}::jsonb", quote_literal(&render_json(value)?)))
         }
@@ -1017,7 +1464,14 @@ pub struct ApplyResult {
 }
 
 pub async fn execute(config: &TargetConfig, plan: &SqlTransaction) -> io::Result<ApplyResult> {
-    let mut connection = connect(config).await?;
+    execute_for_version(config, plan).await
+}
+
+pub async fn execute_for_version(
+    config: &TargetConfig,
+    plan: &SqlTransaction,
+) -> io::Result<ApplyResult> {
+    let mut connection = connect_for_version(config, plan.target_version).await?;
     let mut transaction = connection.begin().await.map_err(io::Error::other)?;
     execute_statements(&mut transaction, plan).await?;
     transaction.commit().await.map_err(commit_error)?;
@@ -1028,6 +1482,13 @@ pub async fn execute(config: &TargetConfig, plan: &SqlTransaction) -> io::Result
 }
 
 pub(crate) async fn connect(config: &TargetConfig) -> io::Result<PgConnection> {
+    connect_for_version(config, POSTGRESQL_15_VERSION).await
+}
+
+pub(crate) async fn connect_for_version(
+    config: &TargetConfig,
+    target_version: &str,
+) -> io::Result<PgConnection> {
     let options = PgConnectOptions::new()
         .host(&config.host)
         .port(config.port)
@@ -1046,10 +1507,10 @@ pub(crate) async fn connect(config: &TargetConfig) -> io::Result<PgConnection> {
     if !version
         .split('.')
         .next()
-        .is_some_and(|major| major == TARGET_VERSION)
+        .is_some_and(|major| major == target_version)
     {
         return Err(capability_failure(format!(
-            "postgresql_{TARGET_VERSION} cannot write target version {version}"
+            "postgresql_{target_version} cannot write target version {version}"
         )));
     }
     sqlx::query("SET TIME ZONE 'UTC'")
@@ -1061,6 +1522,184 @@ pub(crate) async fn connect(config: &TargetConfig) -> io::Result<PgConnection> {
         .await
         .map_err(io::Error::other)?;
     Ok(connection)
+}
+
+/// Read-only target evidence used by route activation.  The probe records the
+/// exact PostgreSQL build, target column definition, installed extensions, and
+/// session settings that the Sink will use; it never mutates the target.
+pub async fn probe_target(
+    config: &TargetConfig,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> io::Result<TargetCapabilityProbe> {
+    probe_target_for_version(config, schema, table, column, POSTGRESQL_15_VERSION).await
+}
+
+pub async fn probe_target_for_version(
+    config: &TargetConfig,
+    schema: &str,
+    table: &str,
+    column: &str,
+    target_version: &str,
+) -> io::Result<TargetCapabilityProbe> {
+    let mut connection = connect_for_version(config, target_version).await?;
+    let server_version: String = sqlx::query_scalar("SHOW server_version")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(io::Error::other)?;
+    let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(io::Error::other)?;
+    let timezone: String = sqlx::query_scalar("SHOW TIME ZONE")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(io::Error::other)?;
+    let standard_conforming_strings: String =
+        sqlx::query_scalar("SHOW standard_conforming_strings")
+            .fetch_one(&mut connection)
+            .await
+            .map_err(io::Error::other)?;
+    let row = sqlx::query(
+        "SELECT format_type(a.atttypid, a.atttypmod) AS native_type, \
+                a.atttypid::bigint AS type_oid, a.atttypmod::bigint AS typmod, \
+                t.typtype::text AS type_kind, n.nspname AS type_schema \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace ns ON ns.oid = c.relnamespace \
+         JOIN pg_type t ON t.oid = a.atttypid \
+         JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE ns.nspname = $1 AND c.relname = $2 AND a.attname = $3 \
+           AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(column)
+    .fetch_optional(&mut connection)
+    .await
+    .map_err(io::Error::other)?
+    .ok_or_else(|| capability_failure("target table or column was not found"))?;
+    let native_type: String = row.try_get("native_type").map_err(io::Error::other)?;
+    let type_oid: i64 = row.try_get("type_oid").map_err(io::Error::other)?;
+    let typmod: i64 = row.try_get("typmod").map_err(io::Error::other)?;
+    let type_kind: String = row.try_get("type_kind").map_err(io::Error::other)?;
+    let type_schema: String = row.try_get("type_schema").map_err(io::Error::other)?;
+    let extensions = sqlx::query("SELECT extname, extversion FROM pg_extension ORDER BY extname")
+        .fetch_all(&mut connection)
+        .await
+        .map_err(io::Error::other)?
+        .into_iter()
+        .map(|row| {
+            let name: String = row.try_get("extname").map_err(io::Error::other)?;
+            let version: String = row.try_get("extversion").map_err(io::Error::other)?;
+            Ok(CapabilityProbeEntry::installed(format!("extension:{name}")).with_version(version))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let has_postgis = extensions
+        .iter()
+        .any(|entry| entry.identity.eq_ignore_ascii_case("extension:postgis"));
+    let native_lower = native_type.to_ascii_lowercase();
+    let spatial_target = native_lower.contains("geometry") || native_lower.contains("geography");
+    let type_status = if spatial_target && !has_postgis {
+        CapabilityProbeStatus::Missing
+    } else if is_probeable_target_type(&native_lower) {
+        CapabilityProbeStatus::Qualified
+    } else {
+        CapabilityProbeStatus::Detected
+    };
+    let capability_identity = if spatial_target {
+        let spatial_kind = if native_lower.contains("geography") {
+            "geography"
+        } else {
+            "geometry"
+        };
+        format!("postgresql{target_version}.exact.spatial.{spatial_kind}")
+    } else {
+        format!("target_type:{type_schema}.{native_type}")
+    };
+    let mut capability = CapabilityProbeEntry::new(capability_identity, type_status)
+        .with_version(server_version.clone())
+        .with_evidence_digest(change_event::stable_digest(&(
+            target_version,
+            &native_type,
+            type_oid,
+            typmod,
+        )));
+    if spatial_target && has_postgis {
+        capability.status = CapabilityProbeStatus::Qualified;
+    }
+    let definition_fingerprint = change_event::stable_digest(&(
+        schema,
+        table,
+        column,
+        &native_type,
+        type_oid,
+        typmod,
+        &type_kind,
+    ));
+    let mut metadata =
+        TargetColumnMetadata::new(definition_fingerprint).with_native_type(native_type.clone());
+    if spatial_target {
+        metadata = metadata.with_extension("postgis");
+    }
+    let session = TargetSessionProfile::new(
+        format!("postgresql-{target_version};server_version_num={server_version_num}"),
+        [
+            ("TimeZone", timezone),
+            ("standard_conforming_strings", standard_conforming_strings),
+        ],
+    );
+    let target_build = ServerBuildIdentity::new(
+        "postgresql",
+        "community",
+        server_version.clone(),
+        format!("postgres-{server_version_num}"),
+    );
+    Ok(TargetCapabilityProbe::new(
+        target_build,
+        &config.database,
+        table,
+        column,
+        metadata,
+        [capability],
+        extensions,
+        session,
+    ))
+}
+
+fn is_probeable_target_type(native_type: &str) -> bool {
+    [
+        "boolean",
+        "smallint",
+        "integer",
+        "bigint",
+        "numeric",
+        "real",
+        "double precision",
+        "text",
+        "character varying",
+        "bytea",
+        "bit",
+        "date",
+        "time",
+        "timestamp",
+        "interval",
+        "uuid",
+        "json",
+        "jsonb",
+        "xml",
+        "inet",
+        "cidr",
+        "macaddr",
+        "geometry",
+        "geography",
+    ]
+    .iter()
+    .any(|known| native_type.starts_with(known))
+        || native_type.ends_with("[]")
+        || native_type.contains("range")
+        || native_type.contains("multirange")
 }
 
 pub(crate) async fn execute_statements(
@@ -1114,15 +1753,19 @@ fn bind_query(sql: &str, parameters: &[Parameter]) -> Query<'static, Postgres, P
             Parameter::Numeric(value)
             | Parameter::Text(value)
             | Parameter::Date(value)
+            | Parameter::Time(value)
             | Parameter::Timestamp(value)
             | Parameter::Timestamptz(value)
             | Parameter::Interval(value)
             | Parameter::Uuid(value)
-            | Parameter::Json(value) => query.bind(value.clone()),
+            | Parameter::Json(value)
+            | Parameter::Structured(value) => query.bind(value.clone()),
             Parameter::Float32(value) => query.bind(*value),
             Parameter::Float64(value) => query.bind(*value),
             Parameter::Boolean(value) => query.bind(*value),
             Parameter::Binary(value) => query.bind(value.clone()),
+            Parameter::CustomBinary(value) => query.bind(value.clone()),
+            Parameter::Spatial { bytes, .. } => query.bind(bytes.clone()),
         };
     }
     query
@@ -1237,7 +1880,7 @@ pub fn snapshot_sql(validated: &change_event::ValidatedSnapshotBatch) -> io::Res
         let mut builder = StatementBuilder::default();
         let values = writable
             .iter()
-            .map(|column| builder.datum(&column.datum))
+            .map(|column| builder.datum(column))
             .collect::<io::Result<Vec<_>>>()?;
         parameters.push(builder.finish());
         statements.push(format!(
