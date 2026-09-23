@@ -26,6 +26,7 @@ fn mapping() -> TableMapping {
 }
 fn input(source: &str, sink: &str) -> TaskInput {
     TaskInput {
+        draft_id: None,
         name: "orders replication".into(),
         source_id: source.into(),
         sink_id: sink.into(),
@@ -53,6 +54,21 @@ fn table() -> CatalogTable {
             default_value: None,
         }],
     }
+}
+
+#[test]
+fn mysql_char_columns_reach_the_common_compatibility_planner() {
+    let mut source = table();
+    source.columns.push(CatalogColumn {
+        name: "fixed_name".into(),
+        column_type: "char(10)".into(),
+        nullable: false,
+        extra: String::new(),
+        collation: Some("utf8mb4_bin".into()),
+        default_value: None,
+    });
+    let sink = source.clone();
+    assert!(validate_pair(&source, &sink).is_ok());
 }
 
 #[test]

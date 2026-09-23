@@ -26,6 +26,7 @@ fn runtime_permissions_conflicts_and_restart_state() {
     target.version = "8.0".into();
     let sink = store.save_instance(admin, None, target).unwrap();
     let input = |name: &str| TaskInput {
+        draft_id: None,
         name: name.into(),
         source_id: source.id.clone(),
         sink_id: sink.id.clone(),
@@ -157,6 +158,7 @@ fn live_tasks_resume_from_sink_in_both_modes() {
                 .create_task(
                     admin,
                     TaskInput {
+                        draft_id: None,
                         name: format!("live-{mode}"),
                         source_id: source.id,
                         sink_id: sink.id,
@@ -377,6 +379,7 @@ fn live_web_mysql57_to_postgresql15_full_incremental_and_resume() {
         .create_task(
             admin,
             TaskInput {
+                draft_id: None,
                 name: "MySQL 5.7 to PostgreSQL 15".into(),
                 source_id: source_instance.id,
                 sink_id: sink_instance.id,

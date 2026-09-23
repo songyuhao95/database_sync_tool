@@ -114,6 +114,7 @@ pub fn router(store: Arc<Store>, config: WebConfig) -> Result<Router> {
         )
         .route("/api/instances/{id}/catalog", get(catalog))
         .route("/api/tasks", get(tasks).post(create_task))
+        .route("/api/compatibility/preview", post(preview_field))
         .route("/api/tasks/{id}", get(task).delete(delete_task))
         .route("/api/tasks/{id}/requalify", post(requalify_task))
         .route("/api/tasks/{id}/preflight", post(requalify_task))
@@ -518,6 +519,17 @@ async fn create_task(
         .run(move |store| store.create_task(session.user.id, input))
         .await?;
     Ok((StatusCode::CREATED, Json(task)))
+}
+
+async fn preview_field(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Json(input): Json<crate::tasks::FieldPreviewInput>,
+) -> Result<Json<crate::tasks::FieldCompatibilityPreview>> {
+    state
+        .run(move |store| store.preview_field(session.user.id, input))
+        .await
+        .map(Json)
 }
 
 #[derive(Deserialize, Default)]

@@ -130,6 +130,27 @@ pub fn capability_manifest(
             );
         }
     }
+    // CHAR is fixed-width text.  It shares the Text logical family with
+    // VARCHAR, but its declared character bound is preserved so an exact
+    // CHAR-to-CHAR binding remains distinguishable from an explicit
+    // fixed-width-to-variable-width conversion.
+    for charset in ["utf8mb4", "utf8", "UTF8"] {
+        for max_length in 1..=255 {
+            add_exact(
+                &mut capabilities,
+                LogicalType::Text {
+                    charset: charset.to_owned(),
+                    max_length: Some(max_length),
+                    length_unit: change_event::LengthUnit::Characters,
+                    collation: None,
+                },
+                format!("char({max_length})"),
+                format!("text.{charset}.char.{max_length}"),
+                code_prefix,
+                connector_version,
+            );
+        }
+    }
     for (max_length, native) in [
         (255, "tinytext"),
         (65_535, "text"),
@@ -822,6 +843,7 @@ fn text_target_types() -> Vec<String> {
             "mediumtext".to_owned(),
             "longtext".to_owned(),
         ])
+        .chain((1u64..=255).map(|length| format!("char({length})")))
         .collect()
 }
 

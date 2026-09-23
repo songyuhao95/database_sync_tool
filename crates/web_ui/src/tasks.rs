@@ -33,6 +33,8 @@ pub(crate) struct TableMapping {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskInput {
+    #[serde(default)]
+    pub draft_id: Option<String>,
     pub name: String,
     pub source_id: String,
     pub sink_id: String,
@@ -46,6 +48,49 @@ pub(crate) struct TaskInput {
     pub mappings: Vec<TableMapping>,
     #[serde(default)]
     pub confirmations: Vec<change_event::RiskConfirmation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FieldPreviewInput {
+    pub draft_id: String,
+    pub source_id: String,
+    pub sink_id: String,
+    #[serde(default)]
+    pub source_database: String,
+    #[serde(default)]
+    pub sink_database: String,
+    pub source_revision: i64,
+    pub sink_revision: i64,
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
+    #[serde(default)]
+    pub confirmations: Vec<change_event::RiskConfirmation>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct CompatibilityRuleOptions {
+    pub rule: change_event::RuleReference,
+    pub options: Vec<change_event::OptionSpec>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct FieldCompatibilityPreview {
+    pub source: crate::catalog::CatalogColumn,
+    pub target: crate::catalog::CatalogColumn,
+    pub result: Option<change_event::CompatibilityResult>,
+    pub error: Option<FieldCompatibilityPreviewError>,
+    pub candidates: Vec<CompatibilityRuleOptions>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FieldCompatibilityPreviewError {
+    pub class: change_event::FailureClass,
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +248,15 @@ fn validate_database_selection(connector: &ConnectorDescriptor, database: &str) 
     Ok(())
 }
 pub(crate) fn validate_input(input: &TaskInput) -> Result<()> {
+    if let Some(draft_id) = &input.draft_id
+        && (draft_id.is_empty()
+            || draft_id.len() > 128
+            || !draft_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            }))
+    {
+        return Err(Error::Invalid("任务草稿标识无效"));
+    }
     if input.name.trim().is_empty()
         || input.name.len() > 128
         || input.name.chars().any(char::is_control)
@@ -734,6 +788,7 @@ fn persist_plan_snapshot(
 
 fn input_from_task(task: &ReplicationTask) -> TaskInput {
     TaskInput {
+        draft_id: Some(task.id.clone()),
         name: task.name.clone(),
         source_id: task.source_id.clone(),
         sink_id: task.sink_id.clone(),
@@ -775,6 +830,140 @@ impl Store {
         self.load_runtime(&mut task)?;
         Ok(task)
     }
+
+    pub(crate) fn preview_field(
+        &self,
+        actor: i64,
+        input: FieldPreviewInput,
+    ) -> Result<FieldCompatibilityPreview> {
+        if input.draft_id.is_empty()
+            || input.draft_id.len() > 128
+            || !input.draft_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            return Err(Error::Invalid("任务草稿标识无效"));
+        }
+        if input.schema.is_empty()
+            || input.table.is_empty()
+            || input.column.is_empty()
+            || [
+                input.schema.as_str(),
+                input.table.as_str(),
+                input.column.as_str(),
+            ]
+            .iter()
+            .any(|value| value.chars().count() > 64 || value.chars().any(char::is_control))
+        {
+            return Err(Error::Invalid("库表字段名称无效"));
+        }
+        {
+            let conn = self.db()?;
+            admin(&conn, actor)?;
+        }
+        let source_connector = self.connector(&input.source_id, EndpointRole::Source)?;
+        let sink_connector = self.connector(&input.sink_id, EndpointRole::Sink)?;
+        validate_database_selection(source_connector, &input.source_database)?;
+        validate_database_selection(sink_connector, &input.sink_database)?;
+        let mut source = self.catalog_connection_for_database(
+            actor,
+            &input.source_id,
+            EndpointRole::Source,
+            optional_database(&input.source_database),
+        )?;
+        let mut sink = self.catalog_connection_for_database(
+            actor,
+            &input.sink_id,
+            EndpointRole::Sink,
+            optional_database(&input.sink_database),
+        )?;
+        if source.server_uuid == sink.server_uuid {
+            return Err(Error::Invalid("源端与目的端不能指向同一个数据库实例"));
+        }
+        if source.revision != input.source_revision || sink.revision != input.sink_revision {
+            return Err(Error::Conflict("实例配置已变化，请重新选择实例并加载库表"));
+        }
+        let source_table = source
+            .tables(&input.schema)?
+            .into_iter()
+            .find(|table| table.name == input.table)
+            .ok_or(Error::Validation("源表不存在或无权访问".into()))?;
+        let sink_table = sink
+            .tables(&input.schema)?
+            .into_iter()
+            .find(|table| table.name == input.table)
+            .ok_or(Error::Validation("目的表不存在或无权访问".into()))?;
+        let source_column = source_table
+            .columns
+            .iter()
+            .find(|column| column.name == input.column)
+            .cloned()
+            .ok_or(Error::Validation("源字段不存在或无权访问".into()))?;
+        let sink_column = sink_table
+            .columns
+            .iter()
+            .find(|column| column.name == input.column)
+            .cloned()
+            .ok_or(Error::Validation("目的字段不存在或无权访问".into()))?;
+        let source_build = server_build_identity(source_connector, &source.metadata);
+        let target_build = server_build_identity(sink_connector, &sink.metadata);
+        let route_id = input.draft_id;
+        let configuration_revision = format!("{route_id}:r1");
+        let compatibility = crate::registry::field_compatibility_with_source_evidence(
+            source_connector,
+            sink_connector,
+            &source_table,
+            &sink_table,
+            &source_column,
+            &sink_column,
+            &route_id,
+            &configuration_revision,
+            Some(source_build),
+            Some(target_build.clone()),
+            source.source_type_catalog.as_ref(),
+            source_environment_fingerprint(&source.metadata),
+            &input.parameters,
+            &input.confirmations,
+        );
+        let (result, error) = match compatibility {
+            Ok(result) => (Some(result), None),
+            Err(error) => (
+                None,
+                Some(FieldCompatibilityPreviewError {
+                    class: error.class(),
+                    code: error.code().to_owned(),
+                    message: error.to_string(),
+                }),
+            ),
+        };
+        let manifest = sink_connector.structured_manifest(target_build);
+        let candidates = result
+            .as_ref()
+            .into_iter()
+            .flat_map(|result| result.candidates.iter())
+            .filter_map(|candidate| {
+                manifest
+                    .capabilities
+                    .iter()
+                    .find(|entry| {
+                        entry.rule.id == candidate.rule.id
+                            && entry.rule.version == candidate.rule.version
+                    })
+                    .map(|entry| CompatibilityRuleOptions {
+                        rule: candidate.rule.clone(),
+                        options: entry.rule.options.clone(),
+                    })
+            })
+            .collect();
+        Ok(FieldCompatibilityPreview {
+            source: source_column,
+            target: sink_column,
+            result,
+            error,
+            candidates,
+        })
+    }
+
     #[allow(dead_code)]
     pub(crate) fn preflight_task(&self, actor: i64, input: &TaskInput) -> Result<()> {
         self.preflight_task_with_snapshot(actor, input, "web-preflight", 1)
@@ -917,7 +1106,7 @@ impl Store {
     }
     pub(crate) fn create_task(&self, actor: i64, input: TaskInput) -> Result<ReplicationTask> {
         validate_input(&input)?;
-        let id = secrets::random_token();
+        let id = input.draft_id.clone().unwrap_or_else(secrets::random_token);
         let snapshot = self.preflight_task_with_snapshot(actor, &input, &id, 1)?;
         self.insert_task_with_snapshot(actor, input, id, Some(&snapshot))
     }

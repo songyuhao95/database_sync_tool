@@ -29,6 +29,7 @@ pub(super) fn fixture() -> (TestDirectory, Arc<Store>, i64, ReplicationTask) {
         .insert_task(
             actor,
             TaskInput {
+                draft_id: None,
                 name: "UI test task".into(),
                 source_id: source.id,
                 sink_id: sink.id,
@@ -60,6 +61,16 @@ fn task_tree_controls_keep_hidden_database_selector_and_error_text_visible() {
     let tasks = include_str!("../assets/tasks.js");
     assert!(tasks.contains("function syncControlHeights()"));
     assert!(tasks.contains("checkbox.title=incompatibility"));
+    assert!(tasks.contains("兼容选项"));
+    assert!(tasks.contains("/api/compatibility/preview"));
+    assert!(tasks.contains("Array.isArray(spec.allowed_values)?spec.allowed_values:[]"));
+    assert!(tasks.contains("function compatibilityStatus(result)"));
+    assert!(tasks.contains("compatibilityStatus(response.result)==='NEEDS_CONFIRMATION'"));
+    assert!(tasks.contains("这次转换会发生什么"));
+    assert!(tasks.contains("可能损失或语义变化"));
+    assert!(tasks.contains("compatibility-technical"));
+    assert!(tasks.contains("function compatibilityNormalizedNativeType"));
+    assert!(tasks.contains("compatibilityNormalizedNativeType(sourceType)"));
     assert!(css.contains(
         ".task-tree-controls .task-endpoint-meta,.task-tree-controls .task-error{min-height:18px;margin:0;font-size:11px;line-height:1.45;white-space:normal;overflow-wrap:anywhere;overflow:hidden;text-overflow:clip}"
     ));

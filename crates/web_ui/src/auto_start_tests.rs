@@ -69,6 +69,7 @@ fn auto_start_migration_persistence_and_stop_preserve_checkpoint() {
 fn startup_dispatches_only_enabled_tasks_and_isolates_failures() {
     let (_dir, store, actor, changed) = fixture();
     let input = |name: &str| TaskInput {
+        draft_id: None,
         name: name.into(),
         source_id: changed.source_id.clone(),
         sink_id: changed.sink_id.clone(),

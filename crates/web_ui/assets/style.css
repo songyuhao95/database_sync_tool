@@ -12,7 +12,7 @@
 .task-tree-controls .task-error{max-height:36px;overflow:auto}
 .task-tree-viewport{height:500px;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;background:var(--card)}
 .task-tree-list{min-height:100%}
-.task-tree-row{display:grid;grid-template-columns:24px 20px minmax(90px,1fr) minmax(86px,auto);align-items:center;column-gap:8px;border-bottom:1px solid var(--line);font-size:12px;transition:background .12s,box-shadow .12s}
+.task-tree-row{display:grid;grid-template-columns:24px 20px minmax(90px,1fr) minmax(86px,auto) auto;align-items:center;column-gap:8px;border-bottom:1px solid var(--line);font-size:12px;transition:background .12s,box-shadow .12s}
 .task-tree-schema{height:42px;padding:0 12px;background:var(--sub);font-weight:600}
 .task-tree-table{height:38px;padding:0 12px 0 34px}
 .task-tree-column{height:34px;padding:0 12px 0 58px}
@@ -27,6 +27,9 @@
 .task-tree-toggle:disabled{visibility:hidden}
 .task-tree-check{width:15px!important;height:15px!important;margin:0!important;accent-color:var(--brand)}
 .task-tree-check-locked{cursor:not-allowed;opacity:1;filter:none}
+.task-tree-row-action{width:72px}
+.task-compatibility-button{height:25px;padding:0 7px;border:1px solid color-mix(in srgb,var(--warn) 60%,var(--line));border-radius:3px;background:transparent;color:var(--warn);font:inherit;font-size:11px;white-space:nowrap;cursor:pointer}
+.task-compatibility-button:hover{border-color:var(--brand);color:var(--brand);background:var(--soft)}
 .task-tree-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left;font-weight:500}
 .task-tree-name:hover{color:var(--brand)}
 .task-tree-row small{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;font-size:10px}
@@ -403,6 +406,29 @@ button.tree-row:hover{background:var(--sub)}
 .task-auto-start > small { flex-basis:100%; }
 .task-auto-start-feedback { font-size:12px; }
 .task-control > .btn { width:100%; }
+
+.compatibility-dialog{width:min(620px,calc(100vw - 32px));max-height:min(760px,calc(100vh - 32px));padding:0;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);box-shadow:0 20px 60px #0008}
+.compatibility-dialog::backdrop{background:#050a0dcc}
+.compatibility-form{display:grid;gap:18px;padding:22px}
+.compatibility-content{display:grid;gap:12px;max-height:540px;overflow:auto}
+.compatibility-field-pair{margin:0;padding:10px 12px;border:1px solid var(--line);border-radius:4px;background:var(--soft);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;overflow-wrap:anywhere}
+.compatibility-human-summary{display:grid;gap:8px;padding:14px;border:1px solid color-mix(in srgb,var(--brand) 45%,var(--line));border-radius:5px;background:color-mix(in srgb,var(--brand) 6%,var(--card))}
+.compatibility-human-summary h3{margin:0 0 3px;color:var(--text);font-size:15px}
+.compatibility-human-row{display:grid;grid-template-columns:145px minmax(0,1fr);gap:10px;align-items:start;font-size:12px;line-height:1.55}
+.compatibility-human-row b{color:var(--text)}
+.compatibility-human-row p{margin:0;color:var(--muted);overflow-wrap:anywhere}
+.compatibility-risk-badge{width:max-content;margin:2px 0 0;padding:3px 8px;border-radius:12px;background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn);font-size:12px}
+.compatibility-advanced,.compatibility-technical{border:1px solid var(--line);border-radius:4px;padding:9px 11px;color:var(--muted);font-size:12px}
+.compatibility-advanced summary,.compatibility-technical summary{cursor:pointer;color:var(--text)}
+.compatibility-advanced-fields{display:grid;gap:10px;margin-top:11px}
+.compatibility-option-label small{font-size:11px;line-height:1.4}
+.task-plan-card>.compatibility-human-summary{margin-top:12px}
+.task-plan-card>.compatibility-technical{margin-top:10px}
+.compatibility-option-label{display:grid;gap:7px;color:var(--muted);font-size:12px}
+.compatibility-options{display:grid;gap:10px;margin:0;padding:13px;border:1px solid var(--line);border-radius:4px}
+.compatibility-options legend{padding:0 5px;color:var(--text);font-size:13px}
+.compatibility-confirm-label{display:flex;align-items:flex-start;gap:8px;padding:12px;border:1px solid color-mix(in srgb,var(--warn) 55%,var(--line));border-radius:4px;color:var(--warn);font-size:12px;line-height:1.5}
+.compatibility-confirm-label input{width:15px;height:15px;flex:0 0 auto;margin:1px 0;accent-color:var(--brand)}
 
 .form-grid [hidden] { display: none; }
 .editor-form [data-pg-note] { margin-top: 12px; line-height: 1.6; }

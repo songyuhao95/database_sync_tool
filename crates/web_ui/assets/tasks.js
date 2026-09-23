@@ -80,6 +80,102 @@ function conversionTarget(kind,parameters,nativeType) {
   if(kind==='set_members')return '目标结果：目标 SET 的成员集合（按目标声明顺序编码）';
   return '目标结果：'+(nativeType||'按目标类型');
 }
+function compatibilityFieldType(field) {
+  return field?.column_type||field?.native_type||'未识别类型';
+}
+function compatibilityFieldCollation(field) {
+  return field?.collation||field?.logical_type?.collation||'';
+}
+function compatibilityNormalizedNativeType(value) {
+  const normalized=String(value||'').trim().toLowerCase().replace(/\s+/g,' ');
+  return normalized
+    .replace(/\b(tinyint|smallint|mediumint|int|integer|bigint)\(\d+\)/g,'$1')
+    .replace(/\binteger\b/g,'int');
+}
+function compatibilityRiskLabel(value) {
+  return {NONE:'无',LOW:'低',MEDIUM:'中',HIGH:'高',CRITICAL:'严重'}[String(value||'').toUpperCase()]||value||'未评估';
+}
+function compatibilityRuleKind(parameters) {
+  const kind=conversionKind(parameters||{});
+  return {enum_label:'ENUM 按标签',set_members:'SET 按成员集合',bit_string:'BIT 按位串',binary:'二进制按原始字节',text:'文本编码转换',json:'JSON 结构转换',integer:'整数范围转换',decimal:'小数精度转换',float:'浮点转换',temporal:'时间精度/时区转换'}[kind]||'按目标字段规则';
+}
+function compatibilityHumanSummary(source,sink,result,plan,targetOverride) {
+  const target=plan?.target||targetOverride||{};
+  const parameters=plan?.target?.parameters||targetOverride?.parameters||{};
+  const sourceType=compatibilityFieldType(source),targetType=target.native_type||compatibilityFieldType(sink);
+  const sourceCollation=parameters.source_collation||compatibilityFieldCollation(source),targetCollation=parameters.target_collation||compatibilityFieldCollation(sink);
+  const sourceNormalized=compatibilityNormalizedNativeType(sourceType),targetNormalized=compatibilityNormalizedNativeType(targetType);
+  const difference=[];
+  if(sourceNormalized!==targetNormalized)difference.push('类型从 '+sourceType+' 变为 '+targetType);
+  if(sourceCollation&&targetCollation&&sourceCollation!==targetCollation)difference.push('排序规则从 '+sourceCollation+' 变为 '+targetCollation);
+  if(!difference.length)difference.push('源端和目的端字段定义相同，按目标字段直接写入');
+  const kind=conversionKind(parameters);
+  let conversion='按目标端的 '+compatibilityRuleKind(parameters)+' 规则写入。';
+  let risk='不会静默丢弃数据；无法满足目标字段约束时拒绝本次写入。';
+  let loss='当前计划没有声明值语义损失。';
+  if(kind==='text'){
+    const sourceCharset=parameters.source_charset||'源端字符集',targetCharset=parameters.target_charset||'目标字符集';
+    conversion='将源端文本按 '+targetCharset+' 编码后写入 '+targetType+'；排序和比较以目标端规则为准。';
+    risk='不可编码字符或超出目标长度时拒绝，不截断；排序规则变化可能改变大小写、重音和排序结果。';
+    loss=sourceCharset!==targetCharset||sourceCollation!==targetCollation?'字符集或排序比较语义可能变化，原始文本本身不主动截断。':'没有声明字符集或排序语义变化。';
+  } else if(kind==='binary'){
+    conversion='保留原始字节写入目标二进制字段，不把二进制转成文本。';
+    risk='字节长度超过目标上限或固定长度规则不匹配时拒绝。';
+    loss='不丢失字节；长度不兼容时整笔事务失败。';
+  } else if(kind==='bit_string'){
+    conversion='按声明的位数、位顺序和末字节填充写入目标 BIT 字段。';
+    risk='位数、填充或格式不符合目标声明时拒绝。';
+    loss='不丢失有效位；不会把 BIT 静默转换成整数或文本。';
+  } else if(kind==='enum_label'){
+    conversion='按 ENUM 标签名称匹配写入，不按内部 ordinal 数字转换。';
+    risk='源端出现目的端没有的标签时拒绝；标签顺序变化不会改变标签含义。';
+    loss='不丢失已知标签；未知标签不会被改写成其他标签。';
+  } else if(kind==='set_members'){
+    conversion='按 SET 成员名称组成目标成员集合，写入时按目标声明顺序编码。';
+    risk='未知成员、重复成员或格式错误时拒绝。';
+    loss='成员集合语义保留，显示顺序可能按目标字段顺序变化。';
+  } else if(kind==='integer'){
+    conversion='按目标整数的有符号性和取值范围写入。';
+    risk='越过目标最小值或最大值时拒绝，不回绕、不截断。';
+    loss='计划没有声明数值损失；超范围值会使事务失败。';
+  } else if(kind==='decimal'){
+    conversion='按目标 DECIMAL 的精度和小数位写入。';
+    risk='需要舍入或超出精度时拒绝，不静默四舍五入。';
+    loss='计划没有声明小数损失；不满足精度的值会使事务失败。';
+  } else if(kind==='float'){
+    conversion='按目标浮点宽度写入可精确表示的有限值。';
+    risk='溢出、非有限值或不可避免的舍入时拒绝。';
+    loss='不把特殊值或不可精确值静默写入目标。';
+  } else if(kind==='json'){
+    conversion=parameters.json_strategy==='normalized_text'?'把结构化 JSON 转为规范化 UTF-8 文本。':'保持为目标结构化 JSON/JSONB。';
+    risk=parameters.json_strategy==='normalized_text'?'解析失败时拒绝，原始空白、键顺序和重复键不保留。':'结构化值不符合目标 JSON 能力时拒绝。';
+    loss=parameters.json_strategy==='normalized_text'?'JSON 数据值语义保留，但原始文本格式可能变化。':'当前计划没有声明 JSON 值语义损失。';
+  } else if(kind==='temporal'){
+    conversion='按已保存的时间精度和时区策略转换后写入。';
+    risk='精度无法保留或时区策略缺失时拒绝；显示的本地时间可能变化。';
+    loss='时间点或本地时间语义按计划保留，超出目标精度的值不静默舍入。';
+  }
+  const status=String(result?.status||'').toUpperCase();
+  return {difference:difference.join('；'),conversion,risk,loss,status,riskLabel:compatibilityRiskLabel(plan?.risk||result?.risk)};
+}
+function appendCompatibilitySummary(parent,summary) {
+  const section=node('section','compatibility-human-summary');
+  section.append(node('h3','','这次转换会发生什么'));
+  [['字段差异',summary.difference],['转换方式',summary.conversion],['可能损失或语义变化',summary.loss],['风险和失败条件',summary.risk],['事务行为','失败时整笔事务回滚，checkpoint 不推进。']].forEach(([label,value])=>{
+    const row=node('div','compatibility-human-row');row.append(node('b','',label),node('p','',value));section.append(row);
+  });
+  if(summary.riskLabel)section.append(node('p','compatibility-risk-badge','风险等级：'+summary.riskLabel));
+  parent.append(section);
+}
+function compatibilityOptionLabel(name) {
+  return {target_charset:'目标字符集',target_length:'目标长度',target_length_unit:'长度单位',target_collation:'目标排序规则',encoding_policy:'字符编码策略',length_policy:'超长处理',collation_policy:'排序规则策略',target_precision:'目标精度',precision_policy:'精度处理',temporal_strategy:'时间转换策略',time_zone:'时区',json_strategy:'JSON 处理方式'}[name]||name;
+}
+function compatibilityOptionHelp(name) {
+  return {target_charset:'决定文本如何编码写入目标端。',target_length:'必须与预先创建的目标字段长度一致。',target_length_unit:'目标长度按字节还是字符计算。',target_collation:'决定目标端文本比较和排序方式。',encoding_policy:'当前只允许严格编码，无法编码时拒绝。',length_policy:'当前只允许拒绝超长值，禁止静默截断。',collation_policy:'当前按目标端排序规则执行。',target_precision:'目标数值或时间字段保留的精度。',precision_policy:'当前只允许拒绝精度损失。',temporal_strategy:'决定本地时间和绝对时间如何转换。',time_zone:'绝对时间转换使用的时区。',json_strategy:'选择结构化 JSON 或规范化文本。'}[name]||'';
+}
+function compatibilityOptionAdvanced(name) {
+  return ['encoding_policy','length_policy','collation_policy','precision_policy'].includes(name);
+}
 function registeredConnector(instance,role) {
   if(!instance)return null;
   const list=role==='source'?state.connectors.sources:state.connectors.sinks;
@@ -393,16 +489,19 @@ async function renderTaskDetail(id) {
     } else {
       task.plans.forEach(plan=>{
         const parameters=plan.target?.parameters||{}, parameterText=Object.entries(parameters).map(([key,value])=>key+'='+value).join(' · ');
-        const kind=conversionKind(parameters);
-        const example=conversionExample(kind,parameters);
-        const targetResult=conversionTarget(kind,parameters,plan.target?.native_type);
         const card=node('article','task-plan-card');
         card.append(node('b','',plan.source_field?.lineage_id+' → '+plan.target_field?.lineage_id));
-        card.append(node('p','muted','目标类型：'+(plan.target?.native_type||'未配置')+' · 资格：'+(plan.qualification||'未配置')+' · 风险：'+(plan.risk||'未配置')));
-        if(plan.risk_code)card.append(node('p','muted','风险代码：'+plan.risk_code));
-        if(parameterText)card.append(node('p','mono','转换参数：'+parameterText));
-        card.append(node('p','muted',example+' · '+targetResult+' · 风险等级：'+(plan.risk||'未配置')+' · 失败策略：'+(plan.failure_policy||'拒绝')+(plan.requires_confirmation?' · 需用户确认':' · 无需额外确认')));
-        card.append(node('p','mono','计划摘要：'+(plan.plan_digest||'未知')));
+        card.append(node('p','muted','资格：'+(plan.qualification||'未配置')+' · 风险等级：'+compatibilityRiskLabel(plan.risk)));
+        appendCompatibilitySummary(card,compatibilityHumanSummary(
+          {native_type:plan.source_field?.native_type,collation:parameters.source_collation},
+          {native_type:plan.target?.native_type,collation:parameters.target_collation},
+          {status:'COMPATIBLE',risk:plan.risk},plan
+        ));
+        const technical=node('details','compatibility-technical'),technicalTitle=node('summary','','查看技术细节');technical.append(technicalTitle);
+        if(parameterText)technical.append(node('p','mono','转换参数：'+parameterText));
+        if(plan.risk_code)technical.append(node('p','mono','风险代码：'+plan.risk_code));
+        technical.append(node('p','mono','计划摘要：'+(plan.plan_digest||'未知')));
+        card.append(technical);
         preview.append(card);
       });
     }
@@ -437,6 +536,10 @@ async function renderTaskAdd() {
     sink:{role:'sink',title:'目的端库表',account:'写入账号',base:null,tables:new Map(),loadingSchemas:new Set(),seq:0,database:''}
   };
   const selected=new Set(),expandedSchemas=new Set(),expandedTables=new Set();
+  const compatibility=new Map();
+  const draftId=(window.crypto&&typeof window.crypto.randomUUID==='function')
+    ?window.crypto.randomUUID().replaceAll('-','')
+    :Math.random().toString(36).slice(2)+Date.now().toString(36);
   let focusedKey='',submitting=false,scrolling=false;
   function syncControlHeights() {
     const controls=Object.values(endpoints).map(side=>side.controls).filter(Boolean);
@@ -470,6 +573,33 @@ async function renderTaskAdd() {
     if(JSON.stringify(source.primary_key)!==JSON.stringify(sink.primary_key))return '主键不一致';
     return '';
   }
+  function normalizedNativeType(value) {
+    const normalized=String(value||'').trim().toLowerCase().replace(/\s+/g,' ');
+    // MySQL display widths are metadata spelling differences, not storage
+    // semantics. Keep real parameters (decimal/char/varchar) so only an
+    // actual conversion opens the compatibility editor.
+    return normalized
+      .replace(/\b(tinyint|smallint|mediumint|int|integer|bigint)\(\d+\)/g,'$1')
+      .replace(/\binteger\b/g,'int');
+  }
+  function compatibilityStatus(result) { return String(result?.status||'').toUpperCase(); }
+  function nativeLength(value) {
+    const match=normalizedNativeType(value).match(/\((\d+)\)/);return match?match[1]:'';
+  }
+  function nativeTextLength(value) {
+    const type=normalizedNativeType(value),declared=nativeLength(type);
+    if(declared)return declared;
+    return ({tinytext:'255',text:'65535',mediumtext:'16777215',longtext:'4294967295'})[type]||'unbounded';
+  }
+  function needsCompatibilityOptions(schema,table,column) {
+    const sourceTable=tableFor(endpoints.source,schema,table),sinkTable=tableFor(endpoints.sink,schema,table);
+    const source=columnFor(sourceTable,column),sink=columnFor(sinkTable,column);
+    if(!source||!sink)return false;
+    const saved=compatibility.get(columnKey(schema,table,column));
+    if(compatibilityStatus(saved?.result)==='COMPATIBLE')return false;
+    return normalizedNativeType(source.column_type)!==normalizedNativeType(sink.column_type)
+      ||String(source.collation||'')!==String(sink.collation||'');
+  }
   function columnPairReason(schema,table,column) {
     const sourceTable=tableFor(endpoints.source,schema,table),sinkTable=tableFor(endpoints.sink,schema,table);
     const tableReason=tablePairReason(schema,table);
@@ -477,9 +607,11 @@ async function renderTaskAdd() {
     const source=columnFor(sourceTable,column),sink=columnFor(sinkTable,column);
     if(!source)return '源端缺少字段';
     if(!sink)return '目的端缺少字段';
-    // Compatibility is planned by the public Rust model during preflight.
-    // The browser only handles catalog shape and selection; it must not grow
-    // a second, connector-pair-specific type matrix.
+    if(!needsCompatibilityOptions(schema,table,column))return '';
+    const saved=compatibility.get(columnKey(schema,table,column));
+    if(!saved)return '源端和目的端字段定义不一致，请先配置兼容选项';
+    if(saved.error)return saved.error.message;
+    if(compatibilityStatus(saved.result)!=='COMPATIBLE')return saved.result?.explanation||'兼容选项尚未完成';
     return '';
   }
   function eligibleColumnKeys(schema,table) {
@@ -601,6 +733,122 @@ async function renderTaskAdd() {
     const table=tableFor(side,row.schema,row.table);
     return entity.column_type+(table?.primary_key.includes(entity.name)?' · 主键 · 必选':'');
   }
+  function compatibilityDefault(spec,source,sink) {
+    const sourceType=normalizedNativeType(source.column_type),targetType=normalizedNativeType(sink.column_type);
+    const allowedValues=Array.isArray(spec.allowed_values)?spec.allowed_values:[];
+    const targetCharset=String(sink.collation||'').split('_')[0].toLowerCase();
+    if(spec.name==='target_charset') {
+      if(allowedValues.includes(targetCharset))return targetCharset;
+      if(allowedValues.includes('UTF8')&&['postgresql','utf8'].includes(targetCharset))return 'UTF8';
+      return allowedValues[0]||'';
+    }
+    if(spec.name==='target_length')return nativeTextLength(sink.column_type);
+    if(spec.name==='target_length_unit')return /^(char|varchar)\b/.test(targetType)?'characters':(allowedValues[0]||'bytes');
+    if(spec.name==='target_collation')return sink.collation||'none';
+    if(spec.name==='target_precision')return (targetType.match(/\((\d+)\)/)||[])[1]||'0';
+    if(spec.name==='temporal_strategy') {
+      if(/timestamp/.test(sourceType)&&/datetime/.test(targetType))return 'absolute_to_local';
+      if(/datetime/.test(sourceType)&&/timestamp/.test(targetType))return 'local_to_absolute';
+      if(/time/.test(sourceType)&&/time/.test(targetType))return 'preserve_duration';
+      if(/timestamp/.test(sourceType))return 'preserve_absolute';
+      return 'preserve_local';
+    }
+    if(spec.name==='json_strategy')return 'normalized_text';
+    return spec.default||allowedValues[0]||'';
+  }
+  async function openCompatibility(row) {
+    const source=columnFor(tableFor(endpoints.source,row.schema,row.table),row.column);
+    const sink=columnFor(tableFor(endpoints.sink,row.schema,row.table),row.column);
+    if(!source||!sink)return;
+    const saved=compatibility.get(row.key);
+    let parameters={...(saved?.parameters||{})},confirmations=[...(saved?.confirmations||[])],response=null;
+    const dialog=node('dialog','compatibility-dialog'),form=node('form','compatibility-form');
+    const heading=node('div','dialog-heading'),headingText=node('div');
+    headingText.append(node('h2','','兼容选项'),node('p','muted',row.schema+'.'+row.table+'.'+row.column));
+    const close=node('button','icon','×');close.type='button';close.setAttribute('aria-label','关闭');close.addEventListener('click',()=>dialog.close());
+    heading.append(headingText,close);
+    const content=node('div','compatibility-content'),actions=node('div','dialog-actions');
+    const cancel=node('button','btn','取消');cancel.type='button';cancel.addEventListener('click',()=>dialog.close());
+    const verify=node('button','btn primary','验证并保存');verify.type='submit';actions.append(cancel,verify);
+    form.append(heading,content,actions);dialog.append(form);document.body.append(dialog);
+    dialog.addEventListener('close',()=>dialog.remove(),{once:true});dialog.showModal();
+    function payload(nextParameters,nextConfirmations) {
+      return {draft_id:draftId,source_id:endpoints.source.select.value,sink_id:endpoints.sink.select.value,
+        source_database:endpoints.source.database,sink_database:endpoints.sink.database,
+        source_revision:endpoints.source.base.revision,sink_revision:endpoints.sink.base.revision,
+        schema:row.schema,table:row.table,column:row.column,parameters:nextParameters,confirmations:nextConfirmations};
+    }
+    async function request(nextParameters,nextConfirmations) {
+      return api('/api/compatibility/preview',{method:'POST',body:JSON.stringify(payload(nextParameters,nextConfirmations))});
+    }
+    function renderPreview() {
+      content.replaceChildren();
+      const sourceLabel='源端：'+compatibilityFieldType(source)+(source.collation?' · '+source.collation:'');
+      const sinkLabel='目的端：'+compatibilityFieldType(sink)+(sink.collation?' · '+sink.collation:'');
+      content.append(node('p','compatibility-field-pair',sourceLabel+' → '+sinkLabel));
+      if(response?.error){content.append(node('p','task-error',response.error.message));verify.disabled=true;return;}
+      const result=response?.result;
+      if(!result){content.append(node('p','task-error','兼容性预览没有返回结果'));verify.disabled=true;return;}
+      const candidates=result.candidates||[],rules=response.candidates||[];
+      if(candidates.length>1){
+        const label=node('label','compatibility-option-label','选择目标字段表示方式'),select=node('select','select');
+        candidates.forEach(candidate=>{const option=node('option','',candidate.target.native_type+' · '+candidate.qualification+' · 风险 '+candidate.risk);option.value=candidate.rule.id;option.selected=parameters.__rule_id===candidate.rule.id;select.append(option);});
+        if(!select.value&&candidates[0])select.value=candidates[0].rule.id;
+        select.addEventListener('change',()=>{const candidate=candidates.find(item=>item.rule.id===select.value);if(candidate){parameters.__rule_id=candidate.rule.id;parameters.__rule_version=candidate.rule.version;renderPreview();}});
+        content.append(label);label.append(select);
+      } else if(candidates[0]) {
+        parameters.__rule_id=candidates[0].rule.id;parameters.__rule_version=candidates[0].rule.version;
+      }
+      const ruleId=parameters.__rule_id||(candidates[0]?.rule.id||'');
+      const rule=rules.find(item=>item.rule.id===ruleId)||rules[0];
+      const selectedCandidate=candidates.find(candidate=>candidate.rule.id===ruleId)||candidates[0];
+      appendCompatibilitySummary(content,compatibilityHumanSummary(source,sink,result,result.plan,selectedCandidate?.target));
+      if(rule?.options?.length){
+        const fieldset=node('fieldset','compatibility-options');fieldset.append(node('legend','','需要时调整转换设置'));
+        const advanced=node('details','compatibility-advanced'),advancedTitle=node('summary','','高级设置（通常无需修改）'),advancedFields=node('div','compatibility-advanced-fields');advanced.append(advancedTitle,advancedFields);
+        let visibleCount=0,advancedCount=0;
+        rule.options.forEach(spec=>{const label=node('label','compatibility-option-label');label.append(node('span','',compatibilityOptionLabel(spec.name)));const help=compatibilityOptionHelp(spec.name);if(help)label.append(node('small','muted',help));const allowedValues=Array.isArray(spec.allowed_values)?spec.allowed_values:[];const input=allowedValues.length?node('select','select'):node('input','input');
+          input.name='compat-option';input.dataset.option=spec.name;input.required=spec.required;
+          if(input.tagName==='SELECT'){allowedValues.forEach(value=>{const option=node('option','',value);option.value=value;input.append(option);});}
+          input.value=parameters[spec.name]||compatibilityDefault(spec,source,sink);label.append(input);
+          if(compatibilityOptionAdvanced(spec.name)){advancedFields.append(label);advancedCount++;}else{fieldset.append(label);visibleCount++;}
+        });
+        if(visibleCount)content.append(fieldset);
+        if(advancedCount)content.append(advanced);
+      }
+      const status=compatibilityStatus(result);
+      const statusLabel={COMPATIBLE:'可同步',NEEDS_CONFIRMATION:'需要风险确认',NEEDS_CONFIGURATION:'需要配置参数',UNSUPPORTED:'不支持',BLOCKED:'已阻断',STALE:'已过期'}[status]||result.status;
+      content.append(node('p',status==='COMPATIBLE'?'good':'warn','状态：'+statusLabel+' · '+result.explanation));
+      const needsConfirm=status==='NEEDS_CONFIRMATION'||result.requires_confirmation;
+      if(needsConfirm&&result.plan){
+        const label=node('label','compatibility-confirm-label'),check=node('input');check.type='checkbox';check.name='compat-confirm';
+        label.append(check,document.createTextNode('我已了解该字段的转换风险，同意按上述规则执行'));content.append(label);
+      }
+      verify.disabled=['UNSUPPORTED','BLOCKED','STALE'].includes(status)||Boolean(response.error);
+    }
+    try {response=await request(parameters,confirmations);renderPreview();}
+    catch(reason){response={error:{message:reason.message}};renderPreview();}
+    form.addEventListener('submit',async event=>{
+      event.preventDefault();if(verify.disabled)return;verify.disabled=true;
+      const values=form.querySelectorAll('[data-option]');values.forEach(input=>{parameters[input.dataset.option]=input.value;});
+      const selected=form.querySelector('[data-option]');
+      if(response?.candidates?.length){const selectedRule=parameters.__rule_id||response.result?.candidates?.[0]?.rule.id;if(selectedRule){const candidate=response.result.candidates.find(item=>item.rule.id===selectedRule)||response.result.candidates[0];parameters.__rule_id=candidate.rule.id;parameters.__rule_version=candidate.rule.version;}}
+      try {
+        response=await request(parameters,[]);
+        if(compatibilityStatus(response.result)==='NEEDS_CONFIRMATION'&&response.result.plan){
+          const check=form.querySelector('[name=compat-confirm]');
+          if(!check?.checked){renderPreview();return;}
+          const plan=response.result.plan;
+          confirmations=[{source_field_lineage:plan.source_field.lineage_id,target_field_lineage:plan.target_field.lineage_id,rule:plan.rule,plan_digest:plan.plan_digest,actor:state.me.user.username,confirmed_at:new Date().toISOString(),reason:'添加任务页确认兼容转换风险'}];
+          response=await request(parameters,confirmations);
+        }
+        if(compatibilityStatus(response.result)!=='COMPATIBLE'||!response.result.plan){renderPreview();return;}
+        compatibility.set(row.key,{parameters:{...parameters},confirmations:[...confirmations],result:response.result});
+        dialog.close();renderTrees();updateSummary();
+      } catch(reason){response={error:{message:reason.message}};renderPreview();}
+      finally {if(dialog.open)verify.disabled=false;}
+    });
+  }
   function focusRow(rowKey) {
     focusedKey=rowKey;
     treeLayout.querySelectorAll('.task-tree-row').forEach(element=>element.classList.toggle('focused',element.dataset.nodeKey===rowKey));
@@ -653,6 +901,11 @@ async function renderTaskAdd() {
     label.addEventListener('click',()=>focusRow(row.key));
     const meta=node('small',present?'muted':'warn',rowMeta(side,row,entity));
     line.append(expand,checkbox,label,meta);
+    if(row.kind==='column'&&needsCompatibilityOptions(row.schema,row.table,row.column)) {
+      const compatibilityButton=node('button','task-compatibility-button',compatibility.has(row.key)?'调整配置':'兼容选项');
+      compatibilityButton.type='button';compatibilityButton.addEventListener('click',event=>{event.stopPropagation();openCompatibility(row);});
+      line.append(compatibilityButton);
+    } else line.append(node('span','task-tree-row-action'));
     return line;
   }
   function drawLines() {
@@ -761,7 +1014,12 @@ async function renderTaskAdd() {
       const [kind,schema,table,column]=JSON.parse(item);if(kind!=='column')continue;
       const groupKey=tableKey(schema,table);
       if(!grouped.has(groupKey))grouped.set(groupKey,{source_schema:schema,source_table:table,sink_schema:schema,sink_table:table,columns:[]});
-      grouped.get(groupKey).columns.push(column);
+      const mapping=grouped.get(groupKey);mapping.columns.push(column);
+      const configured=compatibility.get(item);
+      if(configured?.parameters&&Object.keys(configured.parameters).length) {
+        if(!mapping.conversion_options)mapping.conversion_options={};
+        mapping.conversion_options[column]={...configured.parameters};
+      }
     }
     for(const mapping of grouped.values()) {
       const source=tableFor(endpoints.source,mapping.source_schema,mapping.source_table);
@@ -815,7 +1073,7 @@ async function renderTaskAdd() {
   async function loadEndpoint(side) {
     const seq=++side.seq;side.base=null;side.tables.clear();side.loadingSchemas.clear();side.loadingBase=true;
     side.error.hidden=true;side.meta.textContent=side.select.value?'正在读取实例和业务库…':'';side.reload.disabled=true;
-    selected.clear();expandedSchemas.clear();expandedTables.clear();focusedKey='';renderTrees();
+    selected.clear();compatibility.clear();expandedSchemas.clear();expandedTables.clear();focusedKey='';renderTrees();
     try {
       if(!side.select.value)return;
       const catalog=await api(endpointUrl(side));
@@ -833,8 +1091,8 @@ async function renderTaskAdd() {
   form.addEventListener('submit',async event=>{
     event.preventDefault();if(submit.disabled||submitting)return;
     const source=endpoints.source,sink=endpoints.sink;
-    const payload={name:name.value.trim(),source_id:source.select.value,sink_id:sink.select.value,source_database:source.database,sink_database:sink.database,source_revision:source.base.revision,sink_revision:sink.base.revision,
-      start_mode:mode.value,mappings:selectedMappings()};
+    const payload={draft_id:draftId,name:name.value.trim(),source_id:source.select.value,sink_id:sink.select.value,source_database:source.database,sink_database:sink.database,source_revision:source.base.revision,sink_revision:sink.base.revision,
+      start_mode:mode.value,mappings:selectedMappings(),confirmations:[...new Map([...compatibility.values()].flatMap(item=>item.confirmations||[]).map(item=>[item.plan_digest,item])).values()]};
     submitting=true;fields.disabled=true;submit.textContent='正在检查全部库表字段…';error.hidden=true;
     try {const task=await api('/api/tasks',{method:'POST',body:JSON.stringify(payload)});location.assign('/tasks/'+encodeURIComponent(task.id));}
     catch(reason){error.textContent=reason.message;error.hidden=false;error.scrollIntoView({block:'nearest'});}
