@@ -1,22 +1,26 @@
 {
   "schema": "cdc.qualification-config.v1",
   "databases": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
-  "implemented": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
-  "source_only": ["postgresql_16", "postgresql_17"],
+  "implemented": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
+  "source_only": [],
   "unsupported": [],
   "live_qualification": {
-    "source_fixture_roster": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+    "source_fixture_roster": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
     "sources": [
       {"database": "mysql_5_7", "suite": "mysql_5_7.capture"},
       {"database": "mysql_8_0", "suite": "mysql_8_0.capture"},
       {"database": "mysql_8_4", "suite": "mysql_8_4.capture"},
-      {"database": "postgresql_15", "suite": "postgresql_15.capture"}
+      {"database": "postgresql_15", "suite": "postgresql_15.capture"},
+      {"database": "postgresql_16", "suite": "postgresql_16.capture"},
+      {"database": "postgresql_17", "suite": "postgresql_17.capture"}
     ],
     "sinks": [
       {"database": "mysql_5_7", "suite": "mysql_5_7.apply"},
       {"database": "mysql_8_0", "suite": "mysql_8_0.apply"},
       {"database": "mysql_8_4", "suite": "mysql_8_4.apply"},
-      {"database": "postgresql_15", "suite": "postgresql_15.apply"}
+      {"database": "postgresql_15", "suite": "postgresql_15.apply"},
+      {"database": "postgresql_16", "suite": "postgresql_16.apply"},
+      {"database": "postgresql_17", "suite": "postgresql_17.apply"}
     ],
     "transaction_recovery": ["transaction_recovery.common"],
     "route_smoke": ["postgresql_15.capture_to_mysql", "postgresql_15.web_sink"]

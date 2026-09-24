@@ -117,7 +117,7 @@
       "id": "mysql_5_7.apply",
       "mode": "Live",
       "category": "sink",
-      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
       "databases": [
         "mysql_5_7"
       ],
@@ -224,7 +224,7 @@
       "id": "mysql_8_0.apply",
       "mode": "Live",
       "category": "sink",
-      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
       "databases": [
         "mysql_8_0"
       ],
@@ -331,7 +331,7 @@
       "id": "mysql_8_4.apply",
       "mode": "Live",
       "category": "sink",
-      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
       "databases": [
         "mysql_8_4"
       ],
@@ -426,7 +426,7 @@
       "id": "postgresql_15.apply",
       "mode": "Live",
       "category": "sink",
-      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"],
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
       "databases": [
         "postgresql_15"
       ],

@@ -114,28 +114,97 @@ function Get-SuiteResult([string]$Id) {
     return $results | Where-Object { $_.id -eq $Id } | Select-Object -First 1
 }
 
+function Protect-ReportArtifacts([string]$Directory) {
+    $extensions = @('.json', '.jsonl', '.log', '.txt')
+    $files = @(Get-ChildItem -LiteralPath $Directory -File -Recurse | Where-Object {
+        $_.Extension -in $extensions
+    })
+    $matches = 0
+    foreach ($file in $files) {
+        $content = [IO.File]::ReadAllText($file.FullName)
+        $updated = $content
+        foreach ($secret in $secrets) {
+            if (-not [string]::IsNullOrEmpty($secret) -and
+                $updated.IndexOf($secret, [StringComparison]::Ordinal) -ge 0) {
+                $matches++
+                $updated = $updated.Replace($secret, '[REDACTED]')
+            }
+        }
+        if ($updated -cne $content) {
+            [IO.File]::WriteAllText($file.FullName, $updated, [Text.UTF8Encoding]::new($false))
+        }
+    }
+    return [ordered]@{
+        status = if ($matches -eq 0) { 'PASS' } else { 'FAIL' }
+        files_scanned = $files.Count
+        matches_redacted = $matches
+    }
+}
+
+function Get-StableReportDigest([System.Collections.IDictionary]$Report) {
+    $stable = [ordered]@{}
+    foreach ($key in $Report.Keys) {
+        if ($key -notin @('run_id', 'summary_digest')) { $stable[$key] = $Report[$key] }
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($stable | ConvertTo-Json -Depth 40 -Compress))
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($algorithm.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Redact-ReportObject($Value) {
+    if ($Value -is [string]) {
+        foreach ($secret in $secrets) {
+            if (-not [string]::IsNullOrEmpty($secret)) { $Value = $Value.Replace($secret, '[REDACTED]') }
+        }
+        return $Value
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Value.Keys)) { $Value[$key] = Redact-ReportObject $Value[$key] }
+    } elseif ($Value -is [System.Collections.IList]) {
+        for ($index = 0; $index -lt $Value.Count; $index++) {
+            $Value[$index] = Redact-ReportObject $Value[$index]
+        }
+    } elseif ($null -ne $Value -and $Value -is [pscustomobject]) {
+        foreach ($property in $Value.PSObject.Properties) {
+            $property.Value = Redact-ReportObject $property.Value
+        }
+    }
+    return $Value
+}
+
 # Validate the semantic registry before running tests. This prevents a future
-# configuration from silently turning a 4+4 qualification into 16 live links.
+# configuration from silently turning a 6+6 qualification into 36 live links.
 $roster = @($config.live_qualification.source_fixture_roster)
-if ($roster.Count -ne 4 -or @($roster | Select-Object -Unique).Count -ne 4) {
-    throw 'live_qualification.source_fixture_roster must contain four unique source fixtures.'
+if ($roster.Count -ne 6 -or @($roster | Select-Object -Unique).Count -ne 6) {
+    throw 'live_qualification.source_fixture_roster must contain six unique source fixtures.'
 }
 $sourceSpecs = @($config.live_qualification.sources)
 $sinkSpecs = @($config.live_qualification.sinks)
-if ($sourceSpecs.Count -ne 4 -or $sinkSpecs.Count -ne 4) {
-    throw 'live_qualification must declare exactly four source and four sink components.'
+if ($sourceSpecs.Count -ne 6 -or $sinkSpecs.Count -ne 6) {
+    throw 'live_qualification must declare exactly six source and six sink components.'
+}
+$sourceIds = @($sourceSpecs | ForEach-Object { [string]$_.database })
+$sinkIds = @($sinkSpecs | ForEach-Object { [string]$_.database })
+if (($sourceIds -join ',') -ne (@($config.databases) -join ',') -or
+    ($sinkIds -join ',') -ne (@($config.databases) -join ',')) {
+    throw 'live_qualification source and sink components must follow the six-database roster exactly.'
 }
 if ((@($sourceSpecs | ForEach-Object { $_.database }) -join ',') -ne ($roster -join ',') -or
     (@($sinkSpecs | ForEach-Object { $_.database }) -join ',') -ne ($roster -join ',')) {
-    throw 'live source and sink component rosters must match the four implemented databases.'
+    throw 'live source and sink component rosters must match the six implemented databases.'
 }
 
 $suiteDefinitions = @($legacy.suites)
 foreach ($sinkSpec in $sinkSpecs) {
     $sinkSuite = $suiteDefinitions | Where-Object { $_.id -eq $sinkSpec.suite } | Select-Object -First 1
-    if ($null -eq $sinkSuite -or [string]$sinkSuite.category -ne 'sink' -or
-        ((@($sinkSuite.source_fixtures) -join ',') -ne ($roster -join ','))) {
-        throw "Sink suite $($sinkSpec.suite) must declare all four source fixtures."
+    if ($null -ne $sinkSuite -and
+        ([string]$sinkSuite.category -ne 'sink' -or
+         ((@($sinkSuite.source_fixtures) -join ',') -ne ($roster -join ',')))) {
+        throw "Sink suite $($sinkSpec.suite) must declare all six source fixtures."
     }
 }
 
@@ -184,6 +253,8 @@ try {
         Run-Suite $suite (Add-DatabaseEnvironment $suite) $execute
     }
 
+    $passwordScan = Protect-ReportArtifacts $out
+
     $offlineResult = Get-SuiteResult 'offline-workspace'
     $offlinePassed = $null -ne $offlineResult -and $offlineResult.status -eq 'PASS'
     $types = if ($offlinePassed -and (Test-Path -LiteralPath $typePath)) {
@@ -200,11 +271,16 @@ try {
             $type = @($types | Where-Object { $_.source -eq $source -and $_.sink -eq $sink })
             $recover = @($recoveryEvidence | Where-Object { $_.source -eq $source -and $_.sink -eq $sink })
             $unsupported = $source -in $config.unsupported -or $sink -in $config.unsupported
-            if ($type.Count -ne 1 -or $recover.Count -ne 1) {
+            $roleBlocked = $sink -in $config.source_only
+            if ($null -ne $offlineResult -and $offlineResult.status -eq 'FAIL') {
+                $offlineStatus = 'FAIL'
+            } elseif ($type.Count -ne 1 -or $recover.Count -ne 1) {
                 $missing.Add($key)
                 $offlineStatus = 'MISSING_TEST'
             } elseif ($unsupported -and $type[0].offline -eq 'UNSUPPORTED' -and $recover[0].offline -eq 'UNSUPPORTED') {
                 $offlineStatus = 'UNSUPPORTED'
+            } elseif ($roleBlocked -and $type[0].offline -eq 'BLOCKED' -and $recover[0].offline -eq 'BLOCKED') {
+                $offlineStatus = 'BLOCKED'
             } elseif (-not $unsupported -and $type[0].offline -eq 'PASS' -and $recover[0].offline -eq 'PASS') {
                 $offlineStatus = 'PASS'
             } else {
@@ -219,6 +295,9 @@ try {
             if ($unsupported) {
                 $liveStatus = 'UNSUPPORTED'
                 $liveReason = 'connector.not_implemented'
+            } elseif ($roleBlocked) {
+                $liveStatus = 'BLOCKED'
+                $liveReason = 'sink_adapter_not_registered'
             } elseif ($null -eq $sourceEvidence -or $null -eq $sinkEvidence) {
                 $liveStatus = 'REQUIRES_LIVE'
                 $liveReason = 'source_or_sink_component_not_registered'
@@ -237,6 +316,39 @@ try {
             foreach ($level in @('EXACT', 'RANGE_CHECKED', 'EXPLICIT_CONVERSION', 'UNSUPPORTED/BLOCKED')) {
                 $counts[$level] = @($typeCases | Where-Object qualification -eq $level).Count
             }
+            $outcomes = if ($type.Count -eq 1) { $type[0].qualification_outcomes } else { $null }
+            $qualificationEvidence = [ordered]@{
+                'Native Equivalent' = [ordered]@{
+                    status = if ($null -ne $outcomes -and $outcomes.'Native Equivalent' -gt 0) { 'PASS' } else { 'BLOCKED' }
+                    cases = if ($null -ne $outcomes) { $outcomes.'Native Equivalent' } else { 0 }
+                }
+                'Value Preserved' = [ordered]@{
+                    status = if ($null -ne $outcomes -and $outcomes.'Value Preserved' -gt 0) { 'PASS' } else { 'BLOCKED' }
+                    cases = if ($null -ne $outcomes) { $outcomes.'Value Preserved' } else { 0 }
+                }
+                'Explicit Conversion' = [ordered]@{
+                    status = if ($null -ne $outcomes -and $outcomes.'Explicit Conversion' -gt 0) { 'PASS' } else { 'BLOCKED' }
+                    cases = if ($null -ne $outcomes) { $outcomes.'Explicit Conversion' } else { 0 }
+                }
+                UNSUPPORTED = [ordered]@{
+                    status = if ($null -ne $outcomes -and $outcomes.UNSUPPORTED -gt 0) { 'UNSUPPORTED' } else { 'PASS' }
+                    cases = if ($null -ne $outcomes) { $outcomes.UNSUPPORTED } else { 0 }
+                }
+                BLOCKED = [ordered]@{
+                    status = if ($null -ne $outcomes -and $outcomes.BLOCKED -gt 0) { 'BLOCKED' } else { 'PASS' }
+                    cases = if ($null -ne $outcomes) { $outcomes.BLOCKED } else { 0 }
+                }
+                REQUIRES_LIVE = [ordered]@{
+                    status = $liveStatus
+                    source_suite = if ($null -ne $sourceSpec) { $sourceSpec.suite } else { $null }
+                    sink_suite = if ($null -ne $sinkSpec) { $sinkSpec.suite } else { $null }
+                }
+                FAIL = [ordered]@{
+                    status = if ($offlineStatus -eq 'FAIL' -or $liveStatus -eq 'FAIL') { 'FAIL' } else { 'PASS' }
+                    offline = $offlineStatus
+                    live = $liveStatus
+                }
+            }
             [pscustomobject]@{
                 source = $source
                 sink = $sink
@@ -247,6 +359,8 @@ try {
                     @([ordered]@{ source_suite = $sourceSpec.suite; sink_suite = $sinkSpec.suite })
                 }
                 qualification_counts = $counts
+                qualification_outcomes = $outcomes
+                qualification_evidence = $qualificationEvidence
                 cases = $typeCases
                 recovery = @($recover)
             }
@@ -260,6 +374,7 @@ try {
             suite = $_.suite
             status = if ($null -ne $result) { $result.status } else { 'REQUIRES_LIVE' }
             log = if ($null -ne $result) { $result.log } else { $null }
+            reason = if ($null -ne $result) { $null } else { 'live_suite_not_registered' }
             evidence_scope = 'live_source_adapter'
         }
     })
@@ -271,8 +386,9 @@ try {
             database = $spec.database
             suite = $spec.suite
             status = if ($null -ne $result) { $result.status } else { 'REQUIRES_LIVE' }
-            source_fixtures = @($suite.source_fixtures)
+            source_fixtures = if ($null -ne $suite) { @($suite.source_fixtures) } else { @($roster) }
             log = if ($null -ne $result) { $result.log } else { $null }
+            reason = if ($null -ne $result) { $null } else { 'live_suite_not_registered' }
             evidence_scope = 'live_sink_adapter'
         }
     })
@@ -295,8 +411,8 @@ try {
         }
     })
 
-    $sourceQualified = $sourceQualification.Count -eq 4 -and @($sourceQualification | Where-Object status -ne 'PASS').Count -eq 0
-    $sinkQualified = $sinkQualification.Count -eq 4 -and @($sinkQualification | Where-Object status -ne 'PASS').Count -eq 0
+    $sourceQualified = $sourceQualification.Count -eq 6 -and @($sourceQualification | Where-Object status -ne 'PASS').Count -eq 0
+    $sinkQualified = $sinkQualification.Count -eq 6 -and @($sinkQualification | Where-Object status -ne 'PASS').Count -eq 0
     $transactionRecoveryQualified = $transactionRecovery.Count -gt 0 -and @($transactionRecovery | Where-Object status -ne 'PASS').Count -eq 0
     $routeSmokeQualified = $routeSmoke.Count -gt 0 -and @($routeSmoke | Where-Object status -ne 'PASS').Count -eq 0
     $liveQualified = $sourceQualified -and $sinkQualified -and $transactionRecoveryQualified
@@ -349,14 +465,14 @@ try {
 
     $offlineSuccess = $offlinePassed -and $missing.Count -eq 0
     $suiteFailures = @($results | Where-Object status -eq 'FAIL')
-    $failed = $baselineFailed -or $missing.Count -gt 0 -or $suiteFailures.Count -gt 0
+    $failed = $baselineFailed -or $missing.Count -gt 0 -or $suiteFailures.Count -gt 0 -or $passwordScan.matches_redacted -gt 0
     if ($Live -and (-not $liveQualified -or -not $routeSmokeQualified)) { $failed = $true }
     $success = -not $failed
     $report = [ordered]@{
         schema = 'cdc.qualification.v2'
         matrix_semantics = [ordered]@{
             offline_direction_matrix = 'six_by_six_planning_and_type_qualification'
-            live_qualification = 'four_source_adapters_plus_four_sink_adapters_plus_common_transaction_recovery'
+            live_qualification = 'six_source_adapters_plus_six_sink_adapters_plus_common_transaction_recovery'
             route_smoke = 'representative_end_to_end_runtime_routes'
             live_database_to_database_links = $false
         }
@@ -384,8 +500,22 @@ try {
         missing_directions = @($missing.ToArray())
         added_directions = $added
         expected_additional_directions = $expectedAdditional
+        password_scan = $passwordScan
         suites = @($results.ToArray())
     }
+    $report.summary_digest = Get-StableReportDigest $report
+    $report | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+
+    $summaryScan = Protect-ReportArtifacts $out
+    $report.password_scan.files_scanned = $summaryScan.files_scanned
+    if ($summaryScan.matches_redacted -gt 0) {
+        $failed = $true
+        $report = Redact-ReportObject $report
+        $report.password_scan.status = 'FAIL'
+        $report.password_scan.matches_redacted += $summaryScan.matches_redacted
+        $report.success = $false
+    }
+    $report.summary_digest = Get-StableReportDigest $report
     $report | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
 
     Write-Output 'Source -> Sink | Offline | Live | EXACT/RANGE_CHECKED/EXPLICIT_CONVERSION/UNSUPPORTED_BLOCKED'

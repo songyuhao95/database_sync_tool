@@ -1,17 +1,18 @@
 # DML type and version qualification
 
-Issue #37 keeps the six-version offline target without claiming PostgreSQL
-16/17 connector support. The canonical roster is
-`scripts/qualification-matrix.json`. Its Cartesian product is generated on
-every run: 36 offline directions, including 20 explicit `UNSUPPORTED`
-directions involving the two unimplemented versions. No fallback to
-PostgreSQL 15 occurs.
+Issue #57 qualifies the six versioned Source and Sink fixtures in
+`scripts/qualification-matrix.json`. Their Cartesian product is generated on
+every run as 36 offline directions. PostgreSQL 16/17 use their own
+SourceTypeMapping and Sink manifests; neither role falls back to PostgreSQL
+15.
 
-Live qualification is deliberately not a 16-route database-to-database
-matrix. It has four independent Source → ChangeEvent adapter qualifications,
-four independent ChangeEvent → Sink adapter qualifications, and one common
-transaction-recovery qualification. Representative end-to-end route smoke
-tests are reported separately.
+Live qualification is deliberately not a 36-route database-to-database
+matrix. It reports six independent Source → ChangeEvent components, six
+ChangeEvent → Sink components, and one common transaction-recovery
+qualification. The current live suite registers MySQL 5.7/8.0/8.4 and
+PostgreSQL 15; PostgreSQL 16/17 remain `REQUIRES_LIVE` until their live suites
+are registered and run. Representative end-to-end route smoke tests are
+reported separately.
 
 Run from the repository root:
 
@@ -33,7 +34,10 @@ The console contains only an ordered final matrix, missing-direction count,
 and report location. Cargo output stays in per-suite logs. `summary.json`
 contains the complete offline matrix, per-case qualification and status,
 stable reason codes, plan/manifest digests, recovery evidence scope,
-missing/new directions, and the four separate live report sections.
+missing/new directions, a stable summary digest, a password scan result, and
+the four separate live report sections. Each direction separates Native
+Equivalent, Value Preserved, Explicit Conversion, `UNSUPPORTED`, `BLOCKED`,
+`REQUIRES_LIVE`, and `FAIL` evidence.
 `live-source.json`, `live-sink.json`, `transaction-recovery.json`, and
 `route-smoke.json` retain the structured component reports. `types.json` and
 `recovery.json` retain the underlying offline evidence. Reports contain no
@@ -71,11 +75,11 @@ Live component PASS is scoped to the named adapter test. An implemented
 direction is `live=PASS` only when its registered Source component and Sink
 component both pass; that status is evidence composition, not execution of
 that database-to-database pair. Missing component evidence is
-`REQUIRES_LIVE`, a failed component is `FAIL`, and PostgreSQL 16/17 remain
-`UNSUPPORTED`. Offline PASS is never promoted to live PASS.
+`REQUIRES_LIVE`, a failed component is `FAIL`. Offline PASS is never promoted
+to live PASS.
 
-`live_qualified=true` requires exactly four Source components, exactly four
-Sink components, and the common transaction-recovery report to pass. Route
+`live_qualified=true` requires all six Source components, all six Sink
+components, and the common transaction-recovery report to pass. Route
 smoke is reported in `route_smoke_qualified` and is required for a successful
 `-Live` run, but it is not counted as an additional source/sink direction.
 The report therefore does not claim that all 16 database-to-database links
@@ -99,4 +103,3 @@ outgoing and self directions.
 
 This scope is DML against prepared targets. It adds no DDL replication, full
 load, automatic schema alteration, or bidirectional conflict resolution.
-

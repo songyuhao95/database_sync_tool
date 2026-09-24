@@ -261,10 +261,14 @@ pub fn fixture(version: &str, table: &str) -> ChangeTransaction {
 }
 
 pub fn postgres_fixture(table: &str) -> ChangeTransaction {
-    let mut fixture = fixture("15", table);
+    postgres_fixture_for_version(table, "15")
+}
+
+pub fn postgres_fixture_for_version(table: &str, version: &str) -> ChangeTransaction {
+    let mut fixture = fixture(version, table);
     fixture.source = Source {
         kind: "postgresql".into(),
-        version: "15".into(),
+        version: version.into(),
         id: "550e8400-e29b-41d4-a716-446655440000".into(),
     };
     fixture.begin_cursor = postgres_cursor(100);

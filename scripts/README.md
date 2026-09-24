@@ -1,9 +1,11 @@
 # 固定回归测试
 
-Issue #37 的完整 6×6 类型与恢复资格矩阵使用 `./scripts/qualify.ps1`。
-它按字段分别输出 EXACT、RANGE_CHECKED、EXPLICIT_CONVERSION、UNSUPPORTED/BLOCKED，
-并保留 `summary.json`、`types.json`、`recovery.json` 和日志。
-PostgreSQL 16/17 明确为 UNSUPPORTED；离线通过不代表 live qualification。
+Issue #57 的完整 6×6 类型与恢复资格矩阵使用 `./scripts/qualify.ps1`。
+它分别记录 Native Equivalent、Value Preserved、Explicit Conversion、
+UNSUPPORTED、BLOCKED、REQUIRES_LIVE 和 FAIL，并保留稳定摘要、密码命中检查、
+`types.json`、`recovery.json` 和日志。PostgreSQL 16/17 有独立离线 Source/Sink
+fixture；它们的 live 状态在相应套件注册并运行前保持 `REQUIRES_LIVE`。
+离线通过不代表 live qualification。
 使用 `-Live -ConfigFile ./scripts/test.txt` 可执行已登记的 live 组件测试，
 未配置实例或尚缺完整方向证据时保持 REQUIRES_LIVE。
 扩展规则、证据边界和报告格式见 [类型资格测试](../docs/testing/type-qualification.md)。

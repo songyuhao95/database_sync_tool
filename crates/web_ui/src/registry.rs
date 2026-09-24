@@ -214,6 +214,18 @@ const SINKS: &[ConnectorDescriptor] = &[
         AdapterKind::Postgresql15,
         postgresql_15::CAPABILITY_MANIFEST,
     ),
+    sink(
+        "postgresql",
+        "16",
+        AdapterKind::Postgresql16,
+        postgresql_16::CAPABILITY_MANIFEST,
+    ),
+    sink(
+        "postgresql",
+        "17",
+        AdapterKind::Postgresql17,
+        postgresql_17::CAPABILITY_MANIFEST,
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -268,9 +280,9 @@ impl ConnectorDescriptor {
             AdapterKind::Mysql57 => mysql_5_7::compatibility_manifest(target_build),
             AdapterKind::Mysql80 => mysql_8_0::compatibility_manifest(target_build),
             AdapterKind::Mysql84 => mysql_8_4::compatibility_manifest(target_build),
-            AdapterKind::Postgresql15 | AdapterKind::Postgresql16 | AdapterKind::Postgresql17 => {
-                postgresql_15::compatibility_manifest(target_build)
-            }
+            AdapterKind::Postgresql15 => postgresql_15::compatibility_manifest(target_build),
+            AdapterKind::Postgresql16 => postgresql_16::compatibility_manifest(target_build),
+            AdapterKind::Postgresql17 => postgresql_17::compatibility_manifest(target_build),
         }
     }
 

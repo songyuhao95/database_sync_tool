@@ -123,6 +123,12 @@ fn mysql_fixture(version: &str) -> change_event::ValidatedTransaction {
     validate(transaction).unwrap()
 }
 
+fn postgres_fixture(version: &str) -> change_event::ValidatedTransaction {
+    let mut transaction = fixture().transaction().clone();
+    transaction.source.version = version.into();
+    validate(transaction).unwrap()
+}
+
 #[test]
 fn postgres15_sink_adapter_accepts_mysql_and_postgres_events() {
     let sink = SinkAdapter::new();
@@ -135,6 +141,8 @@ fn postgres15_sink_adapter_accepts_mysql_and_postgres_events() {
 
     for transaction in [
         fixture(),
+        postgres_fixture("16.10"),
+        postgres_fixture("17.6"),
         mysql_fixture("5.7.44"),
         mysql_fixture("8.0.46"),
         mysql_fixture("8.4.8"),
@@ -490,6 +498,8 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
             .with_port(setting("PG_CDC_PORT", "54321").parse().unwrap());
             for source_fixture in [
                 fixture(),
+                postgres_fixture("16.10"),
+                postgres_fixture("17.6"),
                 mysql_fixture("5.7.44"),
                 mysql_fixture("8.0.46"),
                 mysql_fixture("8.4.8"),

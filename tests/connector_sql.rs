@@ -170,7 +170,9 @@ macro_rules! target_tests {
                     fixture("5.7.44", &table.name),
                     fixture("8.0.46", &table.name),
                     fixture("8.4.8", &table.name),
-                    postgres_fixture(&table.name),
+                    postgres_fixture_for_version(&table.name, "15"),
+                    postgres_fixture_for_version(&table.name, "16"),
+                    postgres_fixture_for_version(&table.name, "17"),
                 ];
                 for full in source_fixtures {
                     // Inspect the committed state after each operation, not only final emptiness.
@@ -230,7 +232,9 @@ fn mysql_sinks_consume_mysql_and_postgresql_change_events_with_parameterized_sql
         change_event::validate(fixture("5.7.44", "cdc_contract")).unwrap(),
         change_event::validate(fixture("8.0.46", "cdc_contract")).unwrap(),
         change_event::validate(fixture("8.4.8", "cdc_contract")).unwrap(),
-        change_event::validate(postgres_fixture("cdc_contract")).unwrap(),
+        change_event::validate(postgres_fixture_for_version("cdc_contract", "15")).unwrap(),
+        change_event::validate(postgres_fixture_for_version("cdc_contract", "16")).unwrap(),
+        change_event::validate(postgres_fixture_for_version("cdc_contract", "17")).unwrap(),
     ];
 
     macro_rules! assert_sink {

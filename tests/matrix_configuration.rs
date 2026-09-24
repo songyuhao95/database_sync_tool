@@ -40,7 +40,7 @@ fn issue_15_declares_one_local_four_by_four_change_event_matrix() {
 }
 
 #[test]
-fn issue_37_declares_component_qualification_instead_of_sixteen_live_routes() {
+fn issue_57_declares_six_component_qualification_without_claiming_live_routes() {
     let config: Value = serde_json::from_str(include_str!("../scripts/qualification-matrix.json"))
         .expect("qualification matrix must be valid JSON");
     let matrix: Value = serde_json::from_str(include_str!("../scripts/test-matrix.json"))
@@ -53,13 +53,20 @@ fn issue_37_declares_component_qualification_instead_of_sixteen_live_routes() {
         .collect::<Vec<_>>();
     assert_eq!(
         roster,
-        vec!["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15"]
+        vec![
+            "mysql_5_7",
+            "mysql_8_0",
+            "mysql_8_4",
+            "postgresql_15",
+            "postgresql_16",
+            "postgresql_17"
+        ]
     );
 
     let sources = config["live_qualification"]["sources"].as_array().unwrap();
     let sinks = config["live_qualification"]["sinks"].as_array().unwrap();
-    assert_eq!(sources.len(), 4);
-    assert_eq!(sinks.len(), 4);
+    assert_eq!(sources.len(), 6);
+    assert_eq!(sinks.len(), 6);
     assert!(
         !config["live_qualification"]["route_smoke"]
             .as_array()
@@ -75,7 +82,6 @@ fn issue_37_declares_component_qualification_instead_of_sixteen_live_routes() {
     );
 
     let suites = matrix["suites"].as_array().unwrap();
-    let find = |id: &str| suites.iter().find(|suite| suite["id"] == id).unwrap();
     assert_eq!(
         suites
             .iter()
@@ -100,18 +106,36 @@ fn issue_37_declares_component_qualification_instead_of_sixteen_live_routes() {
             .count(),
         1
     );
-    for sink in sinks {
-        let suite = find(sink["suite"].as_str().unwrap());
-        let fixtures = suite["source_fixtures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap())
-            .collect::<Vec<_>>();
+    for source in sources {
+        let suite_id = source["suite"].as_str().unwrap();
         assert_eq!(
-            fixtures, roster,
-            "every Sink must consume all four source fixtures"
+            suites.iter().any(|suite| suite["id"] == suite_id),
+            !matches!(
+                source["database"].as_str().unwrap(),
+                "postgresql_16" | "postgresql_17"
+            ),
+            "missing Source live suite must remain visible as REQUIRES_LIVE"
         );
+    }
+    for sink in sinks {
+        let suite_id = sink["suite"].as_str().unwrap();
+        if let Some(suite) = suites.iter().find(|suite| suite["id"] == suite_id) {
+            let fixtures = suite["source_fixtures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                fixtures, roster,
+                "every live Sink suite consumes six source fixtures"
+            );
+        } else {
+            assert!(matches!(
+                sink["database"].as_str().unwrap(),
+                "postgresql_16" | "postgresql_17"
+            ));
+        }
     }
     assert_eq!(
         suites

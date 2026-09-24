@@ -45,15 +45,27 @@ fn source_and_sink_registries_publish_independent_connector_catalogs() {
             ConnectorIdentity::new("mysql", "8.0"),
             ConnectorIdentity::new("mysql", "8.4"),
             ConnectorIdentity::new("postgresql", "15"),
+            ConnectorIdentity::new("postgresql", "16"),
+            ConnectorIdentity::new("postgresql", "17"),
         ]
     );
     assert!(sources.find("postgresql", "15").is_some());
     assert!(sources.find("postgresql", "16").is_some());
     assert!(sources.find("postgresql", "17").is_some());
     assert!(sinks.find("postgresql", "15").is_some());
+    assert!(sinks.find("postgresql", "16").is_some());
+    assert!(sinks.find("postgresql", "17").is_some());
     assert_eq!(
         sinks.find("postgresql", "15").unwrap().adapter,
         AdapterKind::Postgresql15
+    );
+    assert_eq!(
+        sinks.find("postgresql", "16").unwrap().adapter,
+        AdapterKind::Postgresql16
+    );
+    assert_eq!(
+        sinks.find("postgresql", "17").unwrap().adapter,
+        AdapterKind::Postgresql17
     );
 }
 
@@ -87,7 +99,7 @@ fn source_and_sink_capabilities_are_role_specific() {
 fn source_and_sink_registries_have_no_pair_specific_registration() {
     let sources = SourceRegistry.all().collect::<Vec<_>>();
     let sinks = SinkRegistry.all().collect::<Vec<_>>();
-    assert_eq!(sources.len() * sinks.len(), 24);
+    assert_eq!(sources.len() * sinks.len(), 36);
     for source in sources {
         assert_eq!(source.role, "source");
         assert!(

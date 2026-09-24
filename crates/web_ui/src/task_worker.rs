@@ -9,6 +9,7 @@ use crate::{
 use change_event::{
     ChangeTransaction, ColumnConversionPlan, CommitResolution, Datum, SnapshotBatch,
     SnapshotBoundary, SnapshotTable, TargetApplyErrorKind, TargetCapabilityFailure,
+    ValidatedTransaction,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -304,6 +305,112 @@ sink_adapter!(mysql_8_0, mysql_8_0::sql_with_plans);
 sink_adapter!(mysql_8_4, mysql_8_4::sql_with_plans);
 sink_adapter!(postgresql_15, postgresql_15::sql_with_plans);
 
+type PostgresqlPlanner =
+    fn(&ValidatedTransaction, &[ColumnConversionPlan]) -> io::Result<postgresql_15::SqlTransaction>;
+
+struct VersionedPostgresqlSink {
+    writer: postgresql_15::CheckpointWriter,
+    planner: PostgresqlPlanner,
+}
+
+impl Sink for VersionedPostgresqlSink {
+    fn check_snapshot_targets(&mut self, tables: &[SnapshotTable]) -> io::Result<()> {
+        self.writer.check_snapshot_targets(tables)
+    }
+
+    fn prepare_snapshot(&mut self, boundary: &SnapshotBoundary) -> io::Result<Checkpoint> {
+        self.writer
+            .prepare_snapshot(boundary)
+            .map(|checkpoint| Checkpoint::from(&checkpoint))
+    }
+
+    fn copy_snapshot(
+        &mut self,
+        tables: &[SnapshotTable],
+        batches: &mut dyn Iterator<Item = io::Result<SnapshotBatch>>,
+        progress: &mut SnapshotProgress<'_>,
+    ) -> io::Result<Checkpoint> {
+        self.writer
+            .copy_snapshot(tables, batches, progress)
+            .map(|checkpoint| Checkpoint::from(&checkpoint))
+    }
+
+    fn observe(&mut self, tx: &ChangeTransaction) -> io::Result<()> {
+        self.writer.observe(tx)
+    }
+
+    fn checkpoint(&self) -> Option<Checkpoint> {
+        self.writer.checkpoint().map(Checkpoint::from)
+    }
+
+    fn initialize(&mut self, checkpoint: &Checkpoint) -> io::Result<Checkpoint> {
+        self.writer
+            .initialize(
+                &checkpoint.mode,
+                &checkpoint.file,
+                checkpoint.position,
+                checkpoint.gtid_set.as_deref(),
+            )
+            .map(|checkpoint| Checkpoint::from(&checkpoint))
+    }
+
+    fn apply(
+        &mut self,
+        tx: &ChangeTransaction,
+        plans: &[ColumnConversionPlan],
+    ) -> io::Result<(Checkpoint, String, usize, bool)> {
+        if tx.changes.is_empty() {
+            let result = self.writer.advance(tx)?;
+            return Ok((
+                Checkpoint::from(&result.checkpoint),
+                String::new(),
+                0,
+                result.already_applied,
+            ));
+        }
+        if plans.is_empty() || plans.iter().any(|plan| !plan.verify_digest()) {
+            return Err(io::Error::other(TargetCapabilityFailure::new(
+                "stored ColumnConversionPlan is missing or has an invalid digest",
+            )));
+        }
+        let validated = change_event::validate(tx.clone()).map_err(io::Error::other)?;
+        let plan = (self.planner)(&validated, plans)?;
+        let result = self.writer.apply(&plan)?;
+        Ok((
+            Checkpoint::from(&result.checkpoint),
+            plan.script(),
+            result.statements_executed,
+            result.already_applied,
+        ))
+    }
+
+    fn classify_apply_error(&self, error: &io::Error) -> TargetApplyErrorKind {
+        postgresql_15::classify_apply_error(error)
+    }
+
+    fn resolve_commit_unknown(&mut self, tx: &ChangeTransaction) -> io::Result<CommitResolution> {
+        self.writer.resolve_commit_unknown(tx)
+    }
+}
+
+fn open_versioned_postgresql_sink(
+    endpoint: &Endpoint,
+    id: &str,
+    source_uuid: &str,
+    binding: &str,
+    planner: PostgresqlPlanner,
+) -> io::Result<Box<dyn Sink>> {
+    let config = postgresql_15::TargetConfig::new(
+        &endpoint.host,
+        &endpoint.database,
+        &endpoint.user,
+        &endpoint.password,
+    )
+    .with_port(endpoint.port);
+    let writer = postgresql_15::CheckpointWriter::open(&config, id, source_uuid, binding)?;
+    Ok(Box::new(VersionedPostgresqlSink { writer, planner }))
+}
+
 fn open_sink(
     endpoint: &Endpoint,
     id: &str,
@@ -345,9 +452,20 @@ fn open_sink(
                 binding,
             )?))
         }
-        AdapterKind::Postgresql16 | AdapterKind::Postgresql17 => Err(io::Error::other(
-            "PostgreSQL 16/17 are source-only Web adapters",
-        )),
+        AdapterKind::Postgresql16 => open_versioned_postgresql_sink(
+            endpoint,
+            id,
+            source_uuid,
+            binding,
+            postgresql_16::sql_with_plans,
+        ),
+        AdapterKind::Postgresql17 => open_versioned_postgresql_sink(
+            endpoint,
+            id,
+            source_uuid,
+            binding,
+            postgresql_17::sql_with_plans,
+        ),
     }
 }
 fn capture(

@@ -478,7 +478,7 @@ Adding a database version follows role-specific extension contracts. A Source ve
 
 ## Verification and Web registry decisions
 
-The local verification matrix covers every combination of the four currently supported connectors: MySQL 5.7, MySQL 8.0, MySQL 8.4, and PostgreSQL 15. This is a 4-by-4 matrix for ChangeEvent-to-Sink qualification and rendering. Live database tests cover the deployed and operationally important combinations rather than requiring every local combination to run against a live server.
+The local verification matrix covers every combination of MySQL 5.7/8.0/8.4 and PostgreSQL 15/16/17. This is a 6-by-6 matrix for ChangeEvent-to-Sink qualification and rendering, with a version-owned Source fixture and Sink manifest for every direction. Live database evidence is recorded per Source and Sink component, with missing suites reported as REQUIRES_LIVE; it does not imply that every Source-to-Sink pair ran against live servers.
 
 The standard test fixture is a canonical ChangeEvent fixture paired with the referenced source definitions. Each Sink renderer consumes that fixture independently, while source tests separately verify that native MySQL and PostgreSQL capture produces the same semantic model. JSON serialization and replay are tested as part of the canonical fixture path.
 
