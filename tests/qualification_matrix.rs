@@ -399,6 +399,27 @@ fn representative_value(logical_type: &LogicalType) -> Option<LogicalValue> {
     })
 }
 
+fn zero_date_fixture_evidence() -> Value {
+    let value = mysql_5_7::decode_temporal_components("date", 0, 0, 0, 0, 0, 0, 0)
+        .expect("MySQL zero date is captured as an invalid temporal value");
+    let LogicalValue::InvalidTemporal { kind, raw } = &value else {
+        panic!("zero date must not be normalized into a valid date")
+    };
+    assert_eq!(kind, "mysql.date");
+    assert_eq!(raw, "0000-00-00");
+    assert!(!LogicalType::Date.matches_value(&value));
+
+    json!({
+        "fixture": "mysql_zero_date",
+        "source_connector": "mysql_5_7",
+        "source_capture": "PASS",
+        "captured_logical_type": "invalid_temporal",
+        "captured_raw": raw,
+        "captured_value_digest": change_event::stable_digest(&value),
+        "date_write_validation": "BLOCKED"
+    })
+}
+
 // Native declarations are independently selected by role, never by pair.
 struct Case {
     id: &'static str,
@@ -434,6 +455,34 @@ fn cases() -> Vec<Case> {
         ),
         (
             "float",
+            "double",
+            "double precision",
+            "double",
+            "double precision",
+        ),
+        (
+            "float_nan",
+            "double",
+            "double precision",
+            "double",
+            "double precision",
+        ),
+        (
+            "float_positive_infinity",
+            "double",
+            "double precision",
+            "double",
+            "double precision",
+        ),
+        (
+            "float_negative_infinity",
+            "double",
+            "double precision",
+            "double",
+            "double precision",
+        ),
+        (
+            "float_negative_zero",
             "double",
             "double precision",
             "double",
@@ -590,13 +639,28 @@ fn run_case(
             return json!({"case":case.id,"qualification":"UNSUPPORTED/BLOCKED","status":"UNSUPPORTED","evidence_outcome":"UNSUPPORTED","phase":"source_mapping","code":"source_type.unqualified","offline":"PASS"});
         }
     };
-    let sample_value = if case.id == "decimal_range" {
-        Some(LogicalValue::Decimal {
+    let sample_value = match case.id {
+        "decimal_range" => Some(LogicalValue::Decimal {
             unscaled: "1000000".into(),
             scale: 6,
-        })
-    } else {
-        representative_value(&source_mapping.logical_type)
+        }),
+        "float_nan" => Some(LogicalValue::Float {
+            bits: 64,
+            ieee754_hex: "7ff8000000000000".into(),
+        }),
+        "float_positive_infinity" => Some(LogicalValue::Float {
+            bits: 64,
+            ieee754_hex: "7ff0000000000000".into(),
+        }),
+        "float_negative_infinity" => Some(LogicalValue::Float {
+            bits: 64,
+            ieee754_hex: "fff0000000000000".into(),
+        }),
+        "float_negative_zero" => Some(LogicalValue::Float {
+            bits: 64,
+            ieee754_hex: "8000000000000000".into(),
+        }),
+        _ => representative_value(&source_mapping.logical_type),
     };
     if let Some(value) = &sample_value {
         assert!(
@@ -792,7 +856,8 @@ fn run_case(
         }
     } else {
         match result.qualification {
-            QualificationLevel::Exact | QualificationLevel::RangeChecked => "Native Equivalent",
+            QualificationLevel::Exact => "Native Equivalent",
+            QualificationLevel::RangeChecked => "Value Preserved",
             QualificationLevel::ExplicitConversion
                 if result.plan.as_ref().is_some_and(|plan| {
                     plan.target
@@ -983,7 +1048,13 @@ fn six_by_six_qualification() {
             .flat_map(|h| h.join().expect("source qualification failed"))
             .collect()
     });
-    let report = json!({"schema":"cdc.qualification.v2","evidence_scope":"offline_fixture","live_semantics":"adapter_components_only","directions":directions});
+    let report = json!({
+        "schema":"cdc.qualification.v2",
+        "evidence_scope":"offline_fixture",
+        "live_semantics":"adapter_components_only",
+        "source_capture_edge_fixtures":[zero_date_fixture_evidence()],
+        "directions":directions
+    });
     assert_eq!(
         report["directions"].as_array().unwrap().len(),
         ids.len() * ids.len()
@@ -1011,6 +1082,10 @@ fn six_by_six_qualification() {
             direction["cases"].as_array().unwrap().len() as u64
         );
     }
+    assert_eq!(
+        report["source_capture_edge_fixtures"][0]["fixture"],
+        "mysql_zero_date"
+    );
     if let Some(path) = std::env::var_os("CDC_QUALIFICATION_REPORT") {
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
@@ -1026,6 +1101,14 @@ fn direction_report_records_value_preservation_as_its_own_outcome() {
             > 0,
         "the qualified recursive JSON carrier must be reported separately from explicit conversion"
     );
+    let integer_range = direction["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["case"] == "integer_range")
+        .expect("integer range evidence is present");
+    assert_eq!(integer_range["evidence_outcome"], "Value Preserved");
+    assert_eq!(integer_range["qualification"], "RANGE_CHECKED");
 }
 
 #[test]

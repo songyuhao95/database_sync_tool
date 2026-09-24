@@ -82,8 +82,10 @@ to live PASS.
 components, and the common transaction-recovery report to pass. Route
 smoke is reported in `route_smoke_qualified` and is required for a successful
 `-Live` run, but it is not counted as an additional source/sink direction.
-The report therefore does not claim that all 16 database-to-database links
-were run on real servers.
+The report therefore does not claim that all 36 database-to-database links
+were run on real servers. Float NaN, positive and negative infinity, signed
+zero, and MySQL zero-date capture are recorded as offline edge fixtures; the
+zero-date fixture is capture evidence and marks date writes as blocked.
 
 ## Adding a version
 
