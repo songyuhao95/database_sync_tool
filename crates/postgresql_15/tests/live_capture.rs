@@ -11,6 +11,9 @@ use std::{
     env,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[path = "../../../tests/support/postgres_env.rs"]
+mod postgres_env;
+
 fn test_port() -> u16 {
     env::var("PG_CDC_PORT")
         .map(|p| p.parse().expect("invalid PG_CDC_PORT"))
@@ -29,11 +32,18 @@ fn options(user: &str, password: &str) -> PgConnectOptions {
         .ssl_mode(PgSslMode::Prefer)
 }
 async fn read_n(c: Config, n: usize) -> Result<Vec<ValidatedTransaction>> {
+    read_n_for_version(c, n, 15).await
+}
+async fn read_n_for_version(
+    c: Config,
+    n: usize,
+    expected_major: u16,
+) -> Result<Vec<ValidatedTransaction>> {
     // A dedicated task allows a bounded test timeout without cancelling a live read future.
     let token = CancellationToken::new();
     let cancel = token.clone();
     let mut handle = tokio::spawn(async move {
-        let mut capture = postgresql_15::replication(c).await?;
+        let mut capture = postgresql_15::replication_for_version(c, expected_major).await?;
         let mut result = Vec::new();
         for _ in 0..n {
             result.push(capture.next_transaction(&cancel).await?);
@@ -59,16 +69,16 @@ fn datum<'a>(tx: &'a ValidatedTransaction, before: bool, name: &str) -> &'a Datu
     .unwrap();
     &image.iter().find(|c| c.name == name).unwrap().datum
 }
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PostgreSQL 15 test instance and explicit credentials"]
-async fn postgres15_capture_and_replay() -> Result<()> {
-    let password = env::var("PG_CDC_TEST_PASSWORD")?;
+async fn postgres_capture_and_replay_for_version(expected_major: u16) -> Result<()> {
+    let version = expected_major.to_string();
+    let password = env::var(postgres_env::env_name(&version, "TEST_PASSWORD"))?;
     let tag = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let schema = format!("cdc_pg15_test_{tag}");
-    let publication = format!("cdc_pub_{tag}");
-    let slot = format!("cdc_slot_{tag}");
-    let mut admin = PgConnection::connect_with(&options(
-        &test_user("PG_CDC_ADMIN_USER", "postgres"),
+    let schema = format!("cdc_pg{expected_major}_test_{tag}");
+    let publication = format!("cdc_pg{expected_major}_pub_{tag}");
+    let slot = format!("cdc_pg{expected_major}_slot_{tag}");
+    let mut admin = PgConnection::connect_with(&postgres_env::options(
+        &version,
+        &postgres_env::setting(&version, "ADMIN_USER", "postgres"),
         &password,
     ))
     .await?;
@@ -76,10 +86,12 @@ async fn postgres15_capture_and_replay() -> Result<()> {
         .execute(&mut admin)
         .await?;
     let mut c = Config::new(
-        env::var("PG_CDC_HOST").unwrap_or_else(|_| "192.168.0.10".into()),
-        test_port(),
+        postgres_env::setting(&version, "HOST", "192.168.0.10"),
+        postgres_env::setting(&version, "PORT", "54321")
+            .parse()
+            .expect("invalid PostgreSQL test port"),
         "CDC_test",
-        test_user("PG_CDC_READER_USER", "postgresql_reader"),
+        postgres_env::setting(&version, "READER_USER", "postgresql_reader"),
         &password,
         &publication,
         &slot,
@@ -88,14 +100,15 @@ async fn postgres15_capture_and_replay() -> Result<()> {
     let scenario_schema = schema.clone();
     let scenario_pub = publication.clone();
     let scenario_password = password.clone();
+    let scenario_version = version.clone();
     let result=tokio::spawn(async move {
-        let schema=scenario_schema; let publication=scenario_pub; let password=scenario_password;
-        let mut admin=PgConnection::connect_with(&options(&test_user("PG_CDC_ADMIN_USER","postgres"),&password)).await?;
-        let mut writer=PgConnection::connect_with(&options(&test_user("PG_CDC_WRITER_USER","postgresql_writer"),&password)).await?;
+        let schema=scenario_schema; let publication=scenario_pub; let password=scenario_password; let version=scenario_version;
+        let mut admin=PgConnection::connect_with(&postgres_env::options(&version,&postgres_env::setting(&version,"ADMIN_USER","postgres"),&password)).await?;
+        let mut writer=PgConnection::connect_with(&postgres_env::options(&version,&postgres_env::setting(&version,"WRITER_USER","postgresql_writer"),&password)).await?;
         test_sql(format!("CREATE TABLE {schema}.events (tenant integer NOT NULL,id bigint NOT NULL,message text NOT NULL,note text,amount numeric(30,6),flag boolean,bytes bytea,created_at timestamp(6),observed_at timestamptz(6),day date,token uuid,metadata jsonb,ratio double precision,PRIMARY KEY(id,tenant))")).execute(&mut admin).await?;
         test_sql(format!("ALTER TABLE {schema}.events ALTER COLUMN message SET STORAGE EXTERNAL")).execute(&mut admin).await?;
         test_sql(format!("CREATE PUBLICATION {publication} FOR TABLE {schema}.events")).execute(&mut admin).await?;
-        let first=postgresql_15::replication(c.clone()).await?;
+        let first=postgresql_15::replication_for_version(c.clone(),expected_major).await?;
         let source_id=first.source().id.clone(); let initial=first.start_lsn();
         drop(first);
         c.create_slot=false;c.expected_source_id=Some(source_id);
@@ -109,7 +122,8 @@ async fn postgres15_capture_and_replay() -> Result<()> {
         test_sql(format!("UPDATE {schema}.events SET note=NULL,flag=false,amount=-12.345678 WHERE id=1 AND tenant=7")).execute(&mut writer).await?;
         test_sql(format!("UPDATE {schema}.events SET id=9,tenant=8 WHERE id=1 AND tenant=7")).execute(&mut writer).await?;
         test_sql(format!("DELETE FROM {schema}.events WHERE id=9 AND tenant=8")).execute(&mut writer).await?;
-        let transactions=read_n(c.clone(),4).await?;
+        let transactions=read_n_for_version(c.clone(),4,expected_major).await?;
+        assert!(transactions[0].transaction().source.version.starts_with(&format!("{expected_major}.")));
         assert_eq!(transactions[0].transaction().changes.len(),2);
         assert!(matches!(datum(&transactions[0],false,"amount"),Datum::Value(LogicalValue::Decimal{unscaled,scale:6}) if unscaled=="12345678901234567890123456"));
         assert!(matches!(datum(&transactions[0],false,"message"),Datum::Value(LogicalValue::Text{text:Some(t),..}) if t.len()==131072));
@@ -135,9 +149,9 @@ async fn postgres15_capture_and_replay() -> Result<()> {
         if let Ok(dir)=env::var("CDC_TEST_ARTIFACT_DIR") {
             std::fs::create_dir_all(&dir)?;
             let json=transactions.iter().map(change_event::json).collect::<std::result::Result<Vec<_>,_>>()?.join("");
-            std::fs::write(std::path::Path::new(&dir).join(format!("postgresql_15-{schema}.change_event.jsonl")),json)?;
+            std::fs::write(std::path::Path::new(&dir).join(format!("postgresql_{expected_major}-{schema}.change_event.jsonl")),json)?;
         }
-        let replay=read_n(c.clone(),4).await?;
+        let replay=read_n_for_version(c.clone(),4,expected_major).await?;
         for (a,b) in transactions.iter().zip(&replay) {
             let json=change_event::json(a)?;
             assert_eq!(json,change_event::json(b)?);
@@ -146,18 +160,18 @@ async fn postgres15_capture_and_replay() -> Result<()> {
             reader.finish()?;
         }
         c.start_lsn=Some(transactions[1].transaction().commit_cursor.value.clone());
-        let resumed=read_n(c.clone(),2).await?;
+        let resumed=read_n_for_version(c.clone(),2,expected_major).await?;
         assert_eq!(resumed[0].transaction().id,transactions[2].transaction().id);
         let mut wrong=c.clone();wrong.expected_source_id=Some("postgresql:1:1:1".into());
-        assert!(postgresql_15::replication(wrong).await.is_err());
+        assert!(postgresql_15::replication_for_version(wrong, expected_major).await.is_err());
         let mut missing=c.clone();missing.slot.push_str("_missing");
-        assert!(postgresql_15::replication(missing).await.is_err());
+        assert!(postgresql_15::replication_for_version(missing, expected_major).await.is_err());
         let absent:bool=sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)").bind(missing_name(&c.slot)).fetch_one(&mut admin).await?;
         assert!(absent);
         // Reject unsupported table reset and keep the slot checkpoint unchanged.
         c.start_lsn=Some(transactions[3].transaction().commit_cursor.value.clone());
         test_sql(format!("TRUNCATE {schema}.events")).execute(&mut admin).await?;
-        let error=read_n(c.clone(),1).await.unwrap_err().to_string();
+        let error=read_n_for_version(c.clone(),1,expected_major).await.unwrap_err().to_string();
         assert!(error.contains("TRUNCATE"),"{error}");
         let final_lsn:Option<String>=sqlx::query_scalar("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1").bind(&c.slot).fetch_one(&mut admin).await?;
         assert_eq!(final_lsn.as_deref(),Some(initial.as_str()));
@@ -169,16 +183,16 @@ async fn postgres15_capture_and_replay() -> Result<()> {
         test_sql(format!("INSERT INTO {schema}.events(tenant,id,message,note) VALUES(7,3,repeat('abcdefgh',16384),'old note')")).execute(&mut writer).await?;
         test_sql(format!("UPDATE {schema}.events SET note='new note' WHERE id=3 AND tenant=7")).execute(&mut writer).await?;
         test_sql(format!("DELETE FROM {schema}.events WHERE id=3 AND tenant=7")).execute(&mut writer).await?;
-        let full=read_n(c.clone(),3).await?;
+        let full=read_n_for_version(c.clone(),3,expected_major).await?;
         assert!(matches!(datum(&full[1],true,"message"),Datum::Value(LogicalValue::Text{text:Some(t),..}) if t.len()==131072));
         assert!(matches!(datum(&full[1],true,"note"),Datum::Value(LogicalValue::Text{text:Some(t),..}) if t=="old note"));
         assert!(matches!(datum(&full[1],false,"note"),Datum::Value(LogicalValue::Text{text:Some(t),..}) if t=="new note"));
         assert!(matches!(datum(&full[2],true,"message"),Datum::Value(LogicalValue::Text{text:Some(t),..}) if t.len()==131072));
         let mut limited=c.clone();limited.max_transaction_bytes=1024;
-        assert!(read_n(limited,1).await.unwrap_err().to_string().contains("wire-size limit"));
+        assert!(read_n_for_version(limited,1,expected_major).await.unwrap_err().to_string().contains("wire-size limit"));
         let final_lsn:Option<String>=sqlx::query_scalar("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1").bind(&c.slot).fetch_one(&mut admin).await?;
         assert_eq!(final_lsn.as_deref(),Some(initial.as_str()));
-        println!("PASS: 7 committed transactions / 8 rows; DEFAULT and FULL identity; rollback excluded; exact numeric/JSONB, NULL, empty text, TOAST, composite key change; identical replay; explicit LSN resume; missing slot/source mismatch/TRUNCATE/size limit rejected; no WAL acknowledgement");
+        println!("PASS: PostgreSQL {expected_major} Source capture; 7 committed transactions / 8 rows; DEFAULT and FULL identity; rollback excluded; exact numeric/JSONB, NULL, empty text, TOAST, composite key change; identical replay; explicit LSN resume; missing slot/source mismatch/TRUNCATE/size limit rejected; no WAL acknowledgement");
 
         Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
     }).await;
@@ -196,6 +210,13 @@ async fn postgres15_capture_and_replay() -> Result<()> {
     result??;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires PostgreSQL 15 test instance and explicit credentials"]
+async fn postgres15_capture_and_replay() -> Result<()> {
+    postgres_capture_and_replay_for_version(15).await
+}
+
 fn missing_name(slot: &str) -> String {
     format!("{slot}_missing")
 }

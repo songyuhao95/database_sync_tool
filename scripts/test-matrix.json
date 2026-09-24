@@ -3,7 +3,9 @@
     "mysql_5_7",
     "mysql_8_0",
     "mysql_8_4",
-    "postgresql_15"
+    "postgresql_15",
+    "postgresql_16",
+    "postgresql_17"
   ],
   "unsupported": [],
   "suites": [
@@ -423,6 +425,50 @@
       "required_env": []
     },
     {
+      "id": "postgresql_16.types",
+      "mode": "Local",
+      "databases": ["postgresql_16"],
+      "stages": ["ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_16", "--test", "source_type_mapping",
+        "--", "--nocapture", "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "postgresql_16.sql",
+      "mode": "Local",
+      "databases": ["postgresql_16"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_16", "--test", "sink_adapter",
+        "--", "--nocapture", "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "postgresql_17.types",
+      "mode": "Local",
+      "databases": ["postgresql_17"],
+      "stages": ["ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_17", "--test", "source_type_mapping",
+        "--", "--nocapture", "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
+      "id": "postgresql_17.sql",
+      "mode": "Local",
+      "databases": ["postgresql_17"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_17", "--test", "sink_adapter",
+        "--", "--nocapture", "--test-threads=1"
+      ],
+      "required_env": []
+    },
+    {
       "id": "postgresql_15.apply",
       "mode": "Live",
       "category": "sink",
@@ -448,6 +494,7 @@
         "--test-threads=1"
       ],
       "required_env": [
+        "PG_CDC_HOST", "PG_CDC_PORT", "PG_CDC_ADMIN_USER", "PG_CDC_WRITER_USER",
         "PG_CDC_TEST_PASSWORD"
       ]
     },
@@ -540,7 +587,8 @@
         "--test-threads=1"
       ],
       "required_env": [
-        "PG_CDC_TEST_PASSWORD"
+        "PG_CDC_HOST", "PG_CDC_PORT", "PG_CDC_ADMIN_USER", "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER", "PG_CDC_TEST_PASSWORD"
       ]
     },
     {
@@ -569,6 +617,145 @@
         "--test-threads=1"
       ],
       "required_env": [
+        "PG_CDC_HOST", "PG_CDC_PORT", "PG_CDC_ADMIN_USER", "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER", "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_16.capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": ["postgresql_16"],
+      "stages": ["Read", "ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "postgresql_live_qualification",
+        "postgres16_public_source_capture", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST", "PG_CDC16_PORT", "PG_CDC16_ADMIN_USER", "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER", "PG_CDC16_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_17.capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": ["postgresql_17"],
+      "stages": ["Read", "ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "postgresql_live_qualification",
+        "postgres17_public_source_capture", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST", "PG_CDC17_PORT", "PG_CDC17_ADMIN_USER", "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER", "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_16.apply",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
+      "databases": ["postgresql_16"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "postgresql_live_qualification",
+        "postgres16_public_sink_apply", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST", "PG_CDC16_PORT", "PG_CDC16_ADMIN_USER", "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_17.apply",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
+      "databases": ["postgresql_17"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "postgresql_live_qualification",
+        "postgres17_public_sink_apply", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST", "PG_CDC17_PORT", "PG_CDC17_ADMIN_USER", "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_16.checkpoint",
+      "mode": "Live",
+      "category": "supporting_live",
+      "databases": ["postgresql_16"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_15", "--test", "sql_sink",
+        "postgres16_checkpoint_and_dml_commit_atomically_across_restart", "--", "--ignored",
+        "--exact", "--nocapture", "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST", "PG_CDC16_PORT", "PG_CDC16_ADMIN_USER", "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_17.checkpoint",
+      "mode": "Live",
+      "category": "supporting_live",
+      "databases": ["postgresql_17"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_15", "--test", "sql_sink",
+        "postgres17_checkpoint_and_dml_commit_atomically_across_restart", "--", "--ignored",
+        "--exact", "--nocapture", "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST", "PG_CDC17_PORT", "PG_CDC17_ADMIN_USER", "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_15.capability_invalidation",
+      "mode": "Live",
+      "category": "capability_invalidation",
+      "required_for_live_qualified": true,
+      "databases": [
+        "mysql_5_7",
+        "postgresql_15"
+      ],
+      "stages": [
+        "Read",
+        "Sql"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "tests::runtime_tests::live_postgresql15_target_schema_change_invalidates_saved_plan",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL57_PORT",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
         "PG_CDC_TEST_PASSWORD"
       ]
     },

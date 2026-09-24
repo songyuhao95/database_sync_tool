@@ -13,22 +13,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $PSScriptRoot
 $matrix = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'test-matrix.json') -Raw | ConvertFrom-Json
-$allowedConfigNames = @(
-    'CDC_MYSQL_HOST',
-    'CDC_MYSQL57_PORT',
-    'CDC_MYSQL80_PORT',
-    'CDC_MYSQL84_PORT',
-    'CDC_MYSQL_READER_USER',
-    'CDC_MYSQL_READER_PASSWORD',
-    'CDC_MYSQL_WRITER_USER',
-    'CDC_MYSQL_WRITER_PASSWORD',
-    'PG_CDC_HOST',
-    'PG_CDC_PORT',
-    'PG_CDC_ADMIN_USER',
-    'PG_CDC_READER_USER',
-    'PG_CDC_WRITER_USER',
-    'PG_CDC_TEST_PASSWORD'
-)
+$allowedConfigNames = @($matrix.suites.required_env | Select-Object -Unique)
 function Import-TestConfig {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -105,7 +90,7 @@ try {
         $importedConfigKeys = @(Import-TestConfig -Path $configPath)
     }
     $secrets = @(Get-ChildItem Env: | Where-Object {
-        $_.Name -match '^(CDC_MYSQL|PG_CDC)_.*PASSWORD$' -and $_.Value
+        $_.Name -match '^(CDC_MYSQL|PG_CDC(16|17)?)_.*PASSWORD$' -and $_.Value
     } | ForEach-Object { $_.Value })
     foreach ($suite in $selected) {
         $timer = [Diagnostics.Stopwatch]::StartNew()

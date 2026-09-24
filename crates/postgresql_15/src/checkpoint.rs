@@ -87,12 +87,22 @@ impl CheckpointWriter {
         source_uuid: &str,
         binding: &str,
     ) -> io::Result<Self> {
+        Self::open_for_version(config, task_id, source_uuid, binding, "15")
+    }
+
+    pub fn open_for_version(
+        config: &TargetConfig,
+        task_id: &str,
+        source_uuid: &str,
+        binding: &str,
+        target_version: &str,
+    ) -> io::Result<Self> {
         validate_identity(task_id, source_uuid, binding)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(io::Error::other)?;
-        let mut conn = runtime.block_on(sql::connect(config))?;
+        let mut conn = runtime.block_on(sql::connect_for_version(config, target_version))?;
         let (sink_uuid, checkpoint) = runtime.block_on(async {
             let mut tx = conn.begin().await.map_err(io::Error::other)?;
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('cdc.log_info.schema',0))")

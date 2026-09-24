@@ -320,7 +320,7 @@ fn live_web_mysql57_to_postgresql15_full_incremental_and_resume() {
         .unwrap();
     source
         .query_drop(format!(
-            "CREATE TABLE CDC_test.{table}(id INT UNSIGNED PRIMARY KEY,message VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL) ENGINE=InnoDB"
+            "CREATE TABLE CDC_test.{table}(id INT PRIMARY KEY,message VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL) ENGINE=InnoDB"
         ))
         .unwrap();
     source
@@ -352,13 +352,12 @@ fn live_web_mysql57_to_postgresql15_full_incremental_and_resume() {
                      CREATE SCHEMA IF NOT EXISTS cdc AUTHORIZATION {pg_writer};
                      GRANT USAGE,CREATE ON SCHEMA cdc TO {pg_writer};
                      GRANT CREATE ON DATABASE \"CDC_test\" TO {pg_writer};
-                     CREATE TABLE \"CDC_test\".\"{table}\"(id bigint PRIMARY KEY,message character varying(40) NOT NULL);
+                     CREATE TABLE \"CDC_test\".\"{table}\"(id integer PRIMARY KEY,message character varying(40) NOT NULL);
                      GRANT SELECT,INSERT,UPDATE,DELETE ON \"CDC_test\".\"{table}\" TO {pg_writer}"
                 ))))
                 .await
         })
         .unwrap();
-
     let (dir, store) = store();
     let admin = store.login("admin", "admin", None).unwrap().session.user.id;
     let mut source_input = instance_input();
@@ -432,7 +431,7 @@ fn live_web_mysql57_to_postgresql15_full_incremental_and_resume() {
     wait_for(&store, &task.id, |task| task.runtime.applied_rows == 2);
     let rows = pg_runtime
         .block_on(
-            sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(format!(
+            sqlx::query_as::<_, (i32, String)>(sqlx::AssertSqlSafe(format!(
                 "SELECT id,message FROM \"CDC_test\".\"{table}\" ORDER BY id"
             )))
             .fetch_all(&mut target),
@@ -460,4 +459,183 @@ fn live_web_mysql57_to_postgresql15_full_incremental_and_resume() {
         .unwrap();
     drop(store);
     drop(dir);
+}
+
+#[test]
+#[ignore = "requires live MySQL 5.7 and PostgreSQL 15; isolated table and local SQLite"]
+fn live_postgresql15_target_schema_change_invalidates_saved_plan() {
+    use crate::Error;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let table = format!("cap_inv_{nonce}");
+    let mysql_host = std::env::var("CDC_MYSQL_HOST").unwrap();
+    let mysql_port = std::env::var("CDC_MYSQL57_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let mysql_reader = std::env::var("CDC_MYSQL_READER_USER").unwrap();
+    let mysql_reader_password = std::env::var("CDC_MYSQL_READER_PASSWORD").unwrap();
+    let mysql_writer = std::env::var("CDC_MYSQL_WRITER_USER").unwrap();
+    let mysql_writer_password = std::env::var("CDC_MYSQL_WRITER_PASSWORD").unwrap();
+    let mut source = Conn::new(
+        OptsBuilder::new()
+            .ip_or_hostname(Some(mysql_host.clone()))
+            .tcp_port(mysql_port)
+            .user(Some(mysql_writer.clone()))
+            .pass(Some(mysql_writer_password.clone())),
+    )
+    .unwrap();
+    source
+        .query_drop("CREATE DATABASE IF NOT EXISTS CDC_test")
+        .unwrap();
+    source
+        .query_drop(format!(
+            "CREATE TABLE CDC_test.{table}(id INT PRIMARY KEY,message VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL) ENGINE=InnoDB"
+        ))
+        .unwrap();
+    source
+        .query_drop(format!("INSERT INTO CDC_test.{table} VALUES(1,'planned')"))
+        .unwrap();
+
+    let pg_host = std::env::var("PG_CDC_HOST").unwrap();
+    let pg_port = std::env::var("PG_CDC_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let pg_password = std::env::var("PG_CDC_TEST_PASSWORD").unwrap();
+    let pg_admin = std::env::var("PG_CDC_ADMIN_USER").unwrap();
+    let pg_reader = std::env::var("PG_CDC_READER_USER").unwrap();
+    let pg_writer = std::env::var("PG_CDC_WRITER_USER").unwrap();
+    let pg_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pg_options = PgConnectOptions::new()
+        .host(&pg_host)
+        .port(pg_port)
+        .database("CDC_test")
+        .username(&pg_admin)
+        .password(&pg_password)
+        .ssl_mode(PgSslMode::Prefer);
+    let mut target = pg_runtime
+        .block_on(PgConnection::connect_with(&pg_options))
+        .unwrap();
+    pg_runtime
+        .block_on(async {
+            target
+                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "CREATE SCHEMA IF NOT EXISTS \"CDC_test\" AUTHORIZATION \"{}\";
+                     GRANT USAGE ON SCHEMA \"CDC_test\" TO \"{}\";
+                     CREATE TABLE \"CDC_test\".\"{table}\"(id integer PRIMARY KEY,message character varying(40) NOT NULL);
+                     GRANT SELECT ON \"CDC_test\".\"{table}\" TO \"{}\";
+                     GRANT SELECT,INSERT,UPDATE,DELETE ON \"CDC_test\".\"{table}\" TO \"{}\"",
+                    pg_writer.replace('"', "\"\""),
+                    pg_reader.replace('"', "\"\""),
+                    pg_reader.replace('"', "\"\""),
+                    pg_writer.replace('"', "\"\"")
+                ))))
+                .await
+        })
+        .unwrap();
+
+    let (dir, store) = store();
+    let admin = store.login("admin", "admin", None).unwrap().session.user.id;
+    let mut source_input = instance_input();
+    source_input.name = "invalidation-mysql-source".into();
+    source_input.host = mysql_host;
+    source_input.port = mysql_port;
+    source_input.version = "5.7".into();
+    source_input.reader_username = mysql_reader;
+    source_input.reader_password = Some(mysql_reader_password);
+    source_input.writer_username = mysql_writer;
+    source_input.writer_password = Some(mysql_writer_password);
+    let source_instance = store.save_instance(admin, None, source_input).unwrap();
+
+    let mut sink_input = instance_input();
+    sink_input.name = "invalidation-postgresql-target".into();
+    sink_input.host = pg_host;
+    sink_input.port = pg_port;
+    sink_input.kind = "postgresql".into();
+    sink_input.version = "15".into();
+    sink_input.database = "CDC_test".into();
+    sink_input.reader_username = pg_reader;
+    sink_input.reader_password = Some(pg_password.clone());
+    sink_input.writer_username = pg_writer.clone();
+    sink_input.writer_password = Some(pg_password);
+    let sink_instance = store.save_instance(admin, None, sink_input).unwrap();
+
+    let task = store
+        .create_task(
+            admin,
+            TaskInput {
+                draft_id: None,
+                name: "live-target-plan-invalidation".into(),
+                source_id: source_instance.id,
+                sink_id: sink_instance.id,
+                source_database: String::new(),
+                sink_database: "CDC_test".into(),
+                source_revision: 1,
+                sink_revision: 1,
+                start_mode: "auto".into(),
+                mappings: vec![TableMapping {
+                    source_schema: "CDC_test".into(),
+                    source_table: table.clone(),
+                    sink_schema: "CDC_test".into(),
+                    sink_table: table.clone(),
+                    columns: vec!["id".into(), "message".into()],
+                    conversion_options: std::collections::BTreeMap::new(),
+                }],
+                confirmations: vec![],
+            },
+        )
+        .unwrap();
+    let initial_plan_is_valid = task.plan_status == "valid";
+    let initial_plan_count = task.plans.len();
+
+    pg_runtime
+        .block_on(async {
+            target
+                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "ALTER TABLE \"CDC_test\".\"{table}\" DROP COLUMN message"
+                ))))
+                .await
+        })
+        .unwrap();
+
+    let requalification_rejected = store.requalify_task(admin, &task.id, vec![]).is_err();
+    let status_after_requalification = store.task(&task.id).unwrap().plan_status;
+    let start_result = store.start_task(admin, task.id.clone());
+    let status_after_start = store.task(&task.id).unwrap().plan_status;
+    store.shutdown_tasks();
+
+    pg_runtime
+        .block_on(async {
+            target
+                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "DROP TABLE \"CDC_test\".\"{table}\""
+                ))))
+                .await
+        })
+        .unwrap();
+    source
+        .query_drop(format!("DROP TABLE CDC_test.{table}"))
+        .unwrap();
+    drop(store);
+    drop(dir);
+
+    assert!(initial_plan_is_valid, "initial task plan must be valid");
+    assert!(
+        initial_plan_count > 0,
+        "initial task plan must contain tables"
+    );
+    assert!(
+        requalification_rejected,
+        "schema change must make task requalification fail"
+    );
+    assert_eq!(status_after_requalification, "stale");
+    assert!(matches!(start_result, Err(Error::Conflict(_))));
+    assert_eq!(status_after_start, "stale");
 }

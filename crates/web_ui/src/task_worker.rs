@@ -399,6 +399,7 @@ fn open_versioned_postgresql_sink(
     source_uuid: &str,
     binding: &str,
     planner: PostgresqlPlanner,
+    target_version: &str,
 ) -> io::Result<Box<dyn Sink>> {
     let config = postgresql_15::TargetConfig::new(
         &endpoint.host,
@@ -407,7 +408,13 @@ fn open_versioned_postgresql_sink(
         &endpoint.password,
     )
     .with_port(endpoint.port);
-    let writer = postgresql_15::CheckpointWriter::open(&config, id, source_uuid, binding)?;
+    let writer = postgresql_15::CheckpointWriter::open_for_version(
+        &config,
+        id,
+        source_uuid,
+        binding,
+        target_version,
+    )?;
     Ok(Box::new(VersionedPostgresqlSink { writer, planner }))
 }
 
@@ -458,6 +465,7 @@ fn open_sink(
             source_uuid,
             binding,
             postgresql_16::sql_with_plans,
+            "16",
         ),
         AdapterKind::Postgresql17 => open_versioned_postgresql_sink(
             endpoint,
@@ -465,6 +473,7 @@ fn open_sink(
             source_uuid,
             binding,
             postgresql_17::sql_with_plans,
+            "17",
         ),
     }
 }

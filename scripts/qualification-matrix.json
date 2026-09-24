@@ -23,6 +23,7 @@
       {"database": "postgresql_17", "suite": "postgresql_17.apply"}
     ],
     "transaction_recovery": ["transaction_recovery.common"],
+    "capability_invalidation": ["postgresql_15.capability_invalidation"],
     "route_smoke": ["postgresql_15.capture_to_mysql", "postgresql_15.web_sink"]
   }
 }

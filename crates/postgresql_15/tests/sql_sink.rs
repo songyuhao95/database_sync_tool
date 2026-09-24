@@ -1,133 +1,19 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{
     ChangeTransaction, ColumnDatum, Datum, JsonEntry, JsonValue, LogicalValue, Operation,
-    RowChange, SinkAdapter as _, Source, SourceCursor, TargetCapabilityFailure, validate,
+    RowChange, SinkAdapter as _, Source, TargetCapabilityFailure, validate,
 };
 use postgresql_15::{SinkAdapter, TargetConfig, execute};
-use sqlx::{
-    Connection, PgConnection, Row,
-    postgres::{PgConnectOptions, PgSslMode},
-};
+use sqlx::{Connection, PgConnection, Row};
 use std::{
     env,
     time::{SystemTime, UNIX_EPOCH},
 };
+#[path = "../../../tests/support/postgres_env.rs"]
+mod postgres_env;
+#[path = "../../../tests/support/postgres_sink_fixtures.rs"]
+mod sink_fixtures;
 
-fn cursor(value: &str) -> SourceCursor {
-    SourceCursor {
-        format: "postgresql.lsn.v1".into(),
-        value: value.into(),
-        display: value.into(),
-    }
-}
-
-fn column(ordinal: usize, name: &str, key: Option<usize>, datum: Datum) -> ColumnDatum {
-    ColumnDatum {
-        ordinal,
-        name: name.into(),
-        native_type: if name == "id" { "bigint" } else { "text" }.into(),
-        primary_key_ordinal: key,
-        generated: false,
-        collation: None,
-        datum,
-    }
-}
-
-fn id(value: &str) -> ColumnDatum {
-    column(
-        0,
-        "id",
-        Some(0),
-        Datum::Value(LogicalValue::Integer {
-            signed: true,
-            bits: 64,
-            value: value.into(),
-        }),
-    )
-}
-
-fn message(datum: Datum) -> ColumnDatum {
-    column(1, "message", None, datum)
-}
-
-fn text(value: &str) -> Datum {
-    Datum::Value(LogicalValue::Text {
-        charset: "UTF8".into(),
-        bytes_base64url: URL_SAFE_NO_PAD.encode(value),
-        text: Some(value.into()),
-    })
-}
-
-fn fixture() -> change_event::ValidatedTransaction {
-    validate(ChangeTransaction {
-        source: Source {
-            kind: "postgresql".into(),
-            version: "15.14".into(),
-            id: "postgresql:1:1:1".into(),
-        },
-        id: "pg:42:0/16B6C80".into(),
-        begin_cursor: cursor("0/16B6C50"),
-        commit_cursor: cursor("0/16B6C80"),
-        changes: vec![
-            RowChange {
-                database: Some("CDC_test".into()),
-                schema: "public".into(),
-                table: "cdc_contract".into(),
-                operation: Operation::Insert,
-                source_cursor: cursor("0/16B6C80"),
-                source_timestamp: 1_700_000_000,
-                schema_basis: "pgoutput+catalog:1".into(),
-                before: None,
-                after: Some(vec![id("1"), message(text("中文'\\"))]),
-            },
-            RowChange {
-                database: Some("CDC_test".into()),
-                schema: "public".into(),
-                table: "cdc_contract".into(),
-                operation: Operation::Update,
-                source_cursor: cursor("0/16B6C80"),
-                source_timestamp: 1_700_000_001,
-                schema_basis: "pgoutput+catalog:1".into(),
-                before: Some(vec![id("1"), message(Datum::Unavailable)]),
-                after: Some(vec![id("2"), message(Datum::Unchanged)]),
-            },
-            RowChange {
-                database: Some("CDC_test".into()),
-                schema: "public".into(),
-                table: "cdc_contract".into(),
-                operation: Operation::Delete,
-                source_cursor: cursor("0/16B6C80"),
-                source_timestamp: 1_700_000_002,
-                schema_basis: "pgoutput+catalog:1".into(),
-                before: Some(vec![id("2"), message(Datum::Unavailable)]),
-                after: None,
-            },
-        ],
-    })
-    .unwrap()
-}
-
-fn mysql_fixture(version: &str) -> change_event::ValidatedTransaction {
-    let mut transaction = fixture().transaction().clone();
-    transaction.source = Source {
-        kind: "mysql".into(),
-        version: version.into(),
-        id: "430c326c-ab91-11f1-a23b-0242ac160004".into(),
-    };
-    transaction.begin_cursor = mysql_cursor(100);
-    transaction.commit_cursor = mysql_cursor(200);
-    for (index, change) in transaction.changes.iter_mut().enumerate() {
-        change.source_cursor = mysql_cursor(110 + index as u32 * 10);
-        change.schema_basis = "mysql canonical fixture".into();
-    }
-    validate(transaction).unwrap()
-}
-
-fn postgres_fixture(version: &str) -> change_event::ValidatedTransaction {
-    let mut transaction = fixture().transaction().clone();
-    transaction.source.version = version.into();
-    validate(transaction).unwrap()
-}
+use sink_fixtures::{column, cursor, fixture, mysql_cursor, mysql_fixture, postgres_fixture, text};
 
 #[test]
 fn postgres15_sink_adapter_accepts_mysql_and_postgres_events() {
@@ -213,16 +99,6 @@ UPDATE \"public\".\"cdc_contract\" SET \"id\" = 2 WHERE \"id\" = 1;\n\
 DELETE FROM \"public\".\"cdc_contract\" WHERE \"id\" = 2;\n\
 COMMIT;\n"
     );
-}
-
-fn mysql_cursor(position: u32) -> SourceCursor {
-    let mut bytes = b"mysql-bin.000001\0".to_vec();
-    bytes.extend_from_slice(&position.to_be_bytes());
-    SourceCursor {
-        format: "mysql.binlog.file-position.v1".into(),
-        value: URL_SAFE_NO_PAD.encode(bytes),
-        display: format!("mysql-bin.000001:{position}"),
-    }
 }
 
 #[test]
@@ -434,20 +310,6 @@ fn postgres15_preserves_float_sign_and_rejects_timestamp_precision_loss() {
     assert!(postgresql_15::sql(&validate(nanoseconds).unwrap()).is_err());
 }
 
-fn setting(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.into())
-}
-
-fn options(user: &str, password: &str) -> PgConnectOptions {
-    PgConnectOptions::new()
-        .host(&setting("PG_CDC_HOST", "192.168.0.10"))
-        .port(setting("PG_CDC_PORT", "54321").parse().unwrap())
-        .database("CDC_test")
-        .username(user)
-        .password(password)
-        .ssl_mode(PgSslMode::Prefer)
-}
-
 fn transaction_with_changes(
     validated: &change_event::ValidatedTransaction,
     indexes: &[usize],
@@ -460,15 +322,21 @@ fn transaction_with_changes(
     validate(transaction).unwrap()
 }
 
-#[tokio::test]
-#[ignore = "requires the configured PostgreSQL 15 test database"]
-async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
-    let password = env::var("PG_CDC_TEST_PASSWORD")?;
-    let writer = setting("PG_CDC_WRITER_USER", "postgresql_writer");
-    let admin = setting("PG_CDC_ADMIN_USER", "postgres");
+async fn writes_sql_transaction_for_version(
+    target_version: &'static str,
+) -> postgresql_15::Result<()> {
+    let password = env::var(postgres_env::env_name(target_version, "TEST_PASSWORD"))?;
+    let writer = postgres_env::setting(target_version, "WRITER_USER", "postgresql_writer");
+    let admin = postgres_env::setting(target_version, "ADMIN_USER", "postgres");
     let tag = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let table = format!("cdc_sink_{tag}");
-    let mut setup = PgConnection::connect_with(&options(&admin, &password)).await?;
+    let table = format!("cdc_sink_pg{target_version}_{tag}");
+    let mut setup =
+        PgConnection::connect_with(&postgres_env::options(target_version, &admin, &password))
+            .await?;
+    let server_version: String = sqlx::query_scalar("SHOW server_version")
+        .fetch_one(&mut setup)
+        .await?;
+    assert_eq!(server_version.split('.').next(), Some(target_version));
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE public.\"{table}\" (
             id bigint PRIMARY KEY,
@@ -490,12 +358,17 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
         let writer = writer.clone();
         async move {
             let config = TargetConfig::new(
-                setting("PG_CDC_HOST", "192.168.0.10"),
+                postgres_env::setting(&target_version, "HOST", "192.168.0.10"),
                 "CDC_test",
                 writer,
                 password,
             )
-            .with_port(setting("PG_CDC_PORT", "54321").parse().unwrap());
+            .with_port(
+                postgres_env::setting(&target_version, "PORT", "54321")
+                    .parse()
+                    .expect("invalid PostgreSQL test port"),
+            );
+            let sink = SinkAdapter::new_for_version(target_version);
             for source_fixture in [
                 fixture(),
                 postgres_fixture("16.10"),
@@ -512,13 +385,14 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
 
                 let insert = transaction_with_changes(&full, &[0]);
                 assert_eq!(
-                    execute(&config, &SinkAdapter::new().plan(&insert)?)
+                    execute(&config, &sink.plan(&insert)?)
                         .await?
                         .statements_executed,
                     1
                 );
-                let mut verify = PgConnection::connect_with(&options(
-                    &setting("PG_CDC_ADMIN_USER", "postgres"),
+                let mut verify = PgConnection::connect_with(&postgres_env::options(
+                    &target_version,
+                    &postgres_env::setting(&target_version, "ADMIN_USER", "postgres"),
                     &config.password,
                 ))
                 .await?;
@@ -542,7 +416,7 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
                     }
                 }
                 let keyless = validate(keyless)?;
-                assert!(SinkAdapter::new().plan(&keyless).is_err());
+                assert!(sink.plan(&keyless).is_err());
                 let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT count(*) FROM public.\"{table}\""
                 )))
@@ -552,7 +426,7 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
 
                 let update = transaction_with_changes(&full, &[1]);
                 assert_eq!(
-                    execute(&config, &SinkAdapter::new().plan(&update)?)
+                    execute(&config, &sink.plan(&update)?)
                         .await?
                         .statements_executed,
                     1
@@ -571,7 +445,7 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
 
                 let delete = transaction_with_changes(&full, &[2]);
                 assert_eq!(
-                    execute(&config, &SinkAdapter::new().plan(&delete)?)
+                    execute(&config, &sink.plan(&delete)?)
                         .await?
                         .statements_executed,
                     1
@@ -584,11 +458,7 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
                 assert_eq!(count, 0);
 
                 let duplicate = transaction_with_changes(&full, &[0, 0]);
-                assert!(
-                    execute(&config, &SinkAdapter::new().plan(&duplicate)?)
-                        .await
-                        .is_err()
-                );
+                assert!(execute(&config, &sink.plan(&duplicate)?).await.is_err());
                 let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT count(*) FROM public.\"{table}\""
                 )))
@@ -615,24 +485,41 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires the configured PostgreSQL 15 test database"]
-async fn postgres15_checkpoint_and_dml_commit_atomically_across_restart()
--> postgresql_15::Result<()> {
-    let password = env::var("PG_CDC_TEST_PASSWORD")?;
-    let writer_name = setting("PG_CDC_WRITER_USER", "postgresql_writer");
-    let admin_name = setting("PG_CDC_ADMIN_USER", "postgres");
+async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
+    writes_sql_transaction_for_version("15").await
+}
+
+async fn checkpoint_and_dml_for_version(target_version: &'static str) -> postgresql_15::Result<()> {
+    let password = env::var(postgres_env::env_name(target_version, "TEST_PASSWORD"))?;
+    let writer_name = postgres_env::setting(target_version, "WRITER_USER", "postgresql_writer");
+    let admin_name = postgres_env::setting(target_version, "ADMIN_USER", "postgres");
     let tag = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let table = format!("cdc_checkpoint_{tag}");
-    let task = format!("test_checkpoint_{tag}");
+    let table = format!("cdc_checkpoint_pg{target_version}_{tag}");
+    let task = format!("test_checkpoint_pg{target_version}_{tag}");
     let source_uuid = "postgresql:123456:1:16384:Q0RDX3Rlc3Q";
     let binding = "a".repeat(64);
     let config = TargetConfig::new(
-        setting("PG_CDC_HOST", "192.168.0.10"),
+        postgres_env::setting(target_version, "HOST", "192.168.0.10"),
         "CDC_test",
         writer_name.clone(),
         password.clone(),
     )
-    .with_port(setting("PG_CDC_PORT", "54321").parse().unwrap());
-    let mut admin = PgConnection::connect_with(&options(&admin_name, &password)).await?;
+    .with_port(
+        postgres_env::setting(target_version, "PORT", "54321")
+            .parse()
+            .expect("invalid PostgreSQL test port"),
+    );
+    let sink = SinkAdapter::new_for_version(target_version);
+    let mut admin = PgConnection::connect_with(&postgres_env::options(
+        target_version,
+        &admin_name,
+        &password,
+    ))
+    .await?;
+    let server_version: String = sqlx::query_scalar("SHOW server_version")
+        .fetch_one(&mut admin)
+        .await?;
+    assert_eq!(server_version.split('.').next(), Some(target_version));
 
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE public.\"{table}\" (id bigint PRIMARY KEY, message text NOT NULL)"
@@ -689,16 +576,17 @@ async fn postgres15_checkpoint_and_dml_commit_atomically_across_restart()
         let task = task.clone();
         let binding = binding.clone();
         move || -> postgresql_15::Result<u64> {
-            let mut checkpoint =
-                postgresql_15::CheckpointWriter::open(&config, &task, source_uuid, &binding)?;
+            let mut checkpoint = postgresql_15::CheckpointWriter::open_for_version(
+                &config,
+                &task,
+                source_uuid,
+                &binding,
+                target_version,
+            )?;
             let initialized =
                 checkpoint.initialize("postgresql_lsn", "0/16B6C50", initial_position, None)?;
             assert_eq!(initialized.position, initial_position);
-            assert!(
-                checkpoint
-                    .apply(&SinkAdapter::new().plan(&duplicate)?)
-                    .is_err()
-            );
+            assert!(checkpoint.apply(&sink.plan(&duplicate)?).is_err());
             Ok(checkpoint.checkpoint().unwrap().position)
         }
     })
@@ -720,33 +608,40 @@ async fn postgres15_checkpoint_and_dml_commit_atomically_across_restart()
         let task = task.clone();
         let binding = binding.clone();
         move || -> postgresql_15::Result<(u64, u64)> {
-            let mut checkpoint =
-                postgresql_15::CheckpointWriter::open(&config, &task, source_uuid, &binding)?;
-            let applied = checkpoint.apply(&SinkAdapter::new().plan(&insert)?)?;
+            let mut checkpoint = postgresql_15::CheckpointWriter::open_for_version(
+                &config,
+                &task,
+                source_uuid,
+                &binding,
+                target_version,
+            )?;
+            let applied = checkpoint.apply(&sink.plan(&insert)?)?;
             assert_eq!(applied.statements_executed, 1);
             assert_eq!(applied.checkpoint.applied_rows, 1);
             drop(checkpoint);
 
-            let mut restarted =
-                postgresql_15::CheckpointWriter::open(&config, &task, source_uuid, &binding)?;
-            assert!(
-                restarted
-                    .apply(&SinkAdapter::new().plan(&insert)?)?
-                    .already_applied
-            );
-            let deleted = restarted.apply(&SinkAdapter::new().plan(&delete)?)?;
+            let mut restarted = postgresql_15::CheckpointWriter::open_for_version(
+                &config,
+                &task,
+                source_uuid,
+                &binding,
+                target_version,
+            )?;
+            assert!(restarted.apply(&sink.plan(&insert)?)?.already_applied);
+            let deleted = restarted.apply(&sink.plan(&delete)?)?;
             assert_eq!(deleted.statements_executed, 1);
             let position = deleted.checkpoint.position;
             drop(restarted);
 
-            let mut recovered =
-                postgresql_15::CheckpointWriter::open(&config, &task, source_uuid, &binding)?;
+            let mut recovered = postgresql_15::CheckpointWriter::open_for_version(
+                &config,
+                &task,
+                source_uuid,
+                &binding,
+                target_version,
+            )?;
             assert_eq!(recovered.checkpoint().unwrap().applied_rows, 2);
-            assert!(
-                recovered
-                    .apply(&SinkAdapter::new().plan(&delete)?)?
-                    .already_applied
-            );
+            assert!(recovered.apply(&sink.plan(&delete)?)?.already_applied);
             Ok((position, recovered.checkpoint().unwrap().applied_rows))
         }
     })
@@ -771,4 +666,25 @@ async fn postgres15_checkpoint_and_dml_commit_atomically_across_restart()
     .execute(&mut admin)
     .await?;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 15 test database"]
+async fn postgres15_checkpoint_and_dml_commit_atomically_across_restart()
+-> postgresql_15::Result<()> {
+    checkpoint_and_dml_for_version("15").await
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 16 test database"]
+async fn postgres16_checkpoint_and_dml_commit_atomically_across_restart()
+-> postgresql_15::Result<()> {
+    checkpoint_and_dml_for_version("16").await
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 17 test database"]
+async fn postgres17_checkpoint_and_dml_commit_atomically_across_restart()
+-> postgresql_15::Result<()> {
+    checkpoint_and_dml_for_version("17").await
 }

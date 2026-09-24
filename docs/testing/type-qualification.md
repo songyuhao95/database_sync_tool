@@ -8,11 +8,16 @@ SourceTypeMapping and Sink manifests; neither role falls back to PostgreSQL
 
 Live qualification is deliberately not a 36-route database-to-database
 matrix. It reports six independent Source → ChangeEvent components, six
-ChangeEvent → Sink components, and one common transaction-recovery
-qualification. The current live suite registers MySQL 5.7/8.0/8.4 and
-PostgreSQL 15; PostgreSQL 16/17 remain `REQUIRES_LIVE` until their live suites
-are registered and run. Representative end-to-end route smoke tests are
-reported separately.
+ChangeEvent → Sink components, one common transaction-recovery qualification,
+and live target-capability invalidation evidence. The live suite registers
+Source and Sink adapter tests for MySQL 5.7/8.0/8.4 and PostgreSQL 15/16/17.
+PostgreSQL Source suites capture and replay from an actual server of the named
+major version. PostgreSQL Sink suites apply every one of the six canonical
+source fixtures to an actual server of that version, then verify DML and
+atomic checkpoint behavior across restart. A separate MySQL 5.7 → PostgreSQL
+15 Web test changes a temporary target table after saving its plan, verifies
+requalification marks the plan stale, and verifies task start is blocked.
+Representative end-to-end route smoke tests are reported separately.
 
 Run from the repository root:
 
@@ -23,12 +28,19 @@ Run from the repository root:
 ```
 
 The default does not read credentials or connect to databases. `-Live` opts in
-to the existing DML capture/apply/checkpoint and route-smoke tests, using
-process environment variables or an explicitly supplied `KEY=VALUE`
-configuration. Missing configuration produces `REQUIRES_LIVE`. A configured
-test that fails, or a filter executing zero tests, fails the run. Live tests
-prepare their own isolated test objects; no production schema-evolution
-feature is introduced.
+to the DML capture/apply/checkpoint, capability-invalidation, and route-smoke
+tests, using process environment variables or an explicitly supplied
+`KEY=VALUE` configuration. Missing configuration produces `REQUIRES_LIVE`. A
+configured test that fails, or a filter executing zero tests, fails the run.
+Live tests prepare and alter only their own isolated test objects; no
+production schema-evolution feature is introduced.
+
+PostgreSQL 15 uses `PG_CDC_*`; PostgreSQL 16 and 17 use independent
+`PG_CDC16_*` and `PG_CDC17_*` values (`HOST`, `PORT`, `ADMIN_USER`,
+`READER_USER` for Source, `WRITER_USER`, and `TEST_PASSWORD`). The newer major
+versions never borrow PostgreSQL 15 connection settings, and server-version
+assertions reject a misrouted endpoint. Without those settings the live
+component status remains `REQUIRES_LIVE`.
 
 The console contains only an ordered final matrix, missing-direction count,
 and report location. Cargo output stays in per-suite logs. `summary.json`
@@ -38,10 +50,11 @@ missing/new directions, a stable summary digest, a password scan result, and
 the four separate live report sections. Each direction separates Native
 Equivalent, Value Preserved, Explicit Conversion, `UNSUPPORTED`, `BLOCKED`,
 `REQUIRES_LIVE`, and `FAIL` evidence.
-`live-source.json`, `live-sink.json`, `transaction-recovery.json`, and
-`route-smoke.json` retain the structured component reports. `types.json` and
-`recovery.json` retain the underlying offline evidence. Reports contain no
-credentials or fixture row values. Output goes to a unique directory under
+`live-source.json`, `live-sink.json`, `transaction-recovery.json`,
+`live-capability-invalidation.json`, and `route-smoke.json` retain the
+structured component reports. `types.json` and `recovery.json` retain the
+underlying offline evidence. Reports contain no credentials or fixture row
+values. Output goes to a unique directory under
 `target/qualification`; use `-OutputDirectory` to choose another location.
 
 ## Reading results
@@ -79,9 +92,10 @@ that database-to-database pair. Missing component evidence is
 to live PASS.
 
 `live_qualified=true` requires all six Source components, all six Sink
-components, and the common transaction-recovery report to pass. Route
-smoke is reported in `route_smoke_qualified` and is required for a successful
-`-Live` run, but it is not counted as an additional source/sink direction.
+components, the common transaction-recovery report, and capability
+invalidation evidence to pass. Route smoke is reported in
+`route_smoke_qualified` and is required for a successful `-Live` run, but it
+is not counted as an additional source/sink direction.
 The report therefore does not claim that all 36 database-to-database links
 were run on real servers. Float NaN, positive and negative infinity, signed
 zero, and MySQL zero-date capture are recorded as offline edge fixtures; the

@@ -2,8 +2,9 @@
 //!
 //! PostgreSQL 17 shares the public value semantics of the PostgreSQL 15
 //! mapping, but its connector identity and evidence are version-specific.
-//! Capture/runtime support remains owned by a versioned worker and is not
-//! implied by this mapping-only crate.
+//! Replication uses the shared protocol runtime with an explicit PostgreSQL 17
+//! server-version check; the live qualification suite asserts the connected
+//! server major before it records capture evidence.
 
 use change_event::{ServerBuildIdentity, SourceTypeMapping};
 pub use postgresql_15::CAPABILITY_MANIFEST_17 as CAPABILITY_MANIFEST;

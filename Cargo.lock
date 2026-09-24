@@ -304,6 +304,8 @@ dependencies = [
  "postgresql_16",
  "postgresql_17",
  "serde_json",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

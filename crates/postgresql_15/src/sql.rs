@@ -1542,10 +1542,6 @@ pub async fn execute_for_version(
     })
 }
 
-pub(crate) async fn connect(config: &TargetConfig) -> io::Result<PgConnection> {
-    connect_for_version(config, POSTGRESQL_15_VERSION).await
-}
-
 pub(crate) async fn connect_for_version(
     config: &TargetConfig,
     target_version: &str,
@@ -1669,6 +1665,13 @@ pub async fn probe_target_for_version(
     } else {
         CapabilityProbeStatus::Detected
     };
+    let target_build = ServerBuildIdentity::new(
+        "postgresql",
+        "community",
+        server_version.clone(),
+        format!("postgres-{server_version_num}"),
+    );
+    let manifest = crate::compatibility_manifest_for_version(target_build.clone(), target_version);
     let capability_identity = if spatial_target {
         let spatial_kind = if native_lower.contains("geography") {
             "geography"
@@ -1679,16 +1682,35 @@ pub async fn probe_target_for_version(
     } else {
         format!("target_type:{type_schema}.{native_type}")
     };
-    let mut capability = CapabilityProbeEntry::new(capability_identity, type_status)
-        .with_version(server_version.clone())
-        .with_evidence_digest(change_event::stable_digest(&(
-            target_version,
-            &native_type,
-            type_oid,
-            typmod,
-        )));
+    let mut capabilities = vec![
+        CapabilityProbeEntry::new(capability_identity, type_status)
+            .with_version(server_version.clone())
+            .with_evidence_digest(change_event::stable_digest(&(
+                target_version,
+                &native_type,
+                type_oid,
+                typmod,
+            ))),
+    ];
+    capabilities.extend(
+        manifest
+            .capabilities
+            .iter()
+            .filter(|entry| entry.target.native_type.eq_ignore_ascii_case(&native_type))
+            .map(|entry| {
+                CapabilityProbeEntry::new(entry.code.clone(), type_status)
+                    .with_version(server_version.clone())
+                    .with_evidence_digest(change_event::stable_digest(&(
+                        target_version,
+                        &native_type,
+                        type_oid,
+                        typmod,
+                        &entry.rule.evidence_digest,
+                    )))
+            }),
+    );
     if spatial_target && has_postgis {
-        capability.status = CapabilityProbeStatus::Qualified;
+        capabilities[0].status = CapabilityProbeStatus::Qualified;
     }
     let definition_fingerprint = change_event::stable_digest(&(
         schema,
@@ -1711,19 +1733,13 @@ pub async fn probe_target_for_version(
             ("standard_conforming_strings", standard_conforming_strings),
         ],
     );
-    let target_build = ServerBuildIdentity::new(
-        "postgresql",
-        "community",
-        server_version.clone(),
-        format!("postgres-{server_version_num}"),
-    );
     Ok(TargetCapabilityProbe::new(
         target_build,
         &config.database,
         table,
         column,
         metadata,
-        [capability],
+        capabilities,
         extensions,
         session,
     ))

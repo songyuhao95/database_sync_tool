@@ -24,9 +24,10 @@ $recoveryPath = Join-Path $out 'recovery.json'
 $sourcePath = Join-Path $out 'live-source.json'
 $sinkPath = Join-Path $out 'live-sink.json'
 $transactionRecoveryPath = Join-Path $out 'transaction-recovery.json'
+$capabilityInvalidationPath = Join-Path $out 'live-capability-invalidation.json'
 $routePath = Join-Path $out 'route-smoke.json'
 $summaryPath = Join-Path $out 'summary.json'
-foreach ($path in @($typePath, $recoveryPath, $sourcePath, $sinkPath, $transactionRecoveryPath, $routePath, $summaryPath)) {
+foreach ($path in @($typePath, $recoveryPath, $sourcePath, $sinkPath, $transactionRecoveryPath, $capabilityInvalidationPath, $routePath, $summaryPath)) {
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
 }
 
@@ -54,8 +55,6 @@ function Add-DatabaseEnvironment([object]$Suite) {
         if ([string]$Suite.category -eq 'source') {
             $required += 'CDC_MYSQL_READER_USER'
         }
-    } elseif ([string]$Suite.mode -eq 'Live') {
-        $required += @('PG_CDC_HOST', 'PG_CDC_PORT', 'PG_CDC_ADMIN_USER', 'PG_CDC_READER_USER', 'PG_CDC_WRITER_USER')
     }
     return @($required | Select-Object -Unique)
 }
@@ -184,8 +183,12 @@ if ($roster.Count -ne 6 -or @($roster | Select-Object -Unique).Count -ne 6) {
 }
 $sourceSpecs = @($config.live_qualification.sources)
 $sinkSpecs = @($config.live_qualification.sinks)
+$capabilityInvalidationSpecs = @($config.live_qualification.capability_invalidation)
 if ($sourceSpecs.Count -ne 6 -or $sinkSpecs.Count -ne 6) {
     throw 'live_qualification must declare exactly six source and six sink components.'
+}
+if ($capabilityInvalidationSpecs.Count -lt 1) {
+    throw 'live_qualification must register at least one capability invalidation suite.'
 }
 $sourceIds = @($sourceSpecs | ForEach-Object { [string]$_.database })
 $sinkIds = @($sinkSpecs | ForEach-Object { [string]$_.database })
@@ -199,6 +202,14 @@ if ((@($sourceSpecs | ForEach-Object { $_.database }) -join ',') -ne ($roster -j
 }
 
 $suiteDefinitions = @($legacy.suites)
+foreach ($suiteId in $capabilityInvalidationSpecs) {
+    $suite = $suiteDefinitions | Where-Object { $_.id -eq $suiteId } | Select-Object -First 1
+    if ($null -eq $suite -or [string]$suite.mode -ne 'Live' -or
+        [string]$suite.category -ne 'capability_invalidation' -or
+        -not [bool]$suite.required_for_live_qualified) {
+        throw "Capability invalidation suite $suiteId must be registered as live capability_invalidation."
+    }
+}
 foreach ($sinkSpec in $sinkSpecs) {
     $sinkSuite = $suiteDefinitions | Where-Object { $_.id -eq $sinkSpec.suite } | Select-Object -First 1
     if ($null -ne $sinkSuite -and
@@ -211,10 +222,7 @@ foreach ($sinkSpec in $sinkSpecs) {
 Push-Location $root
 try {
     if ($Live -and $ConfigFile) {
-        $allowed = @($legacy.suites.required_env | Select-Object -Unique) + @(
-            'CDC_MYSQL_READER_USER', 'CDC_MYSQL_WRITER_USER', 'PG_CDC_ADMIN_USER',
-            'PG_CDC_READER_USER', 'PG_CDC_WRITER_USER'
-        )
+        $allowed = @($legacy.suites.required_env | Select-Object -Unique)
         $seen = @{}
         foreach ($line in [IO.File]::ReadAllLines([IO.Path]::GetFullPath($ConfigFile))) {
             if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) { continue }
@@ -231,7 +239,7 @@ try {
         }
     }
     $secrets = @(Get-ChildItem Env: |
-        Where-Object { $_.Name -match '^(CDC_MYSQL|PG_CDC)_.*PASSWORD$' -and $_.Value } |
+        Where-Object { $_.Name -match '^(CDC_MYSQL|PG_CDC(16|17)?)_.*PASSWORD$' -and $_.Value } |
         ForEach-Object { $_.Value })
     Set-RunEnvironment 'CDC_QUALIFICATION_REPORT' $typePath
     Set-RunEnvironment 'CDC_QUALIFICATION_RECOVERY_REPORT' $recoveryPath
@@ -401,6 +409,19 @@ try {
             evidence_scope = 'common_transaction_recovery'
         }
     })
+    $capabilityInvalidation = @($capabilityInvalidationSpecs | ForEach-Object {
+        $suiteId = $_
+        $result = Get-SuiteResult $suiteId
+        $suite = $suiteDefinitions | Where-Object { $_.id -eq $suiteId } | Select-Object -First 1
+        [ordered]@{
+            suite = $suiteId
+            databases = @($suite.databases)
+            status = if ($null -ne $result) { $result.status } else { 'REQUIRES_LIVE' }
+            log = if ($null -ne $result) { $result.log } else { $null }
+            reason = if ($null -ne $result) { $null } else { 'live_suite_not_registered' }
+            evidence_scope = 'live_capability_invalidation'
+        }
+    })
     $routeSmoke = @($config.live_qualification.route_smoke | ForEach-Object {
         $result = Get-SuiteResult $_
         [ordered]@{
@@ -414,8 +435,9 @@ try {
     $sourceQualified = $sourceQualification.Count -eq 6 -and @($sourceQualification | Where-Object status -ne 'PASS').Count -eq 0
     $sinkQualified = $sinkQualification.Count -eq 6 -and @($sinkQualification | Where-Object status -ne 'PASS').Count -eq 0
     $transactionRecoveryQualified = $transactionRecovery.Count -gt 0 -and @($transactionRecovery | Where-Object status -ne 'PASS').Count -eq 0
+    $capabilityInvalidationQualified = $capabilityInvalidation.Count -gt 0 -and @($capabilityInvalidation | Where-Object status -ne 'PASS').Count -eq 0
     $routeSmokeQualified = $routeSmoke.Count -gt 0 -and @($routeSmoke | Where-Object status -ne 'PASS').Count -eq 0
-    $liveQualified = $sourceQualified -and $sinkQualified -and $transactionRecoveryQualified
+    $liveQualified = $sourceQualified -and $sinkQualified -and $transactionRecoveryQualified -and $capabilityInvalidationQualified
 
     ([ordered]@{
         schema = 'cdc.qualification-live-source.v1'
@@ -433,6 +455,11 @@ try {
         qualified = $transactionRecoveryQualified
         components = $transactionRecovery
     } | ConvertTo-Json -Depth 20) | Set-Content -LiteralPath $transactionRecoveryPath -Encoding UTF8
+    ([ordered]@{
+        schema = 'cdc.qualification-capability-invalidation.v1'
+        qualified = $capabilityInvalidationQualified
+        components = $capabilityInvalidation
+    } | ConvertTo-Json -Depth 20) | Set-Content -LiteralPath $capabilityInvalidationPath -Encoding UTF8
     ([ordered]@{
         schema = 'cdc.qualification-route-smoke.v1'
         qualified = $routeSmokeQualified
@@ -485,16 +512,19 @@ try {
         source_qualified = $sourceQualified
         sink_qualified = $sinkQualified
         transaction_recovery_qualified = $transactionRecoveryQualified
+        capability_invalidation_qualified = $capabilityInvalidationQualified
         route_smoke_qualified = $routeSmokeQualified
         live_evidence_files = [ordered]@{
             source = 'live-source.json'
             sink = 'live-sink.json'
             transaction_recovery = 'transaction-recovery.json'
+            capability_invalidation = 'live-capability-invalidation.json'
             route_smoke = 'route-smoke.json'
         }
         source_qualification = $sourceQualification
         sink_qualification = $sinkQualification
         transaction_recovery = $transactionRecovery
+        capability_invalidation = $capabilityInvalidation
         route_smoke = $routeSmoke
         directions = $directions
         missing_directions = @($missing.ToArray())
@@ -530,6 +560,7 @@ try {
     Write-Output "Live source qualified: $sourceQualified"
     Write-Output "Live sink qualified: $sinkQualified"
     Write-Output "Transaction recovery qualified: $transactionRecoveryQualified"
+    Write-Output "Capability invalidation qualified: $capabilityInvalidationQualified"
     Write-Output "Route smoke qualified: $routeSmokeQualified"
     Write-Output "Live qualified: $liveQualified"
     Write-Output "Missing directions: $($missing.Count)"

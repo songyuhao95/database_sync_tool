@@ -4,8 +4,8 @@ Issue #57 的完整 6×6 类型与恢复资格矩阵使用 `./scripts/qualify.ps
 它分别记录 Native Equivalent、Value Preserved、Explicit Conversion、
 UNSUPPORTED、BLOCKED、REQUIRES_LIVE 和 FAIL，并保留稳定摘要、密码命中检查、
 `types.json`、`recovery.json` 和日志。PostgreSQL 16/17 有独立离线 Source/Sink
-fixture；它们的 live 状态在相应套件注册并运行前保持 `REQUIRES_LIVE`。
-离线通过不代表 live qualification。
+fixture；PG15/16/17 也各有独立真实 Source 和 Sink 套件。离线通过不代表
+live qualification；缺少对应实例或凭据时仍标记为 `REQUIRES_LIVE`。
 使用 `-Live -ConfigFile ./scripts/test.txt` 可执行已登记的 live 组件测试，
 未配置实例或尚缺完整方向证据时保持 REQUIRES_LIVE。
 扩展规则、证据边界和报告格式见 [类型资格测试](../docs/testing/type-qualification.md)。
@@ -36,14 +36,16 @@ fixture；它们的 live 状态在相应套件注册并运行前保持 `REQUIRES
 
 | 阶段 | 本地检查 | 真机检查 |
 |---|---|---|
-| Read | 真机必需 | 复制协议、版本、MySQL 自动选择/GTID/文件位点、PG LSN、重新读取与恢复 |
-| ChangeEvent | 校验、完整事务、JSON 往返、无效位点与缺失值拒绝 | 真实 INSERT/UPDATE/DELETE、事务多行、回滚排除、精确值、复合主键变化；PG DEFAULT/FULL、TOAST、JSONB |
-| Sql | 同一固定事件 × 三种 MySQL 来源 × 三种目标版本，分别匹配固定 SQL 文件 | 每次 INSERT/UPDATE/DELETE 后查询目标数据、重复键错误整事务回滚 |
+| Read | 真机必需 | 复制协议、版本、MySQL 自动选择/GTID/文件位点、PG15/16/17 LSN、重新读取与恢复 |
+| ChangeEvent | 校验、完整事务、JSON 往返、无效位点与缺失值拒绝 | 真实 INSERT/UPDATE/DELETE、事务多行、回滚排除、精确值、复合主键变化；PG15/16/17 DEFAULT/FULL、TOAST、JSONB |
+| Sql | 固定事件 × 三种 MySQL 来源 × 六种 Sink 目标，匹配预期 SQL | MySQL 与 PG15/16/17 Sink 均写入并查询六种 Source fixture；校验重复键整事务回滚及 PG checkpoint 重启恢复 |
 
 Read 和 ChangeEvent 共用一次真机捕获，脚本不会重复执行同一用例。MySQL 当前还需要查询源表元信息，本地检查不代表已验证二进制解码。三种 MySQL 来源的 SQL 矩阵使用固定事件；这不是九条真实实例之间的端到端迁移测试。全量、故障注入和 Web 测试暂不属于这三个阶段；其他本地回归仍可执行 `cargo test --workspace`。
 
+`scripts/qualify.ps1 -Live` 还运行并单独报告目标能力失效：保存 MySQL 5.7 → PostgreSQL 15 计划后，测试改变本次创建的目标表定义，验证重新预检将计划标记为 stale，且任务无法启动。该项需要 MySQL 5.7 与 PostgreSQL 15 的 reader、writer、admin 配置；无配置时报告 `REQUIRES_LIVE`。
+
 真机范围仅 `CDC_test` 中本次唯一命名的表/PG schema、publication、slot，正常结束及断言失败时清理；进程被强制杀死时可能残留，日志记录对象名称。读取使用 reader，测试造数使用 writer，PG 对象准备使用 postgres。没有全局锁，不操作现有业务表或任务位点。MySQL 未开启 GTID 时检验显式 GTID 拒绝及自动回退，不修改全局配置；当前环境 GTID 开启时，不声称已真机验证关闭 GTID 的环境。
 
-默认的 `test.txt` 已填写当前测试环境：192.168.0.10，MySQL 33061/33062/33063，PG15 54321，以及对应 reader/writer/admin 账号。支持的完整字段可直接查看该文件。PG 三个账号当前共用 `PG_CDC_TEST_PASSWORD`；进程环境变量仍可覆盖任意字段。
+默认的 `test.txt` 已填写当前测试环境：192.168.0.10，MySQL 33061/33062/33063 和 PG15 54321，以及对应 reader/writer/admin 账号。PG16/17 使用单独的 `PG_CDC16_*` / `PG_CDC17_*` 配置，字段为 HOST、PORT、ADMIN_USER、READER_USER、WRITER_USER、TEST_PASSWORD。PG 三个账号共用各自版本的测试密码变量；进程环境变量仍可覆盖任意字段。
 
 新增数据库：实现对应的公开接口测试，在 `test-matrix.json` 登记数据库及 Read/ChangeEvent/Sql 用例。未实现的阶段放入 unsupported；脚本对已声明支持却缺少用例的阶段报 MISSING_TEST。预期 SQL 需人工核对后修改，测试不会自动覆盖预期文件。
