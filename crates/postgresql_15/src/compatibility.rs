@@ -237,6 +237,15 @@ pub fn compatibility_manifest_for_version(
         return compatibility_manifest(target_build);
     }
 
+    if !matches!(connector_version, "16" | "17") {
+        return TargetCapabilityManifest::new(
+            change_event::ConnectorIdentity::new("postgresql", connector_version),
+            target_build,
+            Vec::new(),
+            true,
+        );
+    }
+
     let mut capabilities = compatibility_manifest(target_build.clone()).capabilities;
     let connector_prefix = format!("postgresql{CONNECTOR_VERSION}");
     let versioned_prefix = format!("postgresql{connector_version}");

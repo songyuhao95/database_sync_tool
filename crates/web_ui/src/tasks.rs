@@ -987,6 +987,31 @@ fn input_from_task(task: &ReplicationTask) -> TaskInput {
 }
 
 impl Store {
+    pub(crate) fn authoritative_confirmations(
+        &self,
+        actor: i64,
+        confirmations: &[change_event::RiskConfirmation],
+    ) -> Result<Vec<change_event::RiskConfirmation>> {
+        let conn = self.db()?;
+        admin(&conn, actor)?;
+        let username: String = conn
+            .query_row("SELECT username FROM users WHERE id=?1", [actor], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .ok_or(Error::Forbidden)?;
+        let confirmed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Ok(confirmations
+            .iter()
+            .cloned()
+            .map(|mut confirmation| {
+                confirmation.actor.clone_from(&username);
+                confirmation.confirmed_at.clone_from(&confirmed_at);
+                confirmation
+            })
+            .collect())
+    }
+
     pub(crate) fn tasks(&self) -> Result<Vec<ReplicationTask>> {
         let conn = self.db()?;
         let mut tasks: Vec<ReplicationTask> = conn
@@ -1199,6 +1224,7 @@ impl Store {
             let conn = self.db()?;
             admin(&conn, actor)?;
         }
+        let confirmations = self.authoritative_confirmations(actor, &input.confirmations)?;
         validate_input(input)?;
         let source_connector = self.connector(&input.source_id, EndpointRole::Source)?;
         let sink_connector = self.connector(&input.sink_id, EndpointRole::Sink)?;
@@ -1330,7 +1356,7 @@ impl Store {
                 route_id,
                 &configuration_revision_label,
                 &m.conversion_options,
-                &input.confirmations,
+                &confirmations,
                 Some(source_build.clone()),
                 Some(target_build.clone()),
                 source_type_catalog.as_ref(),
@@ -1351,7 +1377,7 @@ impl Store {
             &sink.metadata,
             source_type_catalog_digest.as_deref(),
             plans,
-            &input.confirmations,
+            &confirmations,
             source_build,
             target_build,
         )?;
@@ -1367,6 +1393,8 @@ impl Store {
     #[allow(dead_code)]
     pub(crate) fn insert_task(&self, actor: i64, input: TaskInput) -> Result<ReplicationTask> {
         let id = secrets::random_token();
+        let mut input = input;
+        input.confirmations = self.authoritative_confirmations(actor, &input.confirmations)?;
         self.insert_task_with_snapshot(actor, input, id, None)
     }
 

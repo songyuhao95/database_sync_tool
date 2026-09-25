@@ -1623,7 +1623,7 @@ mod tests {
             "task-1",
             &transaction,
             Some("plan-set-digest"),
-            &[plan.clone()],
+            std::slice::from_ref(&plan),
             TargetApplyErrorKind::Conversion,
             &error,
         );

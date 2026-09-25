@@ -1,5 +1,36 @@
 use super::task_ui_tests::fixture;
 use crate::{Error, Store};
+use change_event::{RiskConfirmation, RuleReference};
+
+#[test]
+fn risk_confirmation_attribution_is_assigned_by_the_server() {
+    let (_dir, store, actor, _task) = fixture();
+    let submitted = RiskConfirmation {
+        source_field_lineage: "source-field".into(),
+        target_field_lineage: "target-field".into(),
+        rule: RuleReference {
+            id: "conversion-rule".into(),
+            version: "v1".into(),
+        },
+        plan_digest: "plan-digest".into(),
+        actor: "spoofed-user".into(),
+        confirmed_at: "2000-01-01T00:00:00Z".into(),
+        reason: Some("explicit user confirmation".into()),
+    };
+
+    let saved = store
+        .authoritative_confirmations(actor, &[submitted])
+        .unwrap();
+
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].actor, "admin");
+    assert_ne!(saved[0].confirmed_at, "2000-01-01T00:00:00Z");
+    assert!(saved[0].confirmed_at.ends_with('Z'));
+    assert_eq!(
+        saved[0].reason.as_deref(),
+        Some("explicit user confirmation")
+    );
+}
 
 #[test]
 fn legacy_task_plans_are_persisted_as_unsafe_and_block_start() {

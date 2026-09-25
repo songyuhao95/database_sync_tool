@@ -71,6 +71,15 @@ pub const CAPABILITY_MANIFEST_17: CapabilityManifest = CapabilityManifest {
     requires_primary_key: true,
 };
 
+const UNSUPPORTED_CAPABILITY_MANIFEST: CapabilityManifest = CapabilityManifest {
+    connector: "postgresql",
+    target: "unsupported-version",
+    contract: "cdc.change_event.v0.3",
+    supported_logical_types: &[],
+    supported_presence: &[],
+    requires_primary_key: true,
+};
+
 #[derive(Debug, Clone, Copy)]
 pub struct SinkAdapter {
     target_version: &'static str,
@@ -113,7 +122,7 @@ pub fn capability_manifest_for_version(target_version: &str) -> CapabilityManife
         "15" => CAPABILITY_MANIFEST,
         "16" => CAPABILITY_MANIFEST_16,
         "17" => CAPABILITY_MANIFEST_17,
-        _ => CAPABILITY_MANIFEST,
+        _ => UNSUPPORTED_CAPABILITY_MANIFEST,
     }
 }
 

@@ -358,13 +358,13 @@ async fn writes_sql_transaction_for_version(
         let writer = writer.clone();
         async move {
             let config = TargetConfig::new(
-                postgres_env::setting(&target_version, "HOST", "192.168.0.10"),
+                postgres_env::setting(target_version, "HOST", "192.168.0.10"),
                 "CDC_test",
                 writer,
                 password,
             )
             .with_port(
-                postgres_env::setting(&target_version, "PORT", "54321")
+                postgres_env::setting(target_version, "PORT", "54321")
                     .parse()
                     .expect("invalid PostgreSQL test port"),
             );
@@ -391,8 +391,8 @@ async fn writes_sql_transaction_for_version(
                     1
                 );
                 let mut verify = PgConnection::connect_with(&postgres_env::options(
-                    &target_version,
-                    &postgres_env::setting(&target_version, "ADMIN_USER", "postgres"),
+                    target_version,
+                    &postgres_env::setting(target_version, "ADMIN_USER", "postgres"),
                     &config.password,
                 ))
                 .await?;
