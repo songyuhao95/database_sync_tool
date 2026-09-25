@@ -1,6 +1,5 @@
 {
   "schema": "cdc.qualification-config.v1",
-  "databases": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
   "implemented": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
   "source_only": [],
   "unsupported": [],

@@ -8,9 +8,9 @@
 
 仓库当前已经把不同证据层分开：
 
-- [`tests/qualification_matrix.rs`](../../tests/qualification_matrix.rs) 生成 6×6 离线方向矩阵；Source fixture 和 Sink renderer 分开验证，PG16/17 作为明确 `UNSUPPORTED`。
-- [`scripts/qualify.ps1`](../../scripts/qualify.ps1) 将离线方向、4 个 SourceAdapter live suite、4 个 SinkAdapter live suite、公共事务恢复和 representative route smoke 分开记录。
-- [`scripts/qualification-matrix.json`](../../scripts/qualification-matrix.json) 是数据库/connector roster 和 suite 配置来源。
+- [`tests/qualification_matrix.rs`](../../tests/qualification_matrix.rs) 生成 6×6 离线方向矩阵；Source fixture 和 Sink renderer 分开验证。
+- [`scripts/qualify.ps1`](../../scripts/qualify.ps1) 将离线方向、6 个 SourceAdapter live suite、6 个 SinkAdapter live suite、公共事务恢复和 representative route smoke 分开记录。
+- [`scripts/type-inventory.json`](../../scripts/type-inventory.json) 是 connector 与 native type roster；qualification JSON 只声明角色状态和 suite 配置。
 - [`tests/support/matrix_fixture.rs`](../../tests/support/matrix_fixture.rs) 在 SourceAdapter/SinkAdapter 公共 seam 上生成可回放 fixture。
 - [`crates/web_ui/src/qualification_recovery_tests.rs`](../../crates/web_ui/src/qualification_recovery_tests.rs) 覆盖完整事务、回滚、重复投递、CommitUnknown、重启和停止恢复。
 
@@ -96,14 +96,14 @@ invalid value -> Target Capability Failure, rollback, checkpoint unchanged
 5. Recovery: 计划转换失败、约束失败、CommitUnknown、重复投递和重启是否保持事务/Checkpoint 语义；
 6. Live component evidence：实际数据库 SourceAdapter 和 SinkAdapter 是否在各自 live suite 中通过。
 
-PG16/17 当前未实现时，36 个方向仍必须出现在报告中并明确 `UNSUPPORTED`，不能丢失方向或误报 PASS。新增 PostgreSQL 16/17 connector 后，既要补 Source fixture，也要补 Sink fixture 和 live component suite。
+无论 connector 当前是否支持，36 个方向都必须出现在报告中并准确标记 `UNSUPPORTED`、`BLOCKED` 或资格结果，不能丢失方向或误报 PASS。新增 connector 后，既要补 Source fixture，也要补 Sink fixture和 live component suite。
 
 ## Live qualification 语义
 
-真实数据库测试应继续采用 4 Source + 4 Sink + 公共 recovery + representative route smoke 的结构：
+真实数据库测试应采用每个已注册版本各一个 Source + Sink suite、公共 recovery 和 representative route smoke 的结构：
 
-- 4 Source live：各版本读取原生日志并生成 ChangeEvent；
-- 4 Sink live：每个目标适配器消费四个 source fixture roster；
+- Source live：各版本读取原生日志并生成 ChangeEvent；
+- Sink live：每个目标适配器消费全部 source fixture roster；
 - common recovery live/offline：事务原子性和 checkpoint 恢复；
 - route smoke：少量真实 Source→Sink 端到端路径，作为运行链路证据，不替代完整 6×6 类型矩阵。
 
@@ -147,15 +147,14 @@ PG16/17 当前未实现时，36 个方向仍必须出现在报告中并明确 `U
 - 1 个 Sink live suite；
 - 1 个扩展/环境探测 suite（如果是扩展能力）；
 - 1 组 runtime recovery suite；
-- qualification-matrix.json roster 和报告 schema 更新。
+- type-inventory.json roster、suite 状态和报告 schema 更新。
 
 新增类型而不是新增版本时，必须为所有受影响 Source×Sink 方向补齐该类型的 fixture 和资格记录；不能只添加一个源适配器单测。
 
 ## 当前缺口
 
 - `tests/qualification_matrix.rs` 的 fixture 目前主要覆盖标量、JSON、ENUM/SET、BIT、时间和部分类型边界；数组、composite、domain、range/multirange、扩展空间和 hstore 需要新增 canonical fixtures。
-- `scripts/qualify.ps1` 当前正确区分 6×6 离线与 4+4 live component evidence，但还没有扩展能力探测报告字段。
-- PostgreSQL 15 live worker 仍是当前已实现 PostgreSQL connector，PG16/17 仍为明确 unsupported。
+- `scripts/qualify.ps1` 当前区分 6×6 离线与 6+6 live component evidence；原生类型逐项覆盖仍由 Issue #59 起的清单与资格工作补齐。
 - 当前 `SinkAdapter` 对 SET/Spatial 的阻断测试是正确的 fail-closed 基线；完成新地图时必须将它们升级为目标表示和显式资格测试，而不是删除阻断逻辑。
 
 ## 研究依据

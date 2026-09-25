@@ -220,12 +220,14 @@ fn exercise(tx: &ChangeTransaction, plans: &[ColumnConversionPlan], fault: Fault
 fn qualification_recovery_matrix() {
     let config: serde_json::Value =
         serde_json::from_str(include_str!("../../../scripts/qualification-matrix.json")).unwrap();
-    let ids = config["databases"].as_array().unwrap();
+    let inventory: serde_json::Value =
+        serde_json::from_str(include_str!("../../../scripts/type-inventory.json")).unwrap();
+    let ids = inventory["connectors"].as_array().unwrap();
     let mut report = Vec::new();
     for source in ids {
         for sink in ids {
-            let source_id = source.as_str().unwrap();
-            let sink_id = sink.as_str().unwrap();
+            let source_id = source["id"].as_str().unwrap();
+            let sink_id = sink["id"].as_str().unwrap();
             let identity = |id: &str| {
                 let (kind, version) = id.split_once('_').unwrap();
                 (kind.to_owned(), version.replace('_', "."))
@@ -236,10 +238,19 @@ fn qualification_recovery_matrix() {
                 SourceRegistry.find(&sk, &sv).is_some() && SinkRegistry.find(&tk, &tv).is_some();
             let sink_is_source_only = config["source_only"]
                 .as_array()
-                .is_some_and(|values| values.contains(sink));
-            let implemented_source = config["implemented"].as_array().unwrap().contains(source);
-            let implemented_sink = config["implemented"].as_array().unwrap().contains(sink);
-            let source_only_source = config["source_only"].as_array().unwrap().contains(source);
+                .is_some_and(|values| values.contains(&json!(sink_id)));
+            let implemented_source = config["implemented"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(source_id));
+            let implemented_sink = config["implemented"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(sink_id));
+            let source_only_source = config["source_only"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(source_id));
             let declared = (implemented_source && implemented_sink && !sink_is_source_only)
                 || (source_only_source && implemented_sink);
             assert_eq!(
@@ -247,7 +258,7 @@ fn qualification_recovery_matrix() {
                 "registry and qualification roster disagree: {source_id} -> {sink_id}"
             );
             if !supported {
-                report.push(json!({"source":source,"sink":sink,"offline":"UNSUPPORTED","code":"connector.not_implemented"}));
+                report.push(json!({"source":source_id,"sink":sink_id,"offline":"UNSUPPORTED","code":"connector.not_implemented"}));
                 continue;
             }
             let source_version = match source_id {
@@ -300,7 +311,7 @@ fn qualification_recovery_matrix() {
                     exercise(transaction, &plans, fault);
                 }
             }
-            report.push(json!({"source":source,"sink":sink,"offline":"PASS","live":"REQUIRES_LIVE","evidence_scope":"production_recovery_loop_with_fake_executor","checks":["transaction_boundary","cross_table","atomic_dml_checkpoint","rollback","conversion_failure","constraint_failure","metadata_failure","whole_transaction_retry","CommitUnknown.Applied","CommitUnknown.NotApplied","CommitUnknown.Unprovable","restart","duplicate_delivery","stop"]}));
+            report.push(json!({"source":source_id,"sink":sink_id,"offline":"PASS","live":"REQUIRES_LIVE","evidence_scope":"production_recovery_loop_with_fake_executor","checks":["transaction_boundary","cross_table","atomic_dml_checkpoint","rollback","conversion_failure","constraint_failure","metadata_failure","whole_transaction_retry","CommitUnknown.Applied","CommitUnknown.NotApplied","CommitUnknown.Unprovable","restart","duplicate_delivery","stop"]}));
         }
     }
     if let Some(path) = std::env::var_os("CDC_QUALIFICATION_RECOVERY_REPORT") {

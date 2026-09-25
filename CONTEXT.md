@@ -262,6 +262,14 @@ _Avoid_: Cross-database type table, value inference
 A lossless database-independent representation of one captured column value, including only value-level semantics; source and target column definitions are resolved separately.
 _Avoid_: JSON value, stringified value
 
+**Source Representation Envelope**:
+A self-describing record of the exact text or binary representation emitted by a Source's change protocol, together with source type and format evidence; it does not by itself prove the original database value can be reconstructed.
+_Avoid_: Logical Value, raw database value
+
+**Representation-only Preservation**:
+The capture, transfer, storage, and read-back of a Source Representation Envelope without asserting recovery of the source-native value or its behavior at a Sink.
+_Avoid_: Value Preserved, semantic compatibility
+
 **Logical Type**:
 A database-independent type description that preserves value semantics such as signedness, precision, temporal meaning, encoding, and spatial reference without relying on a target database type name. It may be scalar, temporal, enum-like, spatial, JSON, or recursively structured; it is produced only when the source mapping can prove the represented semantics.
 _Avoid_: Native Type, Rust type
@@ -440,11 +448,13 @@ The first portable ChangeEvent contract is transaction-oriented. A published Tra
 
 The contract uses a structured Logical Type rather than asking a Sink to infer semantics from Native Type. The Logical Type family includes scalar, temporal, enum-like, spatial, JSON, and recursively structured types; it preserves value semantics and is produced only by a versioned Source Type Mapping with sufficient evidence. Native Type remains source-definition evidence, not an embedded target or event type.
 
-The first contract is definition-referenced for DML replay. A Change Event carries source object and element identity, a Definition Reference to the fingerprinted source definition, column values, and their explicit presence states; it does not embed the full Logical Type, Native Type, or source column definition.
+The first contract is definition-referenced for DML replay. A Change Event carries source object and element identity, a Definition Reference to the fingerprinted source definition, either semantic column values or an explicitly classified Source Representation Envelope, and their explicit presence states; it does not embed the full Logical Type, Native Type, or source column definition.
 
-Source Type Mapping is strict and versioned. MySQL and PostgreSQL native types map to Logical Types only when the exact connector/build, declaration, and source semantics prove the mapping; aliases such as MySQL `TINYINT(1)` are not treated as Boolean without unambiguous evidence. Integer width and signedness, Decimal precision and signed scale, text/binary bounds, temporal meaning, JSON profile, enum members, and spatial or recursive structure are preserved. PostgreSQL `json` is not mapped to the normalized JSON profile, and an unproven native type remains unsupported rather than being inferred from row values or downgraded.
+Source Type Mapping is strict and versioned. MySQL and PostgreSQL native types map to Logical Types only when the exact connector/build, declaration, and source semantics prove the mapping; aliases such as MySQL `TINYINT(1)` are not treated as Boolean without unambiguous evidence. Integer width and signedness, Decimal precision and signed scale, text/binary bounds, temporal meaning, JSON profile, enum members, and spatial or recursive structure are preserved. PostgreSQL `json` is not mapped to the normalized JSON profile. An unproven native type is never inferred from row values or silently downgraded; where the source protocol can safely capture its emitted representation, it may instead use an explicitly classified Source Representation Envelope.
 
-Target representation is Sink-owned and selected through a Column Conversion Plan for one existing source-to-target column binding. A qualified mapping is `EXACT` when source and target semantics are equivalent, `RANGE_CHECKED` when a proven wider representation requires declared-domain checks, `EXPLICIT_CONVERSION` when an accepted encoding or semantic downgrade is required, and `UNSUPPORTED` when no qualified representation exists. ChangeEvent never selects a target type, and runtime values never select or widen a plan.
+The versioned native type inventory is the single connector/type roster used by Rust and qualification scripts. It records mapping, protocol capture, ChangeEvent, Sink target/carrier, Web, and live evidence separately. PostgreSQL catalog-defined types and unmatched MySQL declarations remain explicit gaps until discovered and qualified; a family-level fixture does not qualify every native declaration.
+
+Target representation is Sink-owned and selected through a Column Conversion Plan for one existing source-to-target column binding. A qualified mapping is `EXACT` when source and target semantics are equivalent, `RANGE_CHECKED` when a proven wider representation requires declared-domain checks, `EXPLICIT_CONVERSION` when an accepted encoding or semantic downgrade is required, `SOURCE_REPRESENTATION_PRESERVED` when an explicitly selected envelope is stored and read back without claiming source-value recovery, and `UNSUPPORTED` when no qualified representation exists. Representation-only preservation is distinct from `VALUE_PRESERVED`. ChangeEvent never selects a target type, and runtime values never select or widen a plan.
 
 Column Datum preserves four presence states: Value, Null, Unchanged, and Unavailable. Unchanged is valid for a source update image; Unavailable means the Source did not provide the historical value. A Sink must report Target Capability Failure when it cannot apply a state without changing semantics.
 
@@ -474,7 +484,7 @@ The Sink Adapter owns the atomic apply boundary. One target transaction applies 
 
 Source and Sink connectors are selected through independent registries keyed by connector identity and target version. Adding a source or Sink connector must not require source-target pair branches in Web or in existing database crates.
 
-Adding a database version follows role-specific extension contracts. A Source version supplies capture, Source Contract validation, Source Type Mapping, and source definitions; a Sink version supplies target catalog access, Capability Manifest qualifications, Conversion Rules, Column Conversion Plan construction and execution, and its target session requirements. Either role may be added independently. A version that introduces semantics outside the existing Logical Type family requires a separate common-contract decision rather than a pair-specific or opaque fallback.
+Adding a database version follows role-specific extension contracts. A Source version supplies capture, Source Contract validation, Source Type Mapping, and source definitions; a Sink version supplies target catalog access, Capability Manifest qualifications, Conversion Rules, Column Conversion Plan construction and execution, and its target session requirements. Either role may be added independently. A version that introduces semantics outside the existing Logical Type family requires a common-contract decision; an approved Source Representation Envelope remains distinct from LogicalValue and does not imply semantic coverage.
 
 ## Verification and Web registry decisions
 

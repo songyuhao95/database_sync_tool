@@ -7,13 +7,44 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::*;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 fn versions() -> Vec<String> {
-    serde_json::from_str::<Value>(include_str!("../scripts/qualification-matrix.json"))
-        .unwrap()["databases"]
-        .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_owned()).collect()
+    type_inventory()["connectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_owned())
+        .collect()
 }
+
+const PINNED_TYPE_INVENTORY_DIGESTS: [(&str, &str); 6] = [
+    (
+        "mysql_5_7",
+        "39d2cba8f1ad127e43c2d456a783d135018a4518615056fb9c303f4be4ba168e",
+    ),
+    (
+        "mysql_8_0",
+        "ceba9a8b13c3e4083b92ddf1ec0bab95280803ad6296d1ff52a3325a85dcac9b",
+    ),
+    (
+        "mysql_8_4",
+        "48bf555f15f7e1837c7f026e999bd50a2217311b6414a5d0fa4448adbc4a61d7",
+    ),
+    (
+        "postgresql_15",
+        "9b69a58b3c5faf04dd3cba8fdd2eac7308bc174adc34a6603f76d20868a89714",
+    ),
+    (
+        "postgresql_16",
+        "937c55cac4d2db0aba2fc1f5bf4375598b4482fdf1658dfd2d0336b46b6ef254",
+    ),
+    (
+        "postgresql_17",
+        "4109071301817d29f0ceac1b4cb8ad88ac6f53e82732eb25a65cf68ccdbb1564",
+    ),
+];
 
 fn connector(id: &str) -> Option<fixture::SourceVersion> {
     use fixture::SourceVersion::*;
@@ -617,6 +648,815 @@ fn cases() -> Vec<Case> {
     .collect()
 }
 
+fn type_inventory() -> Value {
+    serde_json::from_str(include_str!("../scripts/type-inventory.json"))
+        .expect("versioned native type inventory must be valid JSON")
+}
+
+fn connector_inventory_digest(inventory: &Value, connector_id: &str) -> String {
+    let connector = inventory["connectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == connector_id)
+        .unwrap();
+    let declarations: Vec<_> = inventory["types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| {
+            let profile_id = entry["declaration_profile"].as_str().unwrap();
+            let profile = &inventory["native_declaration_profiles"][profile_id];
+            profile["connectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|source| source == connector_id)
+                .then(|| {
+                    json!({
+                        "type": entry,
+                        "native_declaration_profile": profile,
+                        "mapping_aliases": inventory["mapping_aliases"].get(profile_id)
+                    })
+                })
+        })
+        .collect();
+    let dynamic_classes: Vec<_> = inventory["dynamic_type_classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|class| {
+            class["connectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|source| source == connector_id)
+        })
+        .collect();
+    let per_type_qualification_entries: serde_json::Map<String, Value> =
+        inventory["per_type_qualification"]["entries"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, receipt)| {
+                let (type_id, source_id) = key.rsplit_once('@')?;
+                let source_evidence = (source_id == connector_id).then(|| {
+                    json!({
+                        "source": receipt["source"],
+                        "web": receipt["web"]
+                    })
+                });
+                let sink_evidence = receipt["sinks"][connector_id]
+                    .as_object()
+                    .map(|sink| json!({ "sink": sink }));
+                (source_evidence.is_some() || sink_evidence.is_some()).then(|| {
+                    let mut projection = json!({
+                        "type_id": type_id,
+                        "source_connector_id": source_id
+                    });
+                    if let Some(source_evidence) = source_evidence {
+                        projection["source_evidence"] = source_evidence;
+                    }
+                    if let Some(sink_evidence) = sink_evidence {
+                        projection["sink_evidence"] = sink_evidence;
+                    }
+                    (key.clone(), projection)
+                })
+            })
+            .collect();
+    let per_type_qualification_evidence_registry: Vec<_> =
+        inventory["per_type_qualification"]["evidence_registry"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| {
+                record["source_connector_id"] == connector_id
+                    || record["sink_connector_id"] == connector_id
+            })
+            .collect();
+    change_event::stable_digest(&json!({
+        "connector": connector,
+        "static_declarations": declarations,
+        "source_type_identity": inventory["source_type_identity"],
+        "source_mapping_code_seams": inventory["source_mapping_code_seams"][connector_id],
+        "alias_resolution": inventory["alias_resolution"],
+        "dynamic_type_classes": dynamic_classes,
+        "dynamic_catalog_status": inventory["dynamic_catalog_status_by_connector"][connector_id],
+        "per_type_qualification_entries": per_type_qualification_entries,
+        "per_type_qualification_evidence_registry": per_type_qualification_evidence_registry,
+        "excluded_type_classes": inventory["excluded_type_classes"]
+    }))
+}
+
+fn inventory_status(
+    has_missing_implementation: bool,
+    all_evidence_qualified: bool,
+) -> &'static str {
+    if has_missing_implementation {
+        "MISSING_IMPLEMENTATION"
+    } else if all_evidence_qualified {
+        "PASS"
+    } else {
+        "REQUIRES_PER_TYPE_QUALIFICATION"
+    }
+}
+
+fn evidence_axis_pass(
+    axis: &Value,
+    evidence_registry: &Value,
+    type_id: &str,
+    source_id: &str,
+    sink_id: Option<&str>,
+    axis_name: &str,
+) -> bool {
+    let entries = match evidence_registry["entries"].as_array() {
+        Some(entries) => entries,
+        None => return false,
+    };
+    axis["status"] == "PASS"
+        && axis["evidence"].as_array().is_some_and(|items| {
+            !items.is_empty()
+                && items.iter().all(|item| {
+                    let Some(evidence_id) = item.as_str() else {
+                        return false;
+                    };
+                    let mut matching = entries.iter().filter(|record| record["id"] == evidence_id);
+                    let Some(record) = matching.next() else {
+                        return false;
+                    };
+                    matching.next().is_none() && evidence_artifact_passes(record) && {
+                        let digest = record["report_digest"].as_str().unwrap_or_default();
+                        record["type_id"] == type_id
+                            && record["source_connector_id"] == source_id
+                            && record["sink_connector_id"]
+                                == sink_id.map_or(Value::Null, |sink| json!(sink))
+                            && record["axis"] == axis_name
+                            && record["status"] == "PASS"
+                            && record["run_id"]
+                                .as_str()
+                                .is_some_and(|run_id| !run_id.trim().is_empty())
+                            && digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }
+                })
+        })
+}
+
+fn evidence_artifact_passes(record: &Value) -> bool {
+    let Some(relative_path) = record["artifact_path"].as_str() else {
+        return false;
+    };
+    let relative_path = Path::new(relative_path);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+    let workspace = match PathBuf::from(env!("CARGO_MANIFEST_DIR")).canonicalize() {
+        Ok(workspace) => workspace,
+        Err(_) => return false,
+    };
+    let artifact_path = match workspace.join(relative_path).canonicalize() {
+        Ok(path) if path.starts_with(&workspace) => path,
+        _ => return false,
+    };
+    let artifact: Value = match std::fs::read(artifact_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(artifact) => artifact,
+        None => return false,
+    };
+    let Some(records) = artifact["evidence"].as_array() else {
+        return false;
+    };
+    if artifact["schema"] != "cdc.type_qualification_evidence_report.v1"
+        || artifact["run_id"] != record["run_id"]
+        || change_event::stable_digest(&artifact) != record["report_digest"]
+    {
+        return false;
+    }
+    let mut matching = records
+        .iter()
+        .filter(|evidence| evidence["id"] == record["id"]);
+    let Some(evidence) = matching.next() else {
+        return false;
+    };
+    matching.next().is_none()
+        && [
+            "type_id",
+            "source_connector_id",
+            "sink_connector_id",
+            "axis",
+            "status",
+            "run_id",
+        ]
+        .into_iter()
+        .all(|field| evidence[field] == record[field])
+}
+
+fn per_type_qualification_pass(
+    evidence: &Value,
+    evidence_registry: &Value,
+    type_id: &str,
+    source_id: &str,
+    sink_ids: &[String],
+) -> bool {
+    let source = &evidence["source"];
+    let source_axes_pass = ["protocol_capture", "semantic_codec", "change_event", "live"]
+        .into_iter()
+        .all(|axis| {
+            evidence_axis_pass(
+                &source[axis],
+                evidence_registry,
+                type_id,
+                source_id,
+                None,
+                &format!("source.{axis}"),
+            )
+        });
+    let sinks = match evidence["sinks"].as_object() {
+        Some(sinks) => sinks,
+        None => return false,
+    };
+    let expected_sinks: BTreeSet<_> = sink_ids.iter().map(String::as_str).collect();
+    let actual_sinks: BTreeSet<_> = sinks.keys().map(String::as_str).collect();
+    let sink_evidence_pass = expected_sinks == actual_sinks
+        && sink_ids.iter().all(|sink_id| {
+            let sink = &evidence["sinks"][sink_id];
+            let native_or_representation_outcome = match sink["outcome"].as_str() {
+                Some("VALUE_PRESERVED") => true,
+                Some("SOURCE_REPRESENTATION_PRESERVED") => {
+                    evidence_axis_pass(
+                        &json!({
+                            "status": "PASS",
+                            "evidence": sink["representation_carrier_evidence"]
+                        }),
+                        evidence_registry,
+                        type_id,
+                        source_id,
+                        Some(sink_id),
+                        "sink.representation_carrier",
+                    ) && evidence_axis_pass(
+                        &json!({
+                            "status": "PASS",
+                            "evidence": sink["representation_preservation_evidence"]
+                        }),
+                        evidence_registry,
+                        type_id,
+                        source_id,
+                        Some(sink_id),
+                        "sink.representation_preserved",
+                    )
+                }
+                _ => false,
+            };
+            native_or_representation_outcome
+                && evidence_axis_pass(
+                    &json!({ "status": "PASS", "evidence": sink["offline_evidence"] }),
+                    evidence_registry,
+                    type_id,
+                    source_id,
+                    Some(sink_id),
+                    "sink.offline",
+                )
+                && evidence_axis_pass(
+                    &json!({ "status": "PASS", "evidence": sink["live_evidence"] }),
+                    evidence_registry,
+                    type_id,
+                    source_id,
+                    Some(sink_id),
+                    "sink.live",
+                )
+        });
+    let representation_required = sink_ids
+        .iter()
+        .any(|sink_id| evidence["sinks"][sink_id]["outcome"] == "SOURCE_REPRESENTATION_PRESERVED");
+    let representation_axis_pass = !representation_required
+        || (evidence_axis_pass(
+            &source["source_representation_capture"],
+            evidence_registry,
+            type_id,
+            source_id,
+            None,
+            "source.source_representation_capture",
+        ) && evidence_axis_pass(
+            &source["protocol_framing"],
+            evidence_registry,
+            type_id,
+            source_id,
+            None,
+            "source.protocol_framing",
+        ));
+    let web = &evidence["web"];
+    source_axes_pass
+        && sink_evidence_pass
+        && representation_axis_pass
+        && web["selection"] == "explicit_per_field_user_choice_required"
+        && web["risk_confirmation"] == "required_before_plan_activation"
+        && evidence_axis_pass(web, evidence_registry, type_id, source_id, None, "web.plan")
+}
+
+fn per_type_source_live_status(
+    evidence: &Value,
+    evidence_registry: &Value,
+    type_id: &str,
+    source_id: &str,
+) -> &'static str {
+    if evidence_axis_pass(
+        &evidence["source"]["live"],
+        evidence_registry,
+        type_id,
+        source_id,
+        None,
+        "source.live",
+    ) {
+        "PASS"
+    } else {
+        "REQUIRES_PER_TYPE_LIVE_EVIDENCE"
+    }
+}
+
+fn per_type_sink_live_status(
+    evidence: &Value,
+    evidence_registry: &Value,
+    type_id: &str,
+    source_id: &str,
+    sink_ids: &[String],
+) -> &'static str {
+    let sinks = match evidence["sinks"].as_object() {
+        Some(sinks) => sinks,
+        None => return "REQUIRES_PER_TYPE_LIVE_EVIDENCE",
+    };
+    let expected: BTreeSet<_> = sink_ids.iter().map(String::as_str).collect();
+    let actual: BTreeSet<_> = sinks.keys().map(String::as_str).collect();
+    if expected == actual && sink_ids.iter().all(|sink_id| {
+        evidence_axis_pass(
+            &json!({ "status": "PASS", "evidence": evidence["sinks"][sink_id]["live_evidence"] }),
+            evidence_registry,
+            type_id,
+            source_id,
+            Some(sink_id),
+            "sink.live",
+        )
+    }) {
+        "PASS"
+    } else {
+        "REQUIRES_PER_TYPE_LIVE_EVIDENCE"
+    }
+}
+
+fn per_type_web_status(
+    evidence: &Value,
+    evidence_registry: &Value,
+    type_id: &str,
+    source_id: &str,
+) -> &'static str {
+    let web = &evidence["web"];
+    if web["selection"] == "explicit_per_field_user_choice_required"
+        && web["risk_confirmation"] == "required_before_plan_activation"
+        && evidence_axis_pass(web, evidence_registry, type_id, source_id, None, "web.plan")
+    {
+        "PASS"
+    } else {
+        "NOT_QUALIFIED_PER_NATIVE_TYPE"
+    }
+}
+
+fn qualified_type_evidence_fixture(type_id: &str, source_id: &str, sink_ids: &[String]) -> Value {
+    let id = |axis: &str, sink_id: Option<&str>| match sink_id {
+        Some(sink_id) => format!("{type_id}@{source_id}>{sink_id}:{axis}"),
+        None => format!("{type_id}@{source_id}:{axis}"),
+    };
+    let pass_axis = |axis: &str| json!({ "status": "PASS", "evidence": [id(axis, None)] });
+    let sinks = sink_ids
+        .iter()
+        .map(|sink_id| {
+            (
+                sink_id.clone(),
+                json!({
+                    "outcome": "VALUE_PRESERVED",
+                    "offline_evidence": [id("sink.offline", Some(sink_id))],
+                    "live_evidence": [id("sink.live", Some(sink_id))],
+                    "representation_carrier_evidence": [id("sink.representation_carrier", Some(sink_id))],
+                    "representation_preservation_evidence": [id("sink.representation_preserved", Some(sink_id))]
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "source": {
+            "protocol_capture": pass_axis("source.protocol_capture"),
+            "semantic_codec": pass_axis("source.semantic_codec"),
+            "change_event": pass_axis("source.change_event"),
+            "live": pass_axis("source.live"),
+            "source_representation_capture": pass_axis("source.source_representation_capture"),
+            "protocol_framing": pass_axis("source.protocol_framing")
+        },
+        "sinks": sinks,
+        "web": {
+            "status": "PASS",
+            "selection": "explicit_per_field_user_choice_required",
+            "risk_confirmation": "required_before_plan_activation",
+            "evidence": [id("web.plan", None)]
+        }
+    })
+}
+
+fn qualified_type_evidence_registry(type_id: &str, source_id: &str, sink_ids: &[String]) -> Value {
+    let run_id = format!("issue59-test-run-{}", std::process::id());
+    let mut evidence_records = Vec::new();
+    let mut register = |axis: &str, sink_id: Option<&str>| {
+        let id = match sink_id {
+            Some(sink_id) => format!("{type_id}@{source_id}>{sink_id}:{axis}"),
+            None => format!("{type_id}@{source_id}:{axis}"),
+        };
+        evidence_records.push(json!({
+            "id": id,
+            "type_id": type_id,
+            "source_connector_id": source_id,
+            "sink_connector_id": sink_id,
+            "axis": axis,
+            "status": "PASS",
+            "run_id": run_id
+        }));
+    };
+    for axis in [
+        "source.protocol_capture",
+        "source.semantic_codec",
+        "source.change_event",
+        "source.live",
+        "source.source_representation_capture",
+        "source.protocol_framing",
+        "web.plan",
+    ] {
+        register(axis, None);
+    }
+    for sink_id in sink_ids {
+        register("sink.offline", Some(sink_id));
+        register("sink.live", Some(sink_id));
+        register("sink.representation_carrier", Some(sink_id));
+        register("sink.representation_preserved", Some(sink_id));
+    }
+    let report = json!({
+        "schema": "cdc.type_qualification_evidence_report.v1",
+        "run_id": run_id,
+        "evidence": evidence_records
+    });
+    let report_digest = change_event::stable_digest(&report);
+    let artifact_path = format!("target/qualification-evidence-fixtures/{run_id}.json");
+    let artifact_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&artifact_path);
+    std::fs::create_dir_all(artifact_file.parent().unwrap())
+        .expect("create ignored qualification evidence fixture directory");
+    std::fs::write(
+        &artifact_file,
+        serde_json::to_vec_pretty(&report).expect("serialize qualification evidence fixture"),
+    )
+    .expect("write qualification evidence fixture");
+    let entries = report["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            entry["artifact_path"] = json!(artifact_path);
+            entry["report_digest"] = json!(report_digest);
+            entry
+        })
+        .collect::<Vec<_>>();
+    json!({ "entries": entries })
+}
+
+fn qualification_fixture_status(inventory: &Value, entry: &Value, source_id: &str) -> &'static str {
+    let has_family_fixture = entry["qualification_case_ids"]
+        .as_array()
+        .is_some_and(|ids| !ids.is_empty());
+    if !has_family_fixture {
+        return "MISSING_TEST";
+    }
+    let type_id = entry["id"].as_str().unwrap();
+    let evidence_key = format!("{type_id}@{source_id}");
+    let evidence = &inventory["per_type_qualification"]["entries"][evidence_key];
+    if per_type_qualification_pass(
+        evidence,
+        &inventory["per_type_qualification"]["evidence_registry"],
+        type_id,
+        source_id,
+        &versions(),
+    ) {
+        "PER_TYPE_QUALIFIED"
+    } else {
+        "FAMILY_FIXTURE_ONLY"
+    }
+}
+
+fn receipt_uses_representation(evidence: &Value) -> bool {
+    evidence["sinks"].as_object().is_some_and(|sinks| {
+        sinks
+            .values()
+            .any(|sink| sink["outcome"] == "SOURCE_REPRESENTATION_PRESERVED")
+    })
+}
+
+fn representation_scopes(entries: &Value) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut sources = BTreeSet::new();
+    let mut sinks = BTreeSet::new();
+    if let Some(entries) = entries.as_object() {
+        for (key, evidence) in entries {
+            if !receipt_uses_representation(evidence) {
+                continue;
+            }
+            if let Some((_, source_id)) = key.rsplit_once('@') {
+                sources.insert(source_id.to_owned());
+            }
+            if let Some(receipt_sinks) = evidence["sinks"].as_object() {
+                for (sink_id, sink) in receipt_sinks {
+                    if sink["outcome"] == "SOURCE_REPRESENTATION_PRESERVED" {
+                        sinks.insert(sink_id.clone());
+                    }
+                }
+            }
+        }
+    }
+    (sources, sinks)
+}
+
+fn type_inventory_coverage() -> Value {
+    let inventory = type_inventory();
+    let mut declarations = Vec::new();
+    let mut dynamic_classes = Vec::new();
+    for entry in inventory["types"].as_array().unwrap() {
+        let id = entry["id"].as_str().unwrap();
+        let profile_id = entry["declaration_profile"].as_str().unwrap();
+        let source = &inventory["native_declaration_profiles"][profile_id];
+        let mapping_aliases =
+            &inventory["mapping_aliases"][entry["declaration_profile"].as_str().unwrap()];
+        for source_id in source["connectors"].as_array().unwrap() {
+            let source_id = source_id.as_str().unwrap();
+            let fixture_status = qualification_fixture_status(&inventory, entry, source_id);
+            let qualification_key = format!("{id}@{source_id}");
+            let qualification_evidence =
+                &inventory["per_type_qualification"]["entries"][qualification_key.as_str()];
+            let evidence_registry = &inventory["per_type_qualification"]["evidence_registry"];
+            let sink_ids = versions();
+            let source_live_status = per_type_source_live_status(
+                qualification_evidence,
+                evidence_registry,
+                id,
+                source_id,
+            );
+            let sink_live_status = per_type_sink_live_status(
+                qualification_evidence,
+                evidence_registry,
+                id,
+                source_id,
+                &sink_ids,
+            );
+            let web_status =
+                per_type_web_status(qualification_evidence, evidence_registry, id, source_id);
+            let source_profile = &inventory["source_evidence_profiles"][source["evidence_profile"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{id}/{source_id} lacks evidence profile"))];
+            let version = connector(source_id)
+                .unwrap_or_else(|| panic!("inventory refers to unknown connector {source_id}"));
+            for (kind, examples) in [
+                ("native_example", &source["examples"]),
+                ("sql_alias", mapping_aliases),
+            ] {
+                if let Some(examples) = examples.as_array() {
+                    for declaration in examples {
+                        let native = declaration.as_str().unwrap();
+                        let result = mapping(version, native);
+                        declarations.push(json!({
+                            "type_id": id,
+                            "source": source_id,
+                            "declaration_kind": kind,
+                            "native_declaration": native,
+                            "source_type_identity": if source_id.starts_with("mysql_") {
+                                json!({
+                                    "kind": "mysql_binlog_wire_type",
+                                    "wire_types": inventory["source_type_identity"]["mysql_binlog_wire_types"][entry["declaration_profile"].as_str().unwrap()]
+                                })
+                            } else {
+                                json!({
+                                    "kind": "postgresql_relation_type_oid",
+                                    "catalog_identity": inventory["source_type_identity"]["postgresql_catalog_oid"]
+                                })
+                            },
+                            "source_mapping_code_seam": inventory["source_mapping_code_seams"][source_id],
+                            "source_mapping": if result.is_ok() { "MAPPED" } else { "MISSING_IMPLEMENTATION" },
+                            "source_mapping_error": result.err().map(|error| error.chars().take(240).collect::<String>()),
+                            "protocol_capture": source_profile["protocol_capture"],
+                            "semantic_codec": source_profile["semantic_codec"],
+                            "change_event": source_profile["change_event"],
+                            "source_representation_capture": source_profile["source_representation_capture"],
+                            "source_representation_envelope_schema": inventory["source_representation_contract"]["schema"],
+                            "source_representation_envelope_fields": inventory["source_representation_contract"]["required_fields"],
+                            "protocol_framing_profile": inventory["source_representation_contract"]["protocol_profiles"][source_id],
+                            "sink_representation_outcomes": inventory["sink_representation_outcomes"],
+                            "web_representation_policy": inventory["web_representation_policy"],
+                            "sink_evidence_profile": entry["sink_evidence_profile"].as_str().unwrap_or(inventory["default_sink_evidence_profile"].as_str().unwrap()),
+                            "sink_evidence": inventory["sink_evidence_profiles"][entry["sink_evidence_profile"].as_str().unwrap_or(inventory["default_sink_evidence_profile"].as_str().unwrap())]["targets"],
+                            "qualification_case_ids": entry["qualification_case_ids"],
+                            "qualification_fixture_status": fixture_status,
+                            "per_type_qualification_evidence": qualification_evidence,
+                            "per_type_live_evidence": {
+                                "source": source_live_status,
+                                "all_sinks": sink_live_status
+                            },
+                            "per_type_web_status": web_status
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    for dynamic in inventory["dynamic_type_classes"].as_array().unwrap() {
+        for connector_id in dynamic["connectors"].as_array().unwrap() {
+            let connector_id = connector_id.as_str().unwrap();
+            let connector_status = &inventory["dynamic_catalog_status_by_connector"][connector_id];
+            dynamic_classes.push(json!({
+                "id": dynamic["id"],
+                "connector": connector_id,
+                "status": connector_status["status"],
+                "unmatched_type_status": connector_status["unmatched_type_status"],
+                "discovery": dynamic["discovery"],
+                "catalog_query": dynamic["catalog_query"],
+                "evidence": dynamic["evidence"]
+            }));
+        }
+    }
+    let gaps: Vec<_> = declarations
+        .iter()
+        .filter(|item| item["source_mapping"] == "MISSING_IMPLEMENTATION")
+        .cloned()
+        .collect();
+    let types_without_fixture = inventory["types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["qualification_case_ids"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        })
+        .count();
+    let types_with_family_fixture_only = declarations
+        .iter()
+        .filter(|declaration| declaration["qualification_fixture_status"] == "FAMILY_FIXTURE_ONLY")
+        .map(|declaration| declaration["type_id"].as_str().unwrap())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let per_type_live_source_gaps = declarations
+        .iter()
+        .filter(|declaration| {
+            declaration["per_type_live_evidence"]["source"] == "REQUIRES_PER_TYPE_LIVE_EVIDENCE"
+        })
+        .map(|declaration| {
+            format!(
+                "{}@{}",
+                declaration["type_id"].as_str().unwrap(),
+                declaration["source"].as_str().unwrap()
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    let per_type_live_sink_gaps = declarations
+        .iter()
+        .filter(|declaration| {
+            declaration["per_type_live_evidence"]["all_sinks"] == "REQUIRES_PER_TYPE_LIVE_EVIDENCE"
+        })
+        .map(|declaration| {
+            format!(
+                "{}@{}",
+                declaration["type_id"].as_str().unwrap(),
+                declaration["source"].as_str().unwrap()
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    let missing_evidence = |status: &Value| {
+        status
+            .as_str()
+            .is_some_and(|value| value.starts_with("MISSING"))
+    };
+    let source_profiles = inventory["source_evidence_profiles"].as_object().unwrap();
+    let protocol_profiles = inventory["source_representation_contract"]["protocol_profiles"]
+        .as_object()
+        .unwrap();
+    let sink_targets = inventory["sink_evidence_profiles"]
+        [inventory["default_sink_evidence_profile"].as_str().unwrap()]["targets"]
+        .as_object()
+        .unwrap();
+    let sink_outcomes = inventory["sink_representation_outcomes"]
+        .as_object()
+        .unwrap();
+    let (representation_sources, representation_sinks) =
+        representation_scopes(&inventory["per_type_qualification"]["entries"]);
+    let representation_required =
+        !representation_sources.is_empty() || !representation_sinks.is_empty();
+    let has_missing_implementation = !gaps.is_empty()
+        || types_without_fixture > 0
+        || source_profiles.values().any(|profile| {
+            ["protocol_capture", "semantic_codec", "change_event"]
+                .into_iter()
+                .any(|axis| missing_evidence(&profile[axis]["status"]))
+        })
+        || protocol_profiles.iter().any(|(source_id, profile)| {
+            representation_sources.contains(source_id) && missing_evidence(&profile["status"])
+        })
+        || (representation_required
+            && missing_evidence(&inventory["source_representation_contract"]["status"]))
+        || sink_targets.iter().any(|(sink_id, target)| {
+            ["native_target", "web_candidate", "live"]
+                .into_iter()
+                .any(|axis| missing_evidence(&target[axis]["status"]))
+                || (representation_sinks.contains(sink_id)
+                    && missing_evidence(&target["representation_carrier"]["status"]))
+        })
+        || sink_outcomes.iter().any(|(sink_id, outcomes)| {
+            representation_sinks.contains(sink_id)
+                && missing_evidence(&outcomes["source_representation_preserved"]["status"])
+        })
+        || (representation_required
+            && missing_evidence(&inventory["web_representation_policy"]["status"]))
+        || dynamic_classes
+            .iter()
+            .any(|class| class["unmatched_type_status"] == "MISSING_IMPLEMENTATION");
+    let all_evidence_qualified = !has_missing_implementation
+        && gaps.is_empty()
+        && declarations.iter().all(|declaration| {
+            let evidence = &declaration["per_type_qualification_evidence"];
+            let declaration_representation_sinks: Vec<_> = evidence["sinks"]
+                .as_object()
+                .into_iter()
+                .flat_map(|sinks| sinks.iter())
+                .filter(|(_, sink)| sink["outcome"] == "SOURCE_REPRESENTATION_PRESERVED")
+                .map(|(sink_id, _)| sink_id.as_str())
+                .collect();
+            declaration["qualification_fixture_status"] == "PER_TYPE_QUALIFIED"
+                && (declaration_representation_sinks.is_empty()
+                    || (declaration["protocol_framing_profile"]["status"] == "PASS"
+                        && declaration["source_representation_capture"]["status"] == "PASS"
+                        && declaration_representation_sinks.iter().all(|sink_id| {
+                            declaration["sink_evidence"][*sink_id]["representation_carrier"]["status"] == "PASS"
+                                && declaration["sink_representation_outcomes"][*sink_id]["source_representation_preserved"]["status"] == "PASS"
+                        })))
+        })
+        && source_profiles.values().all(|profile| {
+            ["protocol_capture", "semantic_codec", "change_event"]
+                .into_iter()
+                .all(|axis| profile[axis]["status"] == "PASS")
+        })
+        && protocol_profiles.iter().all(|(source_id, profile)| {
+            !representation_sources.contains(source_id) || profile["status"] == "PASS"
+        })
+        && (!representation_required
+            || inventory["source_representation_contract"]["status"] == "PASS")
+        && sink_targets.iter().all(|(sink_id, target)| {
+            ["native_target", "web_candidate", "live"]
+                .into_iter()
+                .all(|axis| target[axis]["status"] == "PASS")
+                && (!representation_sinks.contains(sink_id)
+                    || target["representation_carrier"]["status"] == "PASS")
+        })
+        && sink_outcomes.iter().all(|(sink_id, outcomes)| {
+            outcomes["value_preserved"]["status"] == "PASS"
+                || (representation_sinks.contains(sink_id)
+                    && outcomes["source_representation_preserved"]["status"] == "PASS")
+        })
+        && (!representation_required || inventory["web_representation_policy"]["status"] == "PASS")
+        && dynamic_classes.iter().all(|class| {
+            class["status"] == "PASS" && class["unmatched_type_status"] != "MISSING_IMPLEMENTATION"
+        })
+        && types_without_fixture == 0
+        && types_with_family_fixture_only == 0;
+    json!({
+        "schema": inventory["schema"],
+        "inventory_revision": inventory["revision"],
+        "per_type_qualification_schema": inventory["per_type_qualification"]["schema"],
+        "per_type_qualification_evidence_registry": inventory["per_type_qualification"]["evidence_registry"],
+        "native_type_count": inventory["types"].as_array().unwrap().len(),
+        "source_declaration_count": declarations.len(),
+        "source_mapping_gaps": gaps.len(),
+        "types_without_qualification_fixture": types_without_fixture,
+        "types_with_family_fixture_only": types_with_family_fixture_only,
+        "per_type_live_source_gaps": per_type_live_source_gaps,
+        "per_type_live_sink_gaps": per_type_live_sink_gaps,
+        "source_representation_qualification_required": representation_required,
+        "status": inventory_status(has_missing_implementation, all_evidence_qualified),
+        "implementation_gaps": gaps,
+        "declarations": declarations,
+        "source_evidence_profiles": inventory["source_evidence_profiles"],
+        "sink_evidence_profiles": inventory["sink_evidence_profiles"],
+        "dynamic_type_classes": dynamic_classes,
+        "dynamic_catalog_status_by_connector": inventory["dynamic_catalog_status_by_connector"],
+        "excluded_type_classes": inventory["excluded_type_classes"]
+    })
+}
+
 fn run_case(
     source: fixture::SourceVersion,
     sink: fixture::SourceVersion,
@@ -997,6 +1837,804 @@ fn assert_dml(source: fixture::SourceVersion, sink: fixture::SourceVersion) {
 }
 
 #[test]
+fn six_version_type_inventory_has_explicit_source_and_sink_evidence_axes() {
+    let inventory = type_inventory();
+    assert_eq!(inventory["schema"], "cdc.type_inventory.v1");
+    assert_eq!(
+        inventory["per_type_qualification"]["schema"],
+        "cdc.native_type_qualification.v1"
+    );
+    for required in [
+        "id",
+        "type_id",
+        "source_connector_id",
+        "sink_connector_id",
+        "axis",
+        "status",
+        "run_id",
+        "artifact_path",
+        "report_digest",
+    ] {
+        assert!(
+            inventory["per_type_qualification"]["evidence_registry"]["required_entry_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(required))
+        );
+    }
+    for axis in [
+        "source.protocol_capture",
+        "source.semantic_codec",
+        "source.change_event",
+        "source.live",
+        "source.source_representation_capture",
+        "source.protocol_framing",
+        "sink.offline",
+        "sink.live",
+        "sink.representation_carrier",
+        "sink.representation_preserved",
+        "web.plan",
+    ] {
+        assert!(
+            inventory["per_type_qualification"]["evidence_registry"]["allowed_axes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(axis))
+        );
+    }
+    assert_eq!(
+        inventory["per_type_qualification"]["required_representation_sink_evidence"],
+        json!([
+            "representation_carrier_evidence",
+            "representation_preservation_evidence"
+        ])
+    );
+    for record in inventory["per_type_qualification"]["evidence_registry"]["entries"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(
+            record["artifact_path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("docs/qualification/evidence/"))
+        );
+    }
+    let representation_contract = &inventory["source_representation_contract"];
+    assert_eq!(
+        representation_contract["schema"],
+        "cdc.source_representation_envelope.v1"
+    );
+    assert_eq!(representation_contract["status"], "MISSING_IMPLEMENTATION");
+    for required_field in [
+        "connector_id",
+        "connector_build",
+        "source_definition_identity",
+        "source_definition_digest",
+        "source_protocol",
+        "protocol_format",
+        "native_type_identity",
+        "native_type_metadata",
+        "payload_bytes",
+        "payload_length_bytes",
+        "payload_sha256",
+        "source_cursor",
+    ] {
+        assert!(
+            representation_contract["required_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(required_field)),
+            "Source Representation Envelope lacks {required_field}"
+        );
+    }
+    assert_eq!(
+        representation_contract["protocol_profiles"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        versions().into_iter().collect()
+    );
+    let web_representation_policy = &inventory["web_representation_policy"];
+    assert_eq!(
+        web_representation_policy["status"],
+        "MISSING_IMPLEMENTATION"
+    );
+    assert_eq!(
+        web_representation_policy["selection"],
+        "explicit_per_field_user_choice_required"
+    );
+    assert_eq!(
+        web_representation_policy["risk_confirmation"],
+        "required_before_plan_activation"
+    );
+    for forbidden in ["primary_key", "unique_key", "row_locator"] {
+        assert!(
+            web_representation_policy["forbidden_without_separate_equivalence_evidence"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(forbidden))
+        );
+    }
+
+    let connector_ids: Vec<_> = inventory["connectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        connector_ids,
+        [
+            "mysql_5_7",
+            "mysql_8_0",
+            "mysql_8_4",
+            "postgresql_15",
+            "postgresql_16",
+            "postgresql_17"
+        ]
+    );
+    assert_eq!(
+        connector_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        PINNED_TYPE_INVENTORY_DIGESTS
+            .iter()
+            .map(|(connector_id, _)| *connector_id)
+            .collect::<Vec<_>>(),
+        "connector versions may not disappear from the inventory silently"
+    );
+    for (connector_id, expected_digest) in PINNED_TYPE_INVENTORY_DIGESTS {
+        assert_eq!(
+            connector_inventory_digest(&inventory, connector_id),
+            expected_digest,
+            "{} native type inventory changed; verify the new or removed declarations, aliases, OID/wire identity, dynamic classes, and exclusions before updating its pinned digest",
+            connector_id
+        );
+    }
+    let code_seams = inventory["source_mapping_code_seams"].as_object().unwrap();
+    assert_eq!(
+        code_seams.keys().cloned().collect::<BTreeSet<_>>(),
+        connector_ids.iter().cloned().collect()
+    );
+    let dynamic_catalog_status = inventory["dynamic_catalog_status_by_connector"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        dynamic_catalog_status
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        connector_ids.iter().cloned().collect(),
+        "every connector needs an explicit dynamic-catalog enumeration status"
+    );
+    for connector_id in &connector_ids {
+        assert_eq!(
+            dynamic_catalog_status[connector_id]["unmatched_type_status"], "MISSING_IMPLEMENTATION",
+            "unmatched catalog types must fail closed for {connector_id}"
+        );
+        assert_eq!(
+            dynamic_catalog_status[connector_id]["status"], "REQUIRES_LIVE_CATALOG_ENUMERATION",
+            "dynamic native type coverage needs a live catalog enumeration for {connector_id}"
+        );
+        for path in code_seams[connector_id].as_array().unwrap() {
+            let path = path.as_str().unwrap();
+            assert!(
+                std::path::Path::new(path).is_file(),
+                "missing SourceTypeMapping code seam {path}"
+            );
+        }
+    }
+    assert_eq!(
+        connector_ids,
+        versions(),
+        "inventory owns the six-version roster"
+    );
+    let config: Value =
+        serde_json::from_str(include_str!("../scripts/qualification-matrix.json")).unwrap();
+    let role_ids: Vec<_> = ["implemented", "source_only", "unsupported"]
+        .into_iter()
+        .flat_map(|key| config[key].as_array().unwrap())
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        role_ids.iter().collect::<BTreeSet<_>>(),
+        connector_ids.iter().collect::<BTreeSet<_>>(),
+        "suite config roles must partition the inventory roster"
+    );
+    assert!(
+        config.get("databases").is_none(),
+        "connector roster must have one source"
+    );
+
+    let mut ids = BTreeSet::new();
+    let mut declaration_count = 0usize;
+    for entry in inventory["types"].as_array().unwrap() {
+        let id = entry["id"].as_str().expect("type id is required");
+        assert!(ids.insert(id), "duplicate native type id {id}");
+        assert!(
+            entry["family"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            entry["semantics"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+
+        let profile_id = entry["declaration_profile"].as_str().unwrap();
+        let source = &inventory["native_declaration_profiles"][profile_id];
+        let source_ids = source["connectors"]
+            .as_array()
+            .expect("source versions are required");
+        assert!(!source_ids.is_empty(), "{id} has no native declaration");
+        assert_eq!(source["storable"], true, "{id} must be a column type");
+        assert!(
+            source["examples"]
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+        );
+        assert!(
+            source["evidence"]
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+        );
+        for source_id in source_ids {
+            let source_id = source_id.as_str().unwrap();
+            assert!(connector_ids.iter().any(|known| known == source_id));
+            let evidence_profile_id = source["evidence_profile"].as_str().unwrap();
+            let profile = &inventory["source_evidence_profiles"][evidence_profile_id];
+            if source_id.starts_with("mysql_") {
+                assert!(
+                    inventory["source_type_identity"]["mysql_binlog_wire_types"][profile_id]
+                        .as_array()
+                        .is_some_and(|wire_types| !wire_types.is_empty()),
+                    "{id}/{source_id} lacks MySQL binlog wire identity"
+                );
+            } else {
+                let oid = &inventory["source_type_identity"]["postgresql_catalog_oid"];
+                assert_eq!(oid["oid_field"], "column type OID");
+                assert!(oid["catalog_query"].as_str().unwrap().contains("t.oid"));
+            }
+            assert!(
+                code_seams[source_id]
+                    .as_array()
+                    .is_some_and(|paths| !paths.is_empty()),
+                "{id}/{source_id} lacks SourceTypeMapping code seam"
+            );
+            for axis in [
+                "protocol_capture",
+                "semantic_codec",
+                "change_event",
+                "source_representation_capture",
+            ] {
+                assert!(
+                    profile[axis]["status"].as_str().is_some(),
+                    "{id}/{source_id}/{axis}"
+                );
+                assert!(
+                    profile[axis]["evidence"].as_array().is_some(),
+                    "{id}/{source_id}/{axis}"
+                );
+            }
+        }
+        for alias in source["aliases"].as_array().unwrap() {
+            let alias = alias.as_str().unwrap();
+            let alias_name = alias.split_whitespace().next().unwrap();
+            let directly_probed = inventory["mapping_aliases"][profile_id]
+                .as_array()
+                .is_some_and(|probes| probes.contains(&json!(alias)));
+            assert!(
+                directly_probed
+                    || inventory["alias_resolution"][profile_id][alias_name].is_object(),
+                "{id} alias '{alias}' lacks a mapping probe or explicit resolution rule"
+            );
+        }
+        declaration_count += (source["examples"].as_array().unwrap().len()
+            + inventory["mapping_aliases"][profile_id]
+                .as_array()
+                .map_or(0, Vec::len))
+            * source_ids.len();
+
+        let sink_profile_id = entry["sink_evidence_profile"]
+            .as_str()
+            .or_else(|| inventory["default_sink_evidence_profile"].as_str())
+            .unwrap();
+        let sinks = inventory["sink_evidence_profiles"][sink_profile_id]["targets"]
+            .as_object()
+            .expect("sink evidence profile must enumerate connectors");
+        assert_eq!(
+            sinks.len(),
+            connector_ids.len(),
+            "{id} must describe all six sinks"
+        );
+        for sink_id in &connector_ids {
+            let sink = sinks
+                .get(sink_id)
+                .unwrap_or_else(|| panic!("{id} lacks {sink_id}"));
+            for axis in [
+                "native_target",
+                "representation_carrier",
+                "web_candidate",
+                "live",
+            ] {
+                assert!(
+                    sink[axis]["status"].as_str().is_some(),
+                    "{id}/{sink_id}/{axis}"
+                );
+                assert!(
+                    sink[axis]["evidence"].as_array().is_some(),
+                    "{id}/{sink_id}/{axis}"
+                );
+            }
+            let outcomes = inventory["sink_representation_outcomes"]
+                .get(sink_id)
+                .unwrap_or_else(|| panic!("missing representation outcomes for {sink_id}"));
+            assert_eq!(
+                outcomes["value_preserved"]["status"],
+                "NOT_QUALIFIED_PER_NATIVE_TYPE"
+            );
+            assert_eq!(
+                outcomes["source_representation_preserved"]["status"],
+                "MISSING_IMPLEMENTATION"
+            );
+            assert!(
+                outcomes["source_representation_preserved"]["carrier_candidates"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+            );
+        }
+    }
+    assert!(
+        ids.len() >= 60,
+        "inventory is missing documented native type families"
+    );
+    assert!(
+        declaration_count >= 100,
+        "version aliases and declaration probes are missing"
+    );
+
+    let dynamic: BTreeSet<_> = inventory["dynamic_type_classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    for required in [
+        "postgresql.arrays",
+        "postgresql.domains",
+        "postgresql.enums",
+        "postgresql.composites",
+        "postgresql.ranges",
+        "postgresql.extensions_and_custom_base_types",
+        "mysql.plugin_or_engine_types",
+    ] {
+        assert!(
+            dynamic.contains(required),
+            "missing dynamic class {required}"
+        );
+    }
+    for dynamic_class in inventory["dynamic_type_classes"].as_array().unwrap() {
+        assert!(dynamic_class["discovery"].as_str().is_some());
+        assert!(
+            dynamic_class["evidence"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        for connector_id in dynamic_class["connectors"].as_array().unwrap() {
+            assert!(connector_ids.contains(&connector_id.as_str().unwrap().to_owned()));
+        }
+        if dynamic_class["id"] == "postgresql.other_defined_catalog_types" {
+            assert!(
+                dynamic_class["catalog_query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("n.nspname = 'pg_catalog'"),
+                "the catch-all catalog scan must be limited to pg_catalog"
+            );
+        }
+    }
+    assert!(
+        inventory["excluded_type_classes"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["id"] == "postgresql.pseudotypes")
+            })
+    );
+
+    let inventory_cases: BTreeSet<_> = inventory["qualification_case_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    let qualification_entries = inventory["per_type_qualification"]["entries"]
+        .as_object()
+        .unwrap();
+    for key in qualification_entries.keys() {
+        let (type_id, source_id) = key
+            .rsplit_once('@')
+            .unwrap_or_else(|| panic!("invalid per-type qualification key {key}"));
+        let declaration = inventory["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == type_id)
+            .unwrap_or_else(|| panic!("orphan per-type qualification receipt {key}"));
+        let profile = &inventory["native_declaration_profiles"]
+            [declaration["declaration_profile"].as_str().unwrap()];
+        assert!(
+            profile["connectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|connector| connector == source_id),
+            "qualification receipt {key} is not a declared source version"
+        );
+    }
+    let actual_cases: BTreeSet<_> = cases().iter().map(|case| case.id).collect();
+    assert_eq!(
+        inventory_cases, actual_cases,
+        "Rust fixture IDs and inventory must evolve together"
+    );
+    for entry in inventory["types"].as_array().unwrap() {
+        for case_id in entry["qualification_case_ids"].as_array().unwrap() {
+            assert!(
+                inventory_cases.contains(case_id.as_str().unwrap()),
+                "stale fixture reference in {}",
+                entry["id"]
+            );
+        }
+    }
+
+    let coverage = type_inventory_coverage();
+    assert_eq!(coverage["source_declaration_count"], declaration_count);
+    assert!(coverage["source_mapping_gaps"].as_u64().unwrap() > 0);
+    assert_eq!(coverage["schema"], "cdc.type_inventory.v1");
+    assert_eq!(coverage["status"], "MISSING_IMPLEMENTATION");
+    assert_eq!(
+        inventory_status(false, false),
+        "REQUIRES_PER_TYPE_QUALIFICATION"
+    );
+    assert_eq!(inventory_status(false, true), "PASS");
+    assert_eq!(inventory_status(true, true), "MISSING_IMPLEMENTATION");
+    for declaration in coverage["declarations"].as_array().unwrap() {
+        let source_id = declaration["source"].as_str().unwrap();
+        assert!(
+            declaration["source_type_identity"]["kind"]
+                .as_str()
+                .is_some()
+        );
+        assert!(declaration["source_mapping_code_seam"].as_array().is_some());
+        assert_eq!(
+            declaration["per_type_live_evidence"]["source"],
+            "REQUIRES_PER_TYPE_LIVE_EVIDENCE"
+        );
+        assert_eq!(
+            declaration["per_type_live_evidence"]["all_sinks"],
+            "REQUIRES_PER_TYPE_LIVE_EVIDENCE"
+        );
+        assert_eq!(
+            declaration["per_type_web_status"],
+            "NOT_QUALIFIED_PER_NATIVE_TYPE"
+        );
+        let protocol = &declaration["protocol_framing_profile"];
+        assert_eq!(protocol["status"], "MISSING_IMPLEMENTATION");
+        assert!(
+            protocol["framing_requirements"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert_eq!(
+            declaration["source_representation_envelope_schema"],
+            "cdc.source_representation_envelope.v1"
+        );
+        assert_eq!(
+            declaration["sink_representation_outcomes"],
+            inventory["sink_representation_outcomes"]
+        );
+        assert_eq!(
+            declaration["web_representation_policy"],
+            inventory["web_representation_policy"]
+        );
+        assert_eq!(
+            protocol,
+            &inventory["source_representation_contract"]["protocol_profiles"][source_id]
+        );
+    }
+    for (profile_id, aliases) in inventory["mapping_aliases"].as_object().unwrap() {
+        assert!(
+            inventory["native_declaration_profiles"]
+                .get(profile_id)
+                .is_some()
+        );
+        assert!(aliases.as_array().is_some_and(|items| !items.is_empty()));
+    }
+}
+
+#[test]
+fn per_type_completion_requires_source_all_sinks_web_and_live_evidence() {
+    let sink_ids = versions();
+    let type_id = "example.native_type";
+    let source_id = "mysql_5_7";
+    let evidence_registry = qualified_type_evidence_registry(type_id, source_id, &sink_ids);
+    let qualified = qualified_type_evidence_fixture(type_id, source_id, &sink_ids);
+    assert_eq!(
+        per_type_source_live_status(&qualified, &evidence_registry, type_id, source_id),
+        "PASS"
+    );
+    assert_eq!(
+        per_type_sink_live_status(
+            &qualified,
+            &evidence_registry,
+            type_id,
+            source_id,
+            &sink_ids
+        ),
+        "PASS"
+    );
+    assert_eq!(
+        per_type_web_status(&qualified, &evidence_registry, type_id, source_id),
+        "PASS"
+    );
+    assert!(per_type_qualification_pass(
+        &qualified,
+        &evidence_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let artifact_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        evidence_registry["entries"][0]["artifact_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let original_artifact = std::fs::read(&artifact_path).unwrap();
+    let mut tampered_artifact: Value = serde_json::from_slice(&original_artifact).unwrap();
+    tampered_artifact["evidence"][0]["status"] = json!("FAIL");
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_vec_pretty(&tampered_artifact).unwrap(),
+    )
+    .unwrap();
+    let tampered_report_accepted = per_type_qualification_pass(
+        &qualified,
+        &evidence_registry,
+        type_id,
+        source_id,
+        &sink_ids,
+    );
+    std::fs::write(&artifact_path, original_artifact).unwrap();
+    assert!(!tampered_report_accepted);
+
+    let mut unregistered_evidence = qualified.clone();
+    unregistered_evidence["source"]["protocol_capture"]["evidence"] = json!(["invented-test-id"]);
+    unregistered_evidence["source"]["live"]["evidence"] = json!(["invented-live-test-id"]);
+    assert!(!per_type_qualification_pass(
+        &unregistered_evidence,
+        &evidence_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    assert_eq!(
+        per_type_source_live_status(
+            &unregistered_evidence,
+            &evidence_registry,
+            type_id,
+            source_id
+        ),
+        "REQUIRES_PER_TYPE_LIVE_EVIDENCE"
+    );
+
+    let mut wrong_scope_registry = evidence_registry.clone();
+    wrong_scope_registry["entries"][0]["type_id"] = json!("another.native_type");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &wrong_scope_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut wrong_source_registry = evidence_registry.clone();
+    wrong_source_registry["entries"][0]["source_connector_id"] = json!("mysql_8_0");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &wrong_source_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut wrong_axis_registry = evidence_registry.clone();
+    wrong_axis_registry["entries"][0]["axis"] = json!("source.live");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &wrong_axis_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut missing_run_id_registry = evidence_registry.clone();
+    missing_run_id_registry["entries"][0]["run_id"] = json!("");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &missing_run_id_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut whitespace_run_id_registry = evidence_registry.clone();
+    whitespace_run_id_registry["entries"][0]["run_id"] = json!("   ");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &whitespace_run_id_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut invalid_digest_registry = evidence_registry.clone();
+    invalid_digest_registry["entries"][0]["report_digest"] = json!("not-a-sha256-digest");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &invalid_digest_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut wrong_but_well_formed_digest_registry = evidence_registry.clone();
+    wrong_but_well_formed_digest_registry["entries"][0]["report_digest"] =
+        json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &wrong_but_well_formed_digest_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut mismatched_run_registry = evidence_registry.clone();
+    mismatched_run_registry["entries"][0]["run_id"] = json!("different-run-id");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &mismatched_run_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut escaping_artifact_registry = evidence_registry.clone();
+    escaping_artifact_registry["entries"][0]["artifact_path"] = json!("../../Cargo.toml");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &escaping_artifact_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut duplicate_evidence_id_registry = evidence_registry.clone();
+    let duplicate = duplicate_evidence_id_registry["entries"][0].clone();
+    duplicate_evidence_id_registry["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &duplicate_evidence_id_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut wrong_sink_registry = evidence_registry.clone();
+    let record = wrong_sink_registry["entries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["axis"] == "sink.live")
+        .unwrap();
+    record["sink_connector_id"] = json!("mysql_8_4");
+    assert!(!per_type_qualification_pass(
+        &qualified,
+        &wrong_sink_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+
+    let mut missing_sink = qualified.clone();
+    missing_sink["sinks"]
+        .as_object_mut()
+        .unwrap()
+        .remove("mysql_8_4");
+    assert!(!per_type_qualification_pass(
+        &missing_sink,
+        &evidence_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+
+    let mut missing_live_evidence = qualified.clone();
+    missing_live_evidence["sinks"]["postgresql_17"]["live_evidence"] = json!([]);
+    assert!(!per_type_qualification_pass(
+        &missing_live_evidence,
+        &evidence_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+
+    let mut representation_only = qualified.clone();
+    representation_only["sinks"]["postgresql_17"]["outcome"] =
+        json!("SOURCE_REPRESENTATION_PRESERVED");
+    representation_only["source"]["source_representation_capture"] = Value::Null;
+    representation_only["source"]["protocol_framing"] = Value::Null;
+    assert!(!per_type_qualification_pass(
+        &representation_only,
+        &evidence_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    representation_only["source"]["source_representation_capture"] = json!({ "status": "PASS", "evidence": [format!("{type_id}@{source_id}:source.source_representation_capture")] });
+    representation_only["source"]["protocol_framing"] = json!({ "status": "PASS", "evidence": [format!("{type_id}@{source_id}:source.protocol_framing")] });
+    assert!(per_type_qualification_pass(
+        &representation_only,
+        &evidence_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let mut missing_representation_readback = representation_only.clone();
+    missing_representation_readback["sinks"]["postgresql_17"]
+        .as_object_mut()
+        .unwrap()
+        .remove("representation_preservation_evidence");
+    assert!(!per_type_qualification_pass(
+        &missing_representation_readback,
+        &evidence_registry,
+        type_id,
+        source_id,
+        &sink_ids
+    ));
+    let scoped_receipts = Value::Object(serde_json::Map::from_iter([(
+        format!("{type_id}@{source_id}"),
+        representation_only,
+    )]));
+    assert_eq!(
+        representation_scopes(&scoped_receipts),
+        (
+            BTreeSet::from([source_id.to_owned()]),
+            BTreeSet::from(["postgresql_17".to_owned()])
+        )
+    );
+
+    let mut inventory = type_inventory().clone();
+    inventory["per_type_qualification"]["evidence_registry"] = evidence_registry.clone();
+    let key = format!("{type_id}@{source_id}");
+    inventory["per_type_qualification"]["entries"]
+        .as_object_mut()
+        .unwrap()
+        .insert(key, qualified);
+    let entry = json!({ "id": type_id, "qualification_case_ids": ["integer"] });
+    assert_eq!(
+        qualification_fixture_status(&inventory, &entry, source_id),
+        "PER_TYPE_QUALIFIED"
+    );
+    let mut no_fixture = entry.clone();
+    no_fixture["qualification_case_ids"] = json!([]);
+    assert_eq!(
+        qualification_fixture_status(&inventory, &no_fixture, source_id),
+        "MISSING_TEST"
+    );
+    let artifact = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        evidence_registry["entries"][0]["artifact_path"]
+            .as_str()
+            .unwrap(),
+    );
+    std::fs::remove_file(&artifact).expect("remove ignored qualification evidence fixture");
+}
+
+#[test]
 fn six_by_six_qualification() {
     let ids = versions();
     let config: Value =
@@ -1052,6 +2690,7 @@ fn six_by_six_qualification() {
         "schema":"cdc.qualification.v2",
         "evidence_scope":"offline_fixture",
         "live_semantics":"adapter_components_only",
+        "type_inventory":type_inventory_coverage(),
         "source_capture_edge_fixtures":[zero_date_fixture_evidence()],
         "directions":directions
     });
@@ -1141,9 +2780,26 @@ fn six_connector_fixtures_and_manifests_are_registered() {
     }
 
     let live = &config["live_qualification"];
+    assert_eq!(
+        live["source_fixture_roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ids.iter().map(String::as_str).collect::<Vec<_>>()
+    );
     assert_eq!(live["source_fixture_roster"].as_array().unwrap().len(), 6);
     assert_eq!(live["sources"].as_array().unwrap().len(), 6);
     assert_eq!(live["sinks"].as_array().unwrap().len(), 6);
+    for component in live["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(live["sinks"].as_array().unwrap())
+    {
+        assert!(ids.contains(&component["database"].as_str().unwrap().to_owned()));
+    }
 }
 
 #[test]

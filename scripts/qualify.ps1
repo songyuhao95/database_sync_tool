@@ -11,7 +11,19 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $PSScriptRoot
 $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'qualification-matrix.json') -Raw | ConvertFrom-Json
+$typeInventory = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'type-inventory.json') -Raw | ConvertFrom-Json
 $legacy = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'test-matrix.json') -Raw | ConvertFrom-Json
+$connectorRoster = @($typeInventory.connectors | ForEach-Object { [string]$_.id })
+if ($connectorRoster.Count -ne 6 -or @($connectorRoster | Select-Object -Unique).Count -ne 6) {
+    throw 'type-inventory.json must declare six unique connector identities.'
+}
+$roleRoster = @($config.implemented) + @($config.source_only) + @($config.unsupported)
+if ($roleRoster.Count -ne $connectorRoster.Count -or
+    @($roleRoster | Select-Object -Unique).Count -ne $connectorRoster.Count -or
+    @($roleRoster | Where-Object { $_ -notin $connectorRoster }).Count -gt 0) {
+    throw 'Every inventory connector must have exactly one implementation-role declaration.'
+}
+$config | Add-Member -NotePropertyName databases -NotePropertyValue $connectorRoster -Force
 
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $root ('target/qualification/' + [guid]::NewGuid().ToString('N'))
@@ -265,9 +277,13 @@ try {
 
     $offlineResult = Get-SuiteResult 'offline-workspace'
     $offlinePassed = $null -ne $offlineResult -and $offlineResult.status -eq 'PASS'
+    $typeDocument = $null
     $types = if ($offlinePassed -and (Test-Path -LiteralPath $typePath)) {
-        @((Get-Content -LiteralPath $typePath -Raw | ConvertFrom-Json).directions)
+        $typeDocument = Get-Content -LiteralPath $typePath -Raw | ConvertFrom-Json
+        @($typeDocument.directions)
     } else { @() }
+    $typeInventoryEvidence = if ($offlinePassed -and $null -ne $typeDocument) { $typeDocument.type_inventory } else { $null }
+    $typeInventoryComplete = $null -ne $typeInventoryEvidence -and $typeInventoryEvidence.status -eq 'PASS'
     $recoveryEvidence = if ($offlinePassed -and (Test-Path -LiteralPath $recoveryPath)) {
         @(Get-Content -LiteralPath $recoveryPath -Raw | ConvertFrom-Json)
     } else { @() }
@@ -508,6 +524,8 @@ try {
         unsupported = @($config.unsupported)
         success = $success
         offline_success = $offlineSuccess
+        type_inventory_complete = $typeInventoryComplete
+        type_inventory = $typeInventoryEvidence
         live_qualified = $liveQualified
         source_qualified = $sourceQualified
         sink_qualified = $sinkQualified
@@ -563,6 +581,13 @@ try {
     Write-Output "Capability invalidation qualified: $capabilityInvalidationQualified"
     Write-Output "Route smoke qualified: $routeSmokeQualified"
     Write-Output "Live qualified: $liveQualified"
+    if ($null -ne $typeInventoryEvidence) {
+        Write-Output "Native type inventory: $($typeInventoryEvidence.status)"
+        Write-Output "Native types: $($typeInventoryEvidence.native_type_count); source declarations: $($typeInventoryEvidence.source_declaration_count); source mapping gaps: $($typeInventoryEvidence.source_mapping_gaps)"
+        Write-Output "Types without a qualification fixture: $($typeInventoryEvidence.types_without_qualification_fixture)"
+    } else {
+        Write-Output 'Native type inventory: MISSING_TEST'
+    }
     Write-Output "Missing directions: $($missing.Count)"
     Write-Output "Report: $summaryPath"
     if ($failed) { exit 1 }

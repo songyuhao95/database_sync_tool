@@ -4,24 +4,22 @@ use serde_json::Value;
 fn issue_15_keeps_its_local_four_by_four_matrix_in_the_six_database_roster() {
     let matrix: Value = serde_json::from_str(include_str!("../scripts/test-matrix.json"))
         .expect("test matrix must be valid JSON");
-    let databases = matrix["databases"]
+    let inventory: Value = serde_json::from_str(include_str!("../scripts/type-inventory.json"))
+        .expect("type inventory must be valid JSON");
+    let databases = inventory["connectors"]
         .as_array()
-        .expect("matrix databases must be an array");
-    let expected = [
-        "mysql_5_7",
-        "mysql_8_0",
-        "mysql_8_4",
-        "postgresql_15",
-        "postgresql_16",
-        "postgresql_17",
-    ];
-    assert_eq!(
-        databases
-            .iter()
-            .map(|value| value.as_str().unwrap())
-            .collect::<Vec<_>>(),
-        expected
+        .expect("type inventory connectors must be an array");
+    let expected: Vec<_> = databases
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        matrix.get("databases").is_none(),
+        "type inventory owns the connector roster"
     );
+    assert_eq!(expected.len(), 6);
+    assert!(expected.contains(&"mysql_5_7"));
+    assert!(expected.contains(&"postgresql_17"));
 
     let suite = matrix["suites"]
         .as_array()
@@ -29,6 +27,14 @@ fn issue_15_keeps_its_local_four_by_four_matrix_in_the_six_database_roster() {
         .iter()
         .find(|suite| suite["id"] == "connector_matrix.local")
         .expect("Issue #15 requires a shared local matrix suite");
+    for suite in matrix["suites"].as_array().unwrap() {
+        for database in suite["databases"].as_array().unwrap() {
+            assert!(
+                expected.contains(&database.as_str().unwrap()),
+                "test suite references a connector missing from the type inventory"
+            );
+        }
+    }
     assert_eq!(suite["mode"], "Local");
     let suite_databases = suite["databases"]
         .as_array()
@@ -61,17 +67,19 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
         .iter()
         .map(|value| value.as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(
-        roster,
-        vec![
-            "mysql_5_7",
-            "mysql_8_0",
-            "mysql_8_4",
-            "postgresql_15",
-            "postgresql_16",
-            "postgresql_17"
-        ]
+    let inventory: Value = serde_json::from_str(include_str!("../scripts/type-inventory.json"))
+        .expect("type inventory must be valid JSON");
+    let type_roster = inventory["connectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        config.get("databases").is_none(),
+        "type inventory owns the connector roster"
     );
+    assert_eq!(roster, type_roster);
 
     let sources = config["live_qualification"]["sources"].as_array().unwrap();
     let sinks = config["live_qualification"]["sinks"].as_array().unwrap();

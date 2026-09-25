@@ -13,6 +13,11 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $PSScriptRoot
 $matrix = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'test-matrix.json') -Raw | ConvertFrom-Json
+$typeInventory = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'type-inventory.json') -Raw | ConvertFrom-Json
+$connectorRoster = @($typeInventory.connectors | ForEach-Object { [string]$_.id })
+if ($connectorRoster.Count -ne 6 -or @($connectorRoster | Select-Object -Unique).Count -ne 6) {
+    throw 'type-inventory.json must declare six unique connector identities.'
+}
 $allowedConfigNames = @($matrix.suites.required_env | Select-Object -Unique)
 function Import-TestConfig {
     param([Parameter(Mandatory)][string]$Path)
@@ -53,9 +58,9 @@ function Import-TestConfig {
     }
     return $imported.ToArray()
 }
-$databases = if ($Database -contains 'all') { @($matrix.databases) } else { @($Database | Select-Object -Unique) }
+$databases = if ($Database -contains 'all') { @($connectorRoster) } else { @($Database | Select-Object -Unique) }
 foreach ($db in $databases) {
-    if ($db -notin $matrix.databases) { throw "Unknown database '$db'. Available: $($matrix.databases -join ', ')" }
+    if ($db -notin $connectorRoster) { throw "Unknown database '$db'. Available: $($connectorRoster -join ', ')" }
 }
 $stages = if ($Stage -eq 'All') { @('Read', 'ChangeEvent', 'Sql') } else { @($Stage) }
 $selected = @($matrix.suites | Where-Object {
