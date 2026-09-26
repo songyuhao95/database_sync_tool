@@ -736,6 +736,7 @@ fn apply_diagnostic(
                 Datum::Null => "null",
                 Datum::Unchanged => "unchanged",
                 Datum::Unavailable => "unavailable",
+                Datum::SourceRepresentationEnvelope(_) => "source_representation",
             })
     });
     let plan_summary = plan.map(|plan| PlanDiagnostic {

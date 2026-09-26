@@ -412,6 +412,10 @@ pub enum LogicalType {
         precision: u16,
         scale: i32,
     },
+    /// A decimal whose source declaration does not impose a precision or
+    /// scale. Values remain coefficient-and-scale pairs, so no finite limit is
+    /// invented from one observed row.
+    DecimalUnbounded,
     Float {
         bits: u8,
     },
@@ -435,6 +439,9 @@ pub enum LogicalType {
     LocalTime {
         fractional_precision: u8,
     },
+    OffsetTime {
+        fractional_precision: u8,
+    },
     LocalDatetime {
         fractional_precision: u8,
     },
@@ -442,6 +449,10 @@ pub enum LogicalType {
         fractional_precision: u8,
     },
     Duration {
+        fractional_precision: u8,
+    },
+    /// Calendar interval fields are independent; month lengths are not fixed.
+    CalendarInterval {
         fractional_precision: u8,
     },
     Year,
@@ -529,6 +540,10 @@ impl LogicalType {
         Self::Decimal { precision, scale }
     }
 
+    pub fn decimal_unbounded() -> Self {
+        Self::DecimalUnbounded
+    }
+
     pub fn float(bits: u8) -> Self {
         Self::Float { bits }
     }
@@ -583,6 +598,12 @@ impl LogicalType {
         }
     }
 
+    pub fn offset_time(fractional_precision: u8) -> Self {
+        Self::OffsetTime {
+            fractional_precision,
+        }
+    }
+
     pub fn instant(fractional_precision: u8) -> Self {
         Self::Instant {
             fractional_precision,
@@ -591,6 +612,12 @@ impl LogicalType {
 
     pub fn duration(fractional_precision: u8) -> Self {
         Self::Duration {
+            fractional_precision,
+        }
+    }
+
+    pub fn calendar_interval(fractional_precision: u8) -> Self {
+        Self::CalendarInterval {
             fractional_precision,
         }
     }
@@ -659,7 +686,7 @@ impl LogicalType {
                 LogicalTypeValidationError("integer width is invalid".into()),
             ),
             Self::Decimal { precision, scale } => {
-                if *precision == 0 || *scale < -1000 || *scale > i32::from(*precision) {
+                if *precision == 0 || !(-1000..=1000).contains(scale) {
                     Err(LogicalTypeValidationError(
                         "decimal precision or scale is invalid".into(),
                     ))
@@ -667,6 +694,26 @@ impl LogicalType {
                     Ok(())
                 }
             }
+            Self::LocalTime {
+                fractional_precision,
+            }
+            | Self::OffsetTime {
+                fractional_precision,
+            }
+            | Self::LocalDatetime {
+                fractional_precision,
+            }
+            | Self::Instant {
+                fractional_precision,
+            }
+            | Self::Duration {
+                fractional_precision,
+            }
+            | Self::CalendarInterval {
+                fractional_precision,
+            } if *fractional_precision > 6 => Err(LogicalTypeValidationError(
+                "temporal fractional precision is invalid".into(),
+            )),
             Self::Float { bits } if !matches!(bits, 32 | 64) => Err(LogicalTypeValidationError(
                 "floating point width is invalid".into(),
             )),
@@ -794,16 +841,18 @@ impl LogicalType {
             Self::Boolean => "boolean",
             Self::Uuid => "uuid",
             Self::Integer { .. } => "integer",
-            Self::Decimal { .. } => "decimal",
+            Self::Decimal { .. } | Self::DecimalUnbounded => "decimal",
             Self::Float { .. } => "float",
             Self::Text { .. } => "text",
             Self::Binary { .. } => "binary",
             Self::BitString { .. } => "bit_string",
             Self::Date => "date",
             Self::LocalTime { .. } => "local_time",
+            Self::OffsetTime { .. } => "offset_time",
             Self::LocalDatetime { .. } => "local_datetime",
             Self::Instant { .. } => "instant",
             Self::Duration { .. } => "duration",
+            Self::CalendarInterval { .. } => "calendar_interval",
             Self::Year => "year",
             Self::Json { .. } => "json",
             Self::Enum { .. } => "enum",
@@ -829,10 +878,9 @@ impl LogicalType {
             (Self::Boolean, LogicalValue::Boolean { .. })
             | (Self::Uuid, LogicalValue::Uuid { .. })
             | (Self::Date, LogicalValue::Date { .. })
-            | (Self::LocalTime { .. }, LogicalValue::LocalTime { .. })
-            | (Self::Duration { .. }, LogicalValue::Duration { .. })
             | (Self::Year, LogicalValue::Year { .. })
             | (Self::Json { .. }, LogicalValue::Json { .. }) => true,
+            (Self::DecimalUnbounded, LogicalValue::Decimal { .. }) => true,
             (
                 Self::Integer { signed, bits },
                 LogicalValue::Integer {
@@ -851,13 +899,78 @@ impl LogicalType {
                 },
             ) => {
                 let digits = unscaled.strip_prefix('-').unwrap_or(unscaled);
-                (if *scale < 0 {
-                    *value_scale == 0
+                if matches!(unscaled.as_str(), "NaN" | "Infinity" | "-Infinity") {
+                    return false;
+                }
+                let scale_matches = *scale == *value_scale || (*scale < 0 && *value_scale == 0);
+                let coefficient = digits.trim_start_matches('0');
+                let significant_digits = if *scale < 0 {
+                    coefficient.trim_end_matches('0').len().max(1)
                 } else {
-                    *scale as usize == *value_scale
-                }) && !digits.is_empty()
-                    && digits.len() <= usize::from(*precision)
+                    coefficient.len().max(1)
+                };
+                let integer_digits = if coefficient.is_empty() {
+                    0
+                } else if *value_scale < 0 {
+                    coefficient
+                        .len()
+                        .saturating_add(value_scale.unsigned_abs() as usize)
+                } else {
+                    coefficient.len().saturating_sub(*value_scale as usize)
+                };
+                let maximum_integer_digits =
+                    i32::from(*precision).saturating_sub(*scale).max(0) as usize;
+                let scale_aligned = *scale >= 0
+                    || *value_scale != 0
+                    || coefficient.is_empty()
+                    || digits
+                        .bytes()
+                        .rev()
+                        .take_while(|byte| *byte == b'0')
+                        .count()
+                        >= scale.unsigned_abs() as usize;
+                scale_matches
+                    && !digits.is_empty()
+                    && significant_digits <= usize::from(*precision)
+                    && integer_digits <= maximum_integer_digits
+                    && scale_aligned
             }
+            (
+                Self::LocalTime {
+                    fractional_precision,
+                },
+                LogicalValue::LocalTime { microsecond, .. },
+            )
+            | (
+                Self::OffsetTime {
+                    fractional_precision,
+                },
+                LogicalValue::OffsetTime { microsecond, .. },
+            )
+            | (
+                Self::Duration {
+                    fractional_precision,
+                },
+                LogicalValue::Duration { microsecond, .. },
+            )
+            | (
+                Self::LocalDatetime {
+                    fractional_precision,
+                },
+                LogicalValue::LocalDatetime { microsecond, .. },
+            ) => fractional_microseconds_match(*microsecond, *fractional_precision),
+            (
+                Self::CalendarInterval {
+                    fractional_precision,
+                },
+                LogicalValue::CalendarInterval { microseconds, .. },
+            ) => fractional_microseconds_match_signed(*microseconds, *fractional_precision),
+            (
+                Self::Instant {
+                    fractional_precision,
+                },
+                LogicalValue::Instant { nanoseconds, .. },
+            ) => fractional_nanoseconds_match(*nanoseconds, *fractional_precision),
             (
                 Self::Float { bits },
                 LogicalValue::Float {
@@ -918,8 +1031,30 @@ impl LogicalType {
                         .enumerate()
                         .all(|(index, value)| !values[..index].contains(value))
             }
-            (Self::LocalDatetime { .. }, LogicalValue::LocalDatetime { .. })
-            | (Self::Instant { .. }, LogicalValue::Instant { .. }) => true,
+            (Self::Date, LogicalValue::TemporalInfinity { kind, .. }) => {
+                *kind == crate::TemporalInfinityKind::Date
+            }
+            (
+                Self::LocalDatetime { .. },
+                LogicalValue::TemporalInfinity {
+                    kind: crate::TemporalInfinityKind::LocalDatetime,
+                    ..
+                },
+            )
+            | (
+                Self::Instant { .. },
+                LogicalValue::TemporalInfinity {
+                    kind: crate::TemporalInfinityKind::Instant,
+                    ..
+                },
+            )
+            | (
+                Self::CalendarInterval { .. },
+                LogicalValue::TemporalInfinity {
+                    kind: crate::TemporalInfinityKind::CalendarInterval,
+                    ..
+                },
+            ) => true,
             (
                 Self::Spatial {
                     subtype,
@@ -1016,11 +1151,26 @@ impl LogicalType {
                     && native_type == &carrier.native_type
                     && source_definition_digest == &carrier.source_definition_digest
                     && encoding == &carrier.encoding
+                    && carrier.reversible != Some(false)
             }
-            (Self::Opaque { .. }, LogicalValue::Raw { .. }) => true,
+            (Self::Opaque { .. }, LogicalValue::Raw { carrier }) => {
+                carrier.reversible != Some(false)
+            }
             _ => false,
         }
     }
+}
+
+fn fractional_microseconds_match(microseconds: u32, precision: u8) -> bool {
+    fractional_microseconds_match_signed(i64::from(microseconds), precision)
+}
+
+fn fractional_microseconds_match_signed(microseconds: i64, precision: u8) -> bool {
+    precision <= 6 && microseconds.rem_euclid(10_i64.pow(u32::from(6 - precision))) == 0
+}
+
+fn fractional_nanoseconds_match(nanoseconds: u32, precision: u8) -> bool {
+    precision <= 6 && nanoseconds.is_multiple_of(10_u32.pow(9 - u32::from(precision)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1270,6 +1420,7 @@ pub enum PlanConfirmationState {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PresenceState {
     Value,
+    SourceRepresentation,
     Null,
     Unchanged,
     Unavailable,
@@ -1281,6 +1432,7 @@ impl PresenceState {
         match datum {
             Datum::Value(_) if generated => Self::GeneratedObservation,
             Datum::Value(_) => Self::Value,
+            Datum::SourceRepresentationEnvelope(_) => Self::SourceRepresentation,
             Datum::Null => Self::Null,
             Datum::Unchanged => Self::Unchanged,
             Datum::Unavailable => Self::Unavailable,
@@ -1788,6 +1940,11 @@ pub fn validate_datum_against_plan(
         // second copy of the manifest's presence list; the common event
         // validator has already checked the operation/image relationship.
         Datum::Null | Datum::Unchanged => Ok(()),
+        Datum::SourceRepresentationEnvelope(_) => Err(plan_failure(
+            plan,
+            "target_capability.source_representation_not_supported",
+            "this conversion plan does not provide a carrier for source representation envelopes",
+        )),
         Datum::Unavailable => Err(plan_failure(
             plan,
             "target_capability.unavailable_value",
@@ -2715,7 +2872,7 @@ fn validate_decimal_plan_value(
         .target
         .parameters
         .get("source_scale")
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.parse::<i32>().ok())
     else {
         return Err(plan_failure(
             plan,
@@ -2723,14 +2880,14 @@ fn validate_decimal_plan_value(
             "Decimal source scale is missing",
         ));
     };
-    if source_precision == 0 || source_scale > source_precision {
+    if source_precision == 0 || !(-1000..=1000).contains(&source_scale) {
         return Err(plan_failure(
             plan,
             "target_capability.decimal_range_invalid",
             "Decimal source precision and scale are invalid",
         ));
     }
-    if *scale != source_scale {
+    if *scale != source_scale && !(source_scale < 0 && *scale == 0) {
         return Err(plan_failure(
             plan,
             "target_capability.decimal_scale_mismatch",
@@ -2753,7 +2910,7 @@ fn validate_decimal_plan_value(
         .target
         .parameters
         .get("target_scale")
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.parse::<i32>().ok())
     else {
         return Err(plan_failure(
             plan,
@@ -2773,9 +2930,13 @@ fn validate_decimal_plan_value(
             "Decimal target integer width is missing",
         ));
     };
+    let expected_integer_digits = i32::try_from(target_precision)
+        .ok()
+        .and_then(|precision| precision.checked_sub(target_scale))
+        .and_then(|digits| usize::try_from(digits.max(0)).ok());
     if target_precision == 0
-        || target_scale > target_precision
-        || target_integer_digits != target_precision - target_scale
+        || !(-1000..=1000).contains(&target_scale)
+        || expected_integer_digits != Some(target_integer_digits)
     {
         return Err(plan_failure(
             plan,
@@ -2791,7 +2952,16 @@ fn validate_decimal_plan_value(
         ));
     };
     if *scale > target_scale {
-        let discarded = scale - target_scale;
+        let Some(discarded) = scale
+            .checked_sub(target_scale)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Err(plan_failure(
+                plan,
+                "target_capability.decimal_scale_mismatch",
+                "Decimal scale difference is outside the supported target range",
+            ));
+        };
         let padded_len = digits.len().max(discarded);
         let padding = padded_len - digits.len();
         let padded = std::iter::repeat_n(b'0', padding)
@@ -2808,11 +2978,22 @@ fn validate_decimal_plan_value(
             ));
         }
     }
-    let integer_part_len = digits.len().saturating_sub(*scale);
-    let integer_digits = digits[..integer_part_len]
-        .iter()
-        .skip_while(|digit| **digit == b'0')
-        .count();
+    let integer_digits = if *scale >= 0 {
+        let integer_part_len = digits
+            .len()
+            .saturating_sub(usize::try_from(*scale).unwrap_or(usize::MAX));
+        digits[..integer_part_len]
+            .iter()
+            .skip_while(|digit| **digit == b'0')
+            .count()
+    } else {
+        let significant_digits = digits.iter().skip_while(|digit| **digit == b'0').count();
+        if significant_digits == 0 {
+            0
+        } else {
+            significant_digits.saturating_add(scale.unsigned_abs() as usize)
+        }
+    };
     if integer_digits > target_integer_digits {
         return Err(plan_failure(
             plan,
@@ -3373,6 +3554,13 @@ fn convert_image_with_plans(
                     "an unavailable source value cannot be written by a conversion plan",
                 ));
             }
+            Datum::SourceRepresentationEnvelope(_) => {
+                return Err(plan_failure(
+                    plan,
+                    "target_capability.source_representation_not_supported",
+                    "this conversion plan does not provide a carrier for source representation envelopes",
+                ));
+            }
         };
     }
     Ok(())
@@ -3624,7 +3812,7 @@ fn convert_temporal_value(
             },
         ) => {
             let offset = parse_timezone_offset(plan)?;
-            let days = days_from_civil(i32::from(*year), u32::from(*month), u32::from(*day));
+            let days = days_from_civil(*year, u32::from(*month), u32::from(*day));
             let seconds = days * 86_400
                 + i64::from(*hour) * 3_600
                 + i64::from(*minute) * 60
@@ -3654,15 +3842,15 @@ fn convert_temporal_value(
             let days = seconds.div_euclid(86_400);
             let day_seconds = seconds.rem_euclid(86_400);
             let (year, month, day) = civil_from_days(days);
-            if !(0..=u16::MAX as i32).contains(&year) || year == 0 {
-                return Err(plan_failure(
+            let year = i32::try_from(year).map_err(|_| {
+                plan_failure(
                     plan,
                     "target_capability.temporal_value_invalid",
-                    "the converted local datetime is outside the target range",
-                ));
-            }
+                    "the converted local datetime year is outside the ChangeEvent range",
+                )
+            })?;
             Ok(LogicalValue::LocalDatetime {
-                year: year as u16,
+                year,
                 month: month as u8,
                 day: day as u8,
                 hour: (day_seconds / 3_600) as u8,
@@ -3689,7 +3877,7 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let day_of_era = z - era * 146_097;
@@ -3700,11 +3888,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let month_part = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_part + 2) / 5 + 1;
     let month = month_part + if month_part < 10 { 3 } else { -9 };
-    (
-        year as i32 + i32::from(month <= 2),
-        month as u32,
-        day as u32,
-    )
+    (year + i64::from(month <= 2), month as u32, day as u32)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5728,7 +5912,10 @@ fn validate_input(input: &CompatibilityInput<'_>) -> Result<(), CompatibilityErr
         })
         .filter_map(|column| match &column.datum {
             Datum::Value(value) => Some(value),
-            Datum::Null | Datum::Unchanged | Datum::Unavailable => None,
+            Datum::Null
+            | Datum::Unchanged
+            | Datum::Unavailable
+            | Datum::SourceRepresentationEnvelope(_) => None,
         })
         .any(|value| !input.source_field.logical_type.matches_value(value));
     if value_mismatch {

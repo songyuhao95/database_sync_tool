@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 fn cursor(display: &str) -> SourceCursor {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -10,6 +11,14 @@ fn cursor(display: &str) -> SourceCursor {
         format: "mysql.binlog.file-position.v1".to_owned(),
         value: URL_SAFE_NO_PAD.encode(raw),
         display: display.to_owned(),
+    }
+}
+
+fn postgresql_cursor() -> SourceCursor {
+    SourceCursor {
+        format: "pg.logical-replication.v1".into(),
+        value: "MC8x".into(),
+        display: "0/1".into(),
     }
 }
 
@@ -186,6 +195,10 @@ fn raw_value_carrier_requires_stable_source_evidence() {
     carrier
         .validate()
         .expect("complete carrier should validate");
+    assert!(
+        carrier.reversible.is_none(),
+        "legacy carrier must not imply value recovery"
+    );
     assert_eq!(carrier.raw_bytes().unwrap(), [0, 255, 1]);
     let encoded = serde_json::to_vec(&carrier).unwrap();
     let decoded: RawValueCarrier = serde_json::from_slice(&encoded).unwrap();
@@ -195,6 +208,353 @@ fn raw_value_carrier_requires_stable_source_evidence() {
     incomplete.codec_identity.clear();
     let error = incomplete.validate().unwrap_err();
     assert_eq!(error.code(), "raw_value_carrier.missing_evidence");
+
+    let evidenced = RawValueCarrier::new(
+        "postgresql.hstore.v1",
+        "hstore",
+        "sha256:definition-1",
+        "binary",
+        URL_SAFE_NO_PAD.encode([0, 255, 1]),
+        None::<String>,
+    )
+    .with_source_context(representation_context(postgresql_cursor()), false)
+    .expect("payload evidence should be recorded");
+    evidenced
+        .validate()
+        .expect("nonreversible evidence validates");
+    assert_eq!(evidenced.reversible, Some(false));
+    assert_eq!(evidenced.payload_length, Some(3));
+    assert!(
+        LogicalValue::Raw {
+            carrier: evidenced.clone(),
+        }
+        .validate()
+        .is_err()
+    );
+    let mut corrupted = evidenced;
+    corrupted.payload_sha256 = Some(format!("sha256:{}", "b".repeat(64)));
+    assert_eq!(
+        corrupted.validate().unwrap_err().code(),
+        "raw_value_carrier.payload_digest_mismatch"
+    );
+}
+
+fn representation_context(cursor: SourceCursor) -> SourceRepresentationContext {
+    SourceRepresentationContext {
+        connector: ConnectorIdentity::new("postgresql", "17"),
+        server_build: ServerBuildIdentity::new("PostgreSQL", "community", "17.0", "17.0-build-1"),
+        source_type_identity: "pg_catalog.numeric/1700/typmod:-1".into(),
+        source_type_definition_digest: format!("sha256:{}", "a".repeat(64)),
+        protocol: "pgoutput-v1".into(),
+        format: SourceRepresentationFormat::Binary,
+        type_metadata: BTreeMap::from([
+            ("oid".into(), "1700".into()),
+            ("typmod".into(), "-1".into()),
+        ]),
+        source_cursor: cursor,
+    }
+}
+
+#[test]
+fn exact_numeric_values_preserve_unbounded_precision_signed_scale_and_specials() {
+    let maximum_postgres_integer_part = "9".repeat(131_072);
+    let arbitrary = LogicalValue::Decimal {
+        unscaled: maximum_postgres_integer_part,
+        scale: 0,
+    };
+    arbitrary.validate().expect("large exact decimal is valid");
+    assert!(LogicalType::decimal_unbounded().matches_value(&arbitrary));
+
+    for (unscaled, scale) in [
+        ("1234567890123456789012345678901234567890", 16_383),
+        ("1200", -3),
+        ("NaN", 0),
+        ("Infinity", 0),
+        ("-Infinity", 0),
+    ] {
+        let value = LogicalValue::Decimal {
+            unscaled: unscaled.into(),
+            scale,
+        };
+        value.validate().expect("exact numeric value validates");
+        let decoded: LogicalValue =
+            serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    LogicalType::decimal(2, -3)
+        .validate()
+        .expect("negative numeric scale is a declared semantic");
+    LogicalType::decimal(2, 3)
+        .validate()
+        .expect("scale greater than precision is representable");
+    assert!(LogicalType::decimal(0, 0).validate().is_err());
+    assert!(
+        LogicalType::decimal(2, -3).matches_value(&LogicalValue::Decimal {
+            unscaled: "99".into(),
+            scale: -3,
+        })
+    );
+    assert!(
+        LogicalType::decimal(2, -3).matches_value(&LogicalValue::Decimal {
+            unscaled: "99000".into(),
+            scale: 0,
+        })
+    );
+    assert!(
+        !LogicalType::decimal(2, -3).matches_value(&LogicalValue::Decimal {
+            unscaled: "100000".into(),
+            scale: 0,
+        })
+    );
+    assert!(
+        !LogicalType::decimal(2, -3).matches_value(&LogicalValue::Decimal {
+            unscaled: "12345".into(),
+            scale: 0,
+        })
+    );
+    assert!(
+        !LogicalType::decimal(2, -3).matches_value(&LogicalValue::Decimal {
+            unscaled: "1200".into(),
+            scale: -3,
+        })
+    );
+    assert!(
+        validate_value(&LogicalValue::Decimal {
+            unscaled: "NaN".into(),
+            scale: 1,
+        })
+        .is_err()
+    );
+    assert!(
+        !LogicalType::decimal(10, 2).matches_value(&LogicalValue::Decimal {
+            unscaled: "Infinity".into(),
+            scale: 0,
+        })
+    );
+    for special in ["NaN", "Infinity", "-Infinity"] {
+        assert!(
+            !LogicalType::decimal(10, 0).matches_value(&LogicalValue::Decimal {
+                unscaled: special.into(),
+                scale: 0,
+            }),
+            "bounded decimal cannot contain {special}"
+        );
+    }
+}
+
+#[test]
+fn temporal_values_preserve_bce_years_infinity_offsets_and_calendar_interval_parts() {
+    for value in [
+        LogicalValue::Date {
+            year: -4_712,
+            month: 2,
+            day: 29,
+        },
+        LogicalValue::LocalDatetime {
+            year: 0,
+            month: 2,
+            day: 29,
+            hour: 23,
+            minute: 59,
+            second: 59,
+            microsecond: 999_999,
+        },
+        LogicalValue::Date {
+            year: 294_276,
+            month: 12,
+            day: 31,
+        },
+        LogicalValue::Year { value: i32::MAX },
+        LogicalValue::LocalTime {
+            hour: 24,
+            minute: 0,
+            second: 0,
+            microsecond: 0,
+        },
+        LogicalValue::OffsetTime {
+            hour: 24,
+            minute: 0,
+            second: 0,
+            microsecond: 0,
+            offset_seconds: -57_599,
+        },
+        LogicalValue::CalendarInterval {
+            months: i32::MIN,
+            days: i32::MAX,
+            microseconds: i64::MIN,
+        },
+    ] {
+        value.validate().expect("temporal boundary value validates");
+        let decoded: LogicalValue =
+            serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    for (kind, value) in [
+        (TemporalInfinityKind::Date, LogicalType::date()),
+        (
+            TemporalInfinityKind::LocalDatetime,
+            LogicalType::local_datetime(6),
+        ),
+        (TemporalInfinityKind::Instant, LogicalType::instant(6)),
+        (
+            TemporalInfinityKind::CalendarInterval,
+            LogicalType::calendar_interval(6),
+        ),
+    ] {
+        let infinity = LogicalValue::TemporalInfinity {
+            kind,
+            negative: true,
+        };
+        infinity.validate().unwrap();
+        assert!(value.matches_value(&infinity));
+    }
+    assert!(
+        LogicalType::offset_time(6).matches_value(&LogicalValue::OffsetTime {
+            hour: 15,
+            minute: 59,
+            second: 0,
+            microsecond: 1,
+            offset_seconds: 57_540,
+        })
+    );
+    assert!(
+        LogicalType::calendar_interval(6).matches_value(&LogicalValue::CalendarInterval {
+            months: 1,
+            days: 2,
+            microseconds: 3_000_000,
+        })
+    );
+    assert!(
+        LogicalType::offset_time(3).matches_value(&LogicalValue::OffsetTime {
+            hour: 12,
+            minute: 0,
+            second: 0,
+            microsecond: 123_000,
+            offset_seconds: -57_599,
+        })
+    );
+    assert!(
+        !LogicalType::offset_time(3).matches_value(&LogicalValue::OffsetTime {
+            hour: 12,
+            minute: 0,
+            second: 0,
+            microsecond: 123_456,
+            offset_seconds: -57_599,
+        })
+    );
+    assert!(
+        LogicalType::calendar_interval(3).matches_value(&LogicalValue::CalendarInterval {
+            months: 1,
+            days: -2,
+            microseconds: -123_000,
+        })
+    );
+    assert!(
+        !LogicalType::calendar_interval(3).matches_value(&LogicalValue::CalendarInterval {
+            months: 1,
+            days: -2,
+            microseconds: -123_456,
+        })
+    );
+    assert!(
+        !LogicalType::instant(6).matches_value(&LogicalValue::Instant {
+            unix_seconds: "0".into(),
+            nanoseconds: 123_456_789,
+        })
+    );
+
+    assert!(
+        validate_value(&LogicalValue::Date {
+            year: 0,
+            month: 2,
+            day: 30,
+        })
+        .is_err()
+    );
+    assert!(
+        validate_value(&LogicalValue::OffsetTime {
+            hour: 10,
+            minute: 0,
+            second: 0,
+            microsecond: 0,
+            offset_seconds: 57_600,
+        })
+        .is_err()
+    );
+    assert!(
+        validate_value(&LogicalValue::LocalTime {
+            hour: 24,
+            minute: 0,
+            second: 0,
+            microsecond: 1,
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn source_representation_envelope_is_integrity_checked_and_not_a_logical_value() {
+    let mut transaction = insert_transaction();
+    let change = &mut transaction.changes[0];
+    let cursor = change.source_cursor.clone();
+    let envelope = SourceRepresentationEnvelope::new(
+        representation_context(cursor.clone()),
+        "binary",
+        &[0, 255, 1],
+    );
+    envelope.validate().expect("source evidence is complete");
+    assert_eq!(envelope.raw_bytes().unwrap(), [0, 255, 1]);
+
+    let mut invalid_length = envelope.clone();
+    invalid_length.payload_length += 1;
+    assert_eq!(
+        invalid_length.validate().unwrap_err().code(),
+        "source_representation.payload_length_mismatch"
+    );
+    let mut invalid_digest = envelope.clone();
+    invalid_digest.payload_sha256 = format!("sha256:{}", "b".repeat(64));
+    assert_eq!(
+        invalid_digest.validate().unwrap_err().code(),
+        "source_representation.payload_digest_mismatch"
+    );
+
+    let column = &mut change.after.as_mut().unwrap()[0];
+    column.primary_key_ordinal = None;
+    column.datum = Datum::SourceRepresentationEnvelope(envelope.clone());
+    let validated = validate(transaction).expect("envelope is a separate datum payload");
+    let encoded = json(&validated).expect("envelope serializes in v0.3");
+    assert!(encoded.contains("source_representation_envelope"));
+    assert!(encoded.contains("payload_sha256"));
+    let mut reader = JsonReader::new(encoded.as_bytes());
+    let replayed = reader.next_transaction().unwrap().unwrap();
+    reader.finish().unwrap();
+    assert_eq!(
+        replayed.transaction().changes[0].after.as_ref().unwrap()[0].datum,
+        Datum::SourceRepresentationEnvelope(envelope)
+    );
+    assert_eq!(
+        replayed.transaction().content_digest(),
+        validated.transaction().content_digest()
+    );
+}
+
+#[test]
+fn representation_envelope_must_match_event_cursor_and_cannot_be_a_key() {
+    let mut transaction = insert_transaction();
+    let mut context = representation_context(transaction.changes[0].source_cursor.clone());
+    context.source_cursor.value = "different-position".into();
+    let envelope = SourceRepresentationEnvelope::new(context, "binary", &[1, 2, 3]);
+    transaction.changes[0].after.as_mut().unwrap()[0].datum =
+        Datum::SourceRepresentationEnvelope(envelope);
+    assert!(validate(transaction.clone()).is_err());
+
+    transaction.changes[0].source_cursor.value = "different-position".into();
+    assert!(
+        validate(transaction).is_err(),
+        "envelopes cannot be row keys"
+    );
 }
 
 #[test]

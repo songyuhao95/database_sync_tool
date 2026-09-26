@@ -244,7 +244,11 @@ fn representative_value(logical_type: &LogicalType) -> Option<LogicalValue> {
         },
         LogicalType::Decimal { scale, .. } => LogicalValue::Decimal {
             unscaled: "1".into(),
-            scale: usize::try_from((*scale).max(0)).ok()?,
+            scale: *scale,
+        },
+        LogicalType::DecimalUnbounded => LogicalValue::Decimal {
+            unscaled: "1".into(),
+            scale: 0,
         },
         LogicalType::Float { bits } => LogicalValue::Float {
             bits: *bits,
@@ -287,6 +291,13 @@ fn representative_value(logical_type: &LogicalType) -> Option<LogicalValue> {
             second: 3,
             microsecond: 123_000,
         },
+        LogicalType::OffsetTime { .. } => LogicalValue::OffsetTime {
+            hour: 1,
+            minute: 2,
+            second: 3,
+            microsecond: 123_000,
+            offset_seconds: 5 * 60 * 60 + 30 * 60,
+        },
         LogicalType::LocalDatetime { .. } => LogicalValue::LocalDatetime {
             year: 2026,
             month: 9,
@@ -306,6 +317,11 @@ fn representative_value(logical_type: &LogicalType) -> Option<LogicalValue> {
             minutes: 2,
             seconds: 3,
             microsecond: 123_000,
+        },
+        LogicalType::CalendarInterval { .. } => LogicalValue::CalendarInterval {
+            months: 2,
+            days: -3,
+            microseconds: 4_000_005,
         },
         LogicalType::Year => LogicalValue::Year { value: 2024 },
         LogicalType::Json { .. } => LogicalValue::Json {

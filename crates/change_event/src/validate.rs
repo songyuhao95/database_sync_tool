@@ -273,6 +273,14 @@ pub fn validate(transaction: ChangeTransaction) -> Result<ValidatedTransaction> 
         if let Some(row) = &change.after {
             image(row, change.operation, false)?;
         }
+        for column in change.before.iter().chain(change.after.iter()).flatten() {
+            if let Datum::SourceRepresentationEnvelope(envelope) = &column.datum {
+                ensure(
+                    envelope.context.source_cursor == change.source_cursor,
+                    "source representation cursor differs from its Change Event cursor",
+                )?;
+            }
+        }
         if let (Some(before), Some(after)) = (&change.before, &change.after) {
             ensure(
                 before.len() == after.len()
@@ -336,6 +344,10 @@ pub(crate) fn image(row: &[ColumnDatum], operation: Operation, is_before: bool) 
         }
         if let Datum::Value(v) = &column.datum {
             logical_value(v)?;
+        } else if let Datum::SourceRepresentationEnvelope(envelope) = &column.datum {
+            envelope.validate().map_err(|error| {
+                ChangeEventValidationError(format!("{}: {error}", error.code()))
+            })?;
         }
     }
     ensure(
@@ -381,8 +393,8 @@ fn bytes(value: &str) -> Result<()> {
         "invalid base64url bytes",
     )
 }
-fn date(year: u16, month: u8, day: u8) -> Result<()> {
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+fn date(year: i32, month: u8, day: u8) -> Result<()> {
+    let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
     let days = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -395,10 +407,25 @@ fn date(year: u16, month: u8, day: u8) -> Result<()> {
         }
         _ => 0,
     };
+    ensure(day > 0 && day <= days, "invalid calendar date")
+}
+
+fn decimal(unscaled: &str, scale: i32) -> Result<()> {
+    if matches!(unscaled, "NaN" | "Infinity" | "-Infinity") {
+        return ensure(scale == 0, "special decimal values must have scale zero");
+    }
+    let digits = unscaled.strip_prefix('-').unwrap_or(unscaled);
     ensure(
-        (1..=9999).contains(&year) && day > 0 && day <= days,
-        "invalid calendar date",
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+        "invalid decimal coefficient",
     )
+}
+
+fn time(hour: u8, minute: u8, second: u8, microsecond: u32) -> bool {
+    (hour < 24 || (hour == 24 && minute == 0 && second == 0 && microsecond == 0))
+        && minute < 60
+        && second < 60
+        && microsecond < 1_000_000
 }
 fn logical_value(value: &LogicalValue) -> Result<()> {
     logical_value_at_depth(value, 0)
@@ -424,16 +451,7 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             bits,
             value,
         } => integer(value, *signed, *bits),
-        LogicalValue::Decimal { unscaled, scale } => {
-            let digits = unscaled.strip_prefix('-').unwrap_or(unscaled);
-            ensure(
-                !digits.is_empty()
-                    && digits.len() <= 1000
-                    && *scale <= 1000
-                    && digits.bytes().all(|b| b.is_ascii_digit()),
-                "invalid or oversized decimal",
-            )
-        }
+        LogicalValue::Decimal { unscaled, scale } => decimal(unscaled, *scale),
         LogicalValue::Float { bits, ieee754_hex } => float(*bits, ieee754_hex),
         LogicalValue::Text {
             charset,
@@ -466,8 +484,19 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             second,
             microsecond,
         } => ensure(
-            *hour < 24 && *minute < 60 && *second < 60 && *microsecond < 1_000_000,
+            time(*hour, *minute, *second, *microsecond),
             "invalid local time",
+        ),
+        LogicalValue::OffsetTime {
+            hour,
+            minute,
+            second,
+            microsecond,
+            offset_seconds,
+        } => ensure(
+            time(*hour, *minute, *second, *microsecond)
+                && (-57_599..=57_599).contains(offset_seconds),
+            "invalid offset time",
         ),
         LogicalValue::LocalDatetime {
             year,
@@ -480,7 +509,7 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
         } => {
             date(*year, *month, *day)?;
             ensure(
-                *hour < 24 && *minute < 60 && *second < 60 && *microsecond < 1_000_000,
+                time(*hour, *minute, *second, *microsecond),
                 "invalid datetime",
             )
         }
@@ -493,6 +522,7 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             *minutes < 60 && *seconds < 60 && *microsecond < 1_000_000,
             "invalid duration",
         ),
+        LogicalValue::CalendarInterval { .. } => Ok(()),
         LogicalValue::Instant {
             unix_seconds,
             nanoseconds,
@@ -500,7 +530,8 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             integer(unix_seconds, true, 64)?;
             ensure(*nanoseconds < 1_000_000_000, "invalid instant fraction")
         }
-        LogicalValue::Year { value } => ensure(*value <= 9999, "invalid year"),
+        LogicalValue::Year { .. } => Ok(()),
+        LogicalValue::TemporalInfinity { .. } => Ok(()),
         LogicalValue::Enum { label } => ensure(
             !label.is_empty() && !label.contains('\0'),
             "invalid ENUM label",
@@ -615,9 +646,15 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             )
         }
         LogicalValue::Domain { value } => logical_value_at_depth(value, depth + 1),
-        LogicalValue::Raw { carrier } => carrier
-            .validate()
-            .map_err(|error| ChangeEventValidationError(format!("{}: {error}", error.code()))),
+        LogicalValue::Raw { carrier } => {
+            ensure(
+                carrier.reversible != Some(false),
+                "nonreversible raw carrier must use a source representation envelope",
+            )?;
+            carrier
+                .validate()
+                .map_err(|error| ChangeEventValidationError(format!("{}: {error}", error.code())))
+        }
         LogicalValue::Json { value } => json_value(value, 0),
     }
 }
@@ -769,10 +806,15 @@ fn json_value(value: &JsonValue, depth: usize) -> Result<()> {
         JsonValue::SignedInteger(v) => integer(v, true, 64),
         JsonValue::UnsignedInteger(v) => integer(v, false, 64),
         JsonValue::DoubleBits(v) => float(64, v),
-        JsonValue::Decimal { unscaled, scale } => logical_value(&LogicalValue::Decimal {
-            unscaled: unscaled.clone(),
-            scale: *scale,
-        }),
+        JsonValue::Decimal { unscaled, scale } => {
+            let scale = i32::try_from(*scale).map_err(|_| {
+                ChangeEventValidationError("JSON decimal scale is too large".into())
+            })?;
+            logical_value(&LogicalValue::Decimal {
+                unscaled: unscaled.clone(),
+                scale,
+            })
+        }
         JsonValue::Array(items) => {
             for item in items {
                 json_value(item, depth + 1)?;

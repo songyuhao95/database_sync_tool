@@ -25,7 +25,7 @@ fn value(logical_type: &LogicalType) -> LogicalValue {
         },
         LogicalType::Decimal { scale, .. } => LogicalValue::Decimal {
             unscaled: "123456".into(),
-            scale: *scale as usize,
+            scale: *scale,
         },
         LogicalType::Float { bits } => LogicalValue::Float {
             bits: *bits,

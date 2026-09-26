@@ -259,6 +259,9 @@ impl StatementBuilder {
                     diagnostic_sql,
                 })
             }
+            Datum::SourceRepresentationEnvelope(_) => Err(capability_failure(
+                "PostgreSQL Sink has no qualified carrier plan for source representation envelopes",
+            )),
         }
     }
 
@@ -613,6 +616,12 @@ fn render_verification(change: &RowChange) -> io::Result<Option<PreparedQuery>> 
                     column.name
                 )));
             }
+            Datum::SourceRepresentationEnvelope(_) => {
+                return Err(capability_failure(format!(
+                    "generated column {} has no LogicalValue observation",
+                    column.name
+                )));
+            }
         }
     }
     Ok(Some(PreparedQuery {
@@ -657,6 +666,11 @@ fn key_predicates(
                 let value = builder.datum(column)?;
                 predicates.push(format!("{name} = {}", value.sql));
                 diagnostic_predicates.push(format!("{name} = {}", value.diagnostic_sql));
+            }
+            Datum::SourceRepresentationEnvelope(_) => {
+                return Err(capability_failure(
+                    "source representation envelopes cannot be used as a row locator",
+                ));
             }
         }
     }
@@ -786,7 +800,7 @@ fn parameter_for(value: &LogicalValue, native_type: &str) -> io::Result<Paramete
             *bit_order,
         )?)),
         LogicalValue::Date { year, month, day } => {
-            Ok(Parameter::Date(format!("{year:04}-{month:02}-{day:02}")))
+            Ok(Parameter::Date(postgres_date(*year, *month, *day)))
         }
         LogicalValue::LocalTime {
             hour,
@@ -805,7 +819,8 @@ fn parameter_for(value: &LogicalValue, native_type: &str) -> io::Result<Paramete
             second,
             microsecond,
         } => Ok(Parameter::Timestamp(format!(
-            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{microsecond:06}"
+            "{} {hour:02}:{minute:02}:{second:02}.{microsecond:06}",
+            postgres_date(*year, *month, *day)
         ))),
         LogicalValue::Duration {
             negative,
@@ -869,11 +884,14 @@ fn parameter_for(value: &LogicalValue, native_type: &str) -> io::Result<Paramete
         LogicalValue::Raw { carrier } => Ok(Parameter::CustomBinary(
             carrier.raw_bytes().map_err(capability_failure)?,
         )),
-        LogicalValue::Map { .. } | LogicalValue::Null | LogicalValue::InvalidTemporal { .. } => {
-            Err(capability_failure(
-                "PostgreSQL has no qualified target representation for this value",
-            ))
-        }
+        LogicalValue::Map { .. }
+        | LogicalValue::Null
+        | LogicalValue::InvalidTemporal { .. }
+        | LogicalValue::OffsetTime { .. }
+        | LogicalValue::CalendarInterval { .. }
+        | LogicalValue::TemporalInfinity { .. } => Err(capability_failure(
+            "PostgreSQL has no qualified target representation for this value",
+        )),
         LogicalValue::Json { value } => Ok(Parameter::Json(
             render_json(value).map_err(capability_failure)?,
         )),
@@ -1070,7 +1088,7 @@ fn value_input(value: &LogicalValue) -> io::Result<String> {
             bit_order,
             ..
         } => bit_string_text(&decode_bytes(bytes_base64url)?, *bit_length, *bit_order),
-        LogicalValue::Date { year, month, day } => Ok(format!("{year:04}-{month:02}-{day:02}")),
+        LogicalValue::Date { year, month, day } => Ok(postgres_date(*year, *month, *day)),
         LogicalValue::LocalTime {
             hour,
             minute,
@@ -1088,7 +1106,8 @@ fn value_input(value: &LogicalValue) -> io::Result<String> {
             second,
             microsecond,
         } => Ok(format!(
-            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{microsecond:06}"
+            "{} {hour:02}:{minute:02}:{second:02}.{microsecond:06}",
+            postgres_date(*year, *month, *day)
         )),
         LogicalValue::Array { .. }
         | LogicalValue::ArrayWithMetadata { .. }
@@ -1106,6 +1125,9 @@ fn value_input(value: &LogicalValue) -> io::Result<String> {
             bytes_base64url, ..
         } => Ok(hex(&decode_bytes(bytes_base64url)?)),
         LogicalValue::Duration { .. }
+        | LogicalValue::OffsetTime { .. }
+        | LogicalValue::CalendarInterval { .. }
+        | LogicalValue::TemporalInfinity { .. }
         | LogicalValue::Instant { .. }
         | LogicalValue::Map { .. }
         | LogicalValue::InvalidTemporal { .. } => Err(capability_failure(
@@ -1153,11 +1175,47 @@ fn decode_bytes(value: &str) -> io::Result<Vec<u8>> {
         .map_err(|error| capability_failure(format!("invalid base64url bytes: {error}")))
 }
 
-fn render_decimal(unscaled: &str, scale: usize) -> io::Result<String> {
+fn render_decimal(unscaled: &str, scale: i32) -> io::Result<String> {
+    if matches!(unscaled, "NaN" | "Infinity" | "-Infinity") {
+        return if scale == 0 {
+            Ok(unscaled.into())
+        } else {
+            Err(capability_failure(
+                "special numeric values must have scale zero",
+            ))
+        };
+    }
     let negative = unscaled.starts_with('-');
     let digits = unscaled.strip_prefix(['-', '+']).unwrap_or(unscaled);
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(capability_failure("invalid decimal"));
+    }
+    if scale > 16_383 {
+        return Err(capability_failure(
+            "numeric scale exceeds the PostgreSQL value limit",
+        ));
+    }
+    if scale < 0 {
+        let zeros = usize::try_from(scale.unsigned_abs())
+            .map_err(|_| capability_failure("numeric scale is too large"))?;
+        if digits.len().saturating_add(zeros) > 131_072 {
+            return Err(capability_failure(
+                "numeric integer precision exceeds the PostgreSQL value limit",
+            ));
+        }
+        return Ok(format!(
+            "{}{}{}",
+            if negative { "-" } else { "" },
+            digits,
+            "0".repeat(zeros)
+        ));
+    }
+    let scale = usize::try_from(scale)
+        .map_err(|_| capability_failure("numeric scale is outside the PostgreSQL range"))?;
+    if digits.len().saturating_sub(scale) > 131_072 {
+        return Err(capability_failure(
+            "numeric integer precision exceeds the PostgreSQL value limit",
+        ));
     }
     let magnitude = if scale == 0 {
         digits.to_owned()
@@ -1168,6 +1226,14 @@ fn render_decimal(unscaled: &str, scale: usize) -> io::Result<String> {
         format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
     };
     Ok(format!("{}{}", if negative { "-" } else { "" }, magnitude))
+}
+
+fn postgres_date(year: i32, month: u8, day: u8) -> String {
+    if year <= 0 {
+        format!("{:04}-{month:02}-{day:02} BC", 1_i64 - i64::from(year))
+    } else {
+        format!("{year:04}-{month:02}-{day:02}")
+    }
 }
 
 fn render_logical_value(value: &LogicalValue) -> io::Result<String> {
@@ -1215,7 +1281,7 @@ fn render_logical_value(value: &LogicalValue) -> io::Result<String> {
             )?
         )),
         LogicalValue::Date { year, month, day } => {
-            Ok(format!("DATE '{year:04}-{month:02}-{day:02}'"))
+            Ok(format!("DATE '{}'", postgres_date(*year, *month, *day)))
         }
         LogicalValue::LocalTime {
             hour,
@@ -1234,7 +1300,8 @@ fn render_logical_value(value: &LogicalValue) -> io::Result<String> {
             second,
             microsecond,
         } => Ok(format!(
-            "TIMESTAMP '{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{microsecond:06}'"
+            "TIMESTAMP '{} {hour:02}:{minute:02}:{second:02}.{microsecond:06}'",
+            postgres_date(*year, *month, *day)
         )),
         LogicalValue::Duration {
             negative,
@@ -1290,11 +1357,14 @@ fn render_logical_value(value: &LogicalValue) -> io::Result<String> {
             "decode('{}', 'hex')",
             hex(&carrier.raw_bytes().map_err(capability_failure)?)
         )),
-        LogicalValue::Map { .. } | LogicalValue::Null | LogicalValue::InvalidTemporal { .. } => {
-            Err(capability_failure(
-                "PostgreSQL 15 has no qualified SQL rendering for this structured value",
-            ))
-        }
+        LogicalValue::Map { .. }
+        | LogicalValue::Null
+        | LogicalValue::InvalidTemporal { .. }
+        | LogicalValue::OffsetTime { .. }
+        | LogicalValue::CalendarInterval { .. }
+        | LogicalValue::TemporalInfinity { .. } => Err(capability_failure(
+            "PostgreSQL 15 has no qualified SQL rendering for this structured value",
+        )),
         LogicalValue::Json { value } => {
             Ok(format!("{}::jsonb", quote_literal(&render_json(value)?)))
         }
@@ -1370,7 +1440,11 @@ fn render_json(value: &JsonValue) -> io::Result<String> {
             }
             Ok(rendered)
         }
-        JsonValue::Decimal { unscaled, scale } => render_decimal(unscaled, *scale),
+        JsonValue::Decimal { unscaled, scale } => render_decimal(
+            unscaled,
+            i32::try_from(*scale)
+                .map_err(|_| capability_failure("JSON numeric scale is too large"))?,
+        ),
         JsonValue::Array(values) => values
             .iter()
             .map(render_json)

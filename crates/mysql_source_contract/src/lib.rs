@@ -136,7 +136,8 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
         }
         LogicalValue::Decimal { scale, .. } => {
             matches!(base, "decimal" | "numeric")
-                && decimal_scale(&native).is_none_or(|declared| declared == *scale)
+                && decimal_scale(&native)
+                    .is_none_or(|declared| i32::try_from(declared).ok() == Some(*scale))
         }
         LogicalValue::Float { bits, .. } => float_bits(&native) == Some(*bits),
         LogicalValue::Text { charset, .. } => {
@@ -215,6 +216,9 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
         | LogicalValue::MultiRange { .. }
         | LogicalValue::Null
         | LogicalValue::LocalTime { .. }
+        | LogicalValue::OffsetTime { .. }
+        | LogicalValue::CalendarInterval { .. }
+        | LogicalValue::TemporalInfinity { .. }
         | LogicalValue::Network { .. }
         | LogicalValue::Xml { .. }
         | LogicalValue::Domain { .. }

@@ -597,7 +597,8 @@ fn parse_decimal(text: &str) -> io::Result<LogicalValue> {
     };
     Ok(LogicalValue::Decimal {
         unscaled,
-        scale: fraction.len(),
+        scale: i32::try_from(fraction.len())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     })
 }
 
@@ -634,7 +635,11 @@ fn convert_json_dom(value: JsonDom) -> io::Result<JsonValue> {
             else {
                 unreachable!()
             };
-            JsonValue::Decimal { unscaled, scale }
+            JsonValue::Decimal {
+                unscaled,
+                scale: usize::try_from(scale)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            }
         }
         JsonDom::Scalar(JsonScalar::Number(JsonNumber::Double(value))) => {
             JsonValue::DoubleBits(format!("{:016x}", value.to_bits()))

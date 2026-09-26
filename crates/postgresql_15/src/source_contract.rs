@@ -206,24 +206,24 @@ fn valid_character(native: &str) -> bool {
 }
 
 fn valid_parameterized_numeric(native: &str) -> bool {
+    if matches!(native, "numeric" | "decimal") {
+        return true;
+    }
     let Some(parameters) = native
         .strip_prefix("numeric(")
+        .or_else(|| native.strip_prefix("decimal("))
         .and_then(|value| value.strip_suffix(')'))
     else {
         return false;
     };
-    let Some((precision, scale)) = parameters.split_once(',') else {
+    let mut parts = parameters.split(',');
+    let Ok(precision) = parts.next().unwrap_or_default().trim().parse::<usize>() else {
         return false;
     };
-    let Ok(precision) = precision.trim().parse::<usize>() else {
+    let Ok(scale) = parts.next().unwrap_or("0").trim().parse::<i32>() else {
         return false;
     };
-    let Ok(scale) = scale.trim().parse::<i32>() else {
-        return false;
-    };
-    precision > 0
-        && precision <= 1000
-        && (-1000..=i32::try_from(precision).unwrap()).contains(&scale)
+    parts.next().is_none() && precision > 0 && precision <= 1000 && (-1000..=1000).contains(&scale)
 }
 
 fn valid_parameterized_timestamp(native: &str) -> bool {
@@ -266,10 +266,28 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str
         }
         LogicalValue::Binary { .. } => native == "bytea",
         LogicalValue::Date { .. } => native == "date",
+        LogicalValue::TemporalInfinity { kind, .. } => match kind {
+            change_event::TemporalInfinityKind::Date => native == "date",
+            change_event::TemporalInfinityKind::LocalDatetime => {
+                native == "timestamp without time zone"
+                    || valid_parameterized_timestamp(&native)
+                        && native.ends_with("without time zone")
+            }
+            change_event::TemporalInfinityKind::Instant => {
+                native == "timestamp with time zone"
+                    || valid_parameterized_timestamp(&native) && native.ends_with("with time zone")
+            }
+            change_event::TemporalInfinityKind::CalendarInterval => native.starts_with("interval"),
+        },
         LogicalValue::LocalTime { .. } => {
             native == "time"
                 || native == "time without time zone"
                 || valid_parameterized_time(&native)
+        }
+        LogicalValue::OffsetTime { .. } => {
+            native == "time with time zone"
+                || native == "timetz"
+                || valid_parameterized_time(&native) && native.ends_with("with time zone")
         }
         LogicalValue::LocalDatetime { .. } => {
             native.ends_with("without time zone")
@@ -279,6 +297,7 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str
             native.ends_with("with time zone")
                 && (native.starts_with("timestamp") || valid_parameterized_timestamp(&native))
         }
+        LogicalValue::CalendarInterval { .. } => native.starts_with("interval"),
         LogicalValue::Json { .. } => native == "jsonb" || native == "json",
         LogicalValue::BitString { .. } => native == "bit" || valid_parameterized_bit(&native),
         LogicalValue::Network {
@@ -346,7 +365,7 @@ fn valid_parameterized_time(native: &str) -> bool {
         return false;
     };
     precision.trim().parse::<u8>().is_ok_and(|value| value <= 6)
-        && matches!(suffix.trim(), "" | "without time zone")
+        && matches!(suffix.trim(), "" | "without time zone" | "with time zone")
 }
 
 fn lsn(cursor: &SourceCursor) -> Result<u64, SourceContractError> {

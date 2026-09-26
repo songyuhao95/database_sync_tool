@@ -614,9 +614,9 @@ fn logical_type_from_builtin(
         "bytea" => Ok(LogicalType::binary(None)),
         "bit" => Ok(LogicalType::bit_string(1)),
         "date" => Ok(LogicalType::date()),
-        "time without time zone" | "time" => Ok(LogicalType::LocalTime {
-            fractional_precision: 6,
-        }),
+        "time without time zone" | "time" | "time with time zone" | "timetz" => {
+            time(native_type, version)
+        }
         "uuid" => Ok(LogicalType::uuid()),
         "jsonb" => Ok(LogicalType::Json {
             profile: JsonProfile::default(),
@@ -631,9 +631,10 @@ fn logical_type_from_builtin(
         "cidr" => Ok(LogicalType::network("inet", true)),
         "macaddr" | "macaddr8" => Ok(LogicalType::network(native_type, false)),
         "xml" => Ok(LogicalType::xml()),
-        "numeric" | "decimal" | "interval" | "timetz" | "money" => {
-            Err(SourceTypeMappingError::unsupported(version, native_type))
-        }
+        "interval" => Ok(LogicalType::calendar_interval(6)),
+        "numeric" | "decimal" => numeric(native_type, version),
+        "money" => Err(SourceTypeMappingError::unsupported(version, native_type)),
+        _ if native_type.starts_with("time(") => time(native_type, version),
         _ if native_type.starts_with("numeric(") => numeric(native_type, version),
         _ if native_type.starts_with("decimal(") => numeric(native_type, version),
         _ if native_type.starts_with("bit(") => {
@@ -1096,24 +1097,29 @@ fn enum_members(native_type: &str, version: &str) -> Result<Vec<String>, SourceT
 }
 
 fn numeric(native_type: &str, version: &str) -> Result<LogicalType, SourceTypeMappingError> {
-    let parameters = native_type
+    let Some(parameters) = native_type
         .split_once('(')
         .and_then(|(_, value)| value.strip_suffix(')'))
-        .ok_or_else(|| {
-            SourceTypeMappingError::invalid(version, "numeric parameters are malformed")
-        })?;
-    let (precision, scale) = parameters.split_once(',').ok_or_else(|| {
-        SourceTypeMappingError::invalid(version, "numeric requires precision and scale")
-    })?;
-    let precision = precision
+    else {
+        return Ok(LogicalType::decimal_unbounded());
+    };
+    let mut parameters = parameters.split(',');
+    let precision = parameters
+        .next()
+        .unwrap_or_default()
         .trim()
         .parse::<u16>()
         .map_err(|_| SourceTypeMappingError::invalid(version, "numeric precision is invalid"))?;
-    let scale = scale
+    let scale = parameters
+        .next()
+        .unwrap_or("0")
         .trim()
         .parse::<i32>()
         .map_err(|_| SourceTypeMappingError::invalid(version, "numeric scale is invalid"))?;
-    if !(1..=1000).contains(&precision) || !(-1000..=i32::from(precision)).contains(&scale) {
+    if parameters.next().is_some()
+        || !(1..=1000).contains(&precision)
+        || !(-1000..=1000).contains(&scale)
+    {
         return Err(SourceTypeMappingError::invalid(
             version,
             "numeric precision/scale is outside the ChangeEvent range",
@@ -1187,29 +1193,35 @@ fn spatial(native_type: &str, version: &str) -> Result<LogicalType, SourceTypeMa
 }
 
 fn time(native_type: &str, version: &str) -> Result<LogicalType, SourceTypeMappingError> {
-    let precision = native_type
-        .strip_prefix("time(")
-        .and_then(|value| value.strip_suffix(") without time zone"))
-        .or_else(|| {
-            native_type
-                .strip_prefix("time(")
-                .and_then(|value| value.strip_suffix(")"))
-        })
-        .map(|value| {
-            value
-                .parse::<u8>()
-                .map_err(|_| SourceTypeMappingError::invalid(version, "time precision is invalid"))
-        })
-        .transpose()?
-        .unwrap_or(6);
+    let with_time_zone = native_type == "timetz" || native_type.ends_with("with time zone");
+    let precision = if let Some(parameters) = native_type.strip_prefix("time(") {
+        let (precision, suffix) = parameters.split_once(')').ok_or_else(|| {
+            SourceTypeMappingError::invalid(version, "time declaration is malformed")
+        })?;
+        if !suffix.is_empty() && suffix != " with time zone" && suffix != " without time zone" {
+            return Err(SourceTypeMappingError::invalid(
+                version,
+                "time declaration has an invalid zone qualifier",
+            ));
+        }
+        precision
+            .parse::<u8>()
+            .map_err(|_| SourceTypeMappingError::invalid(version, "time precision is invalid"))?
+    } else {
+        6
+    };
     if precision > 6 {
         return Err(SourceTypeMappingError::invalid(
             version,
             "time precision is outside PostgreSQL limits",
         ));
     }
-    Ok(LogicalType::LocalTime {
-        fractional_precision: precision,
+    Ok(if with_time_zone {
+        LogicalType::offset_time(precision)
+    } else {
+        LogicalType::LocalTime {
+            fractional_precision: precision,
+        }
     })
 }
 
@@ -1308,10 +1320,32 @@ mod tests {
     }
 
     #[test]
-    fn blocks_unproven_json_arrays_and_unbounded_numeric() {
-        for native_type in ["integer[]", "numeric"] {
-            assert!(source_type_mapping(native_type).is_err(), "{native_type}");
-        }
+    fn maps_unbounded_numeric_and_temporal_components() {
+        assert_eq!(
+            source_type_mapping("numeric").unwrap().logical_type,
+            LogicalType::decimal_unbounded()
+        );
+        assert_eq!(
+            source_type_mapping("time with time zone")
+                .unwrap()
+                .logical_type,
+            LogicalType::offset_time(6)
+        );
+        assert_eq!(
+            source_type_mapping("time(3) with time zone")
+                .unwrap()
+                .logical_type,
+            LogicalType::offset_time(3)
+        );
+        assert_eq!(
+            source_type_mapping("interval").unwrap().logical_type,
+            LogicalType::calendar_interval(6)
+        );
+    }
+
+    #[test]
+    fn blocks_unproven_json_arrays() {
+        assert!(source_type_mapping("integer[]").is_err());
     }
 
     #[test]

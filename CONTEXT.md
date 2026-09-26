@@ -259,11 +259,11 @@ A versioned Source-owned rule that uses a precise Native Type, source definition
 _Avoid_: Cross-database type table, value inference
 
 **Logical Value**:
-A lossless database-independent representation of one captured column value, including only value-level semantics; source and target column definitions are resolved separately.
+A lossless database-independent representation of one captured column value, including only value-level semantics; Decimal uses an exact coefficient and signed scale, calendar years use signed astronomical numbering, offset times retain their exact offset, and calendar intervals keep months, days, and sub-day units separate. Source and target column definitions are resolved separately.
 _Avoid_: JSON value, stringified value
 
 **Source Representation Envelope**:
-A self-describing record of the exact text or binary representation emitted by a Source's change protocol, together with source type and format evidence; it does not by itself prove the original database value can be reconstructed.
+A Datum alternative to Logical Value that records the exact text or binary payload emitted by a Source's change protocol, source connector/build, source type definition identity and digest, protocol format, type metadata, payload length and digest, and Source Cursor. It states whether semantic recovery is reversible; it does not by itself prove the original database value can be reconstructed.
 _Avoid_: Logical Value, raw database value
 
 **Representation-only Preservation**:
@@ -450,7 +450,7 @@ The contract uses a structured Logical Type rather than asking a Sink to infer s
 
 The first contract is definition-referenced for DML replay. A Change Event carries source object and element identity, a Definition Reference to the fingerprinted source definition, either semantic column values or an explicitly classified Source Representation Envelope, and their explicit presence states; it does not embed the full Logical Type, Native Type, or source column definition.
 
-Source Type Mapping is strict and versioned. MySQL and PostgreSQL native types map to Logical Types only when the exact connector/build, declaration, and source semantics prove the mapping; aliases such as MySQL `TINYINT(1)` are not treated as Boolean without unambiguous evidence. Integer width and signedness, Decimal precision and signed scale, text/binary bounds, temporal meaning, JSON profile, enum members, and spatial or recursive structure are preserved. PostgreSQL `json` is not mapped to the normalized JSON profile. An unproven native type is never inferred from row values or silently downgraded; where the source protocol can safely capture its emitted representation, it may instead use an explicitly classified Source Representation Envelope.
+Source Type Mapping is strict and versioned. MySQL and PostgreSQL native types map to Logical Types only when the exact connector/build, declaration, and source semantics prove the mapping; aliases such as MySQL `TINYINT(1)` are not treated as Boolean without unambiguous evidence. Integer width and signedness, arbitrary Decimal coefficient and signed scale (including negative scale and exact `NaN`/infinity tokens), text/binary bounds, temporal meaning and precision, signed astronomical years, time-zone offsets, independent calendar-interval months/days/sub-day units, JSON profile, enum members, and spatial or recursive structure are preserved without truncating source precision or year. Calendar months are never converted to a fixed duration. PostgreSQL `json` is not mapped to the normalized JSON profile. An unproven native type is never inferred from row values or silently downgraded; where the source protocol can safely capture its emitted representation, it may instead use an explicitly classified Source Representation Envelope.
 
 The versioned native type inventory is the single connector/type roster used by Rust and qualification scripts. It records mapping, protocol capture, ChangeEvent, Sink target/carrier, Web, and live evidence separately. PostgreSQL catalog-defined types and unmatched MySQL declarations remain explicit gaps until discovered and qualified; a family-level fixture does not qualify every native declaration.
 

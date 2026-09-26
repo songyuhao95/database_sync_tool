@@ -93,7 +93,7 @@ pub(crate) fn decode(oid: u32, bytes: &[u8]) -> Result<V> {
         1082 => {
             let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")?;
             V::Date {
-                year: u16::try_from(date.year())?,
+                year: date.year(),
                 month: date.month() as u8,
                 day: date.day() as u8,
             }
@@ -102,7 +102,7 @@ pub(crate) fn decode(oid: u32, bytes: &[u8]) -> Result<V> {
         1114 => {
             let d = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")?;
             V::LocalDatetime {
-                year: u16::try_from(d.year())?,
+                year: d.year(),
                 month: d.month() as u8,
                 day: d.day() as u8,
                 hour: d.hour() as u8,
@@ -215,7 +215,15 @@ fn network(oid: u32, text: &str) -> Result<V> {
     })
 }
 
-fn decimal(text: &str) -> Result<(String, usize)> {
+fn decimal(text: &str) -> Result<(String, i32)> {
+    match text.to_ascii_lowercase().as_str() {
+        "nan" => return Ok(("NaN".into(), 0)),
+        "infinity" | "inf" | "+infinity" | "+inf" => {
+            return Ok(("Infinity".into(), 0));
+        }
+        "-infinity" | "-inf" => return Ok(("-Infinity".into(), 0)),
+        _ => {}
+    }
     let (coefficient, exponent) = match text.find(['e', 'E']) {
         Some(i) => (&text[..i], text[i + 1..].parse::<i32>()?),
         None => (text, 0),
@@ -231,17 +239,7 @@ fn decimal(text: &str) -> Result<(String, usize)> {
     }
     let mut digits = parts.concat();
     let scale = i64::try_from(parts.get(1).map_or(0, |p| p.len()))? - i64::from(exponent);
-    if scale < 0 {
-        let zeros = usize::try_from(-scale)?;
-        if digits.len().saturating_add(zeros) > 1000 {
-            return Err(invalid("numeric exceeds 1000 digits"));
-        }
-        digits.extend(std::iter::repeat_n('0', zeros));
-    }
-    let scale = usize::try_from(scale.max(0))?;
-    if digits.len() > 1000 || scale > 1000 {
-        return Err(invalid("numeric exceeds ChangeEvent range"));
-    }
+    let scale = i32::try_from(scale)?;
     if negative {
         digits.insert(0, '-');
     }
@@ -256,8 +254,19 @@ fn json(value: serde_json::Value, depth: usize) -> Result<J> {
         serde_json::Value::Bool(v) => J::Boolean(v),
         serde_json::Value::String(v) => J::String(v),
         serde_json::Value::Number(v) => {
-            let (unscaled, scale) = decimal(v.as_str())?;
-            J::Decimal { unscaled, scale }
+            let (mut unscaled, mut scale) = decimal(v.as_str())?;
+            if scale < 0 {
+                let zeros = usize::try_from(scale.unsigned_abs())?;
+                if unscaled.len().saturating_add(zeros) > 131_072 {
+                    return Err(invalid("JSON number exceeds PostgreSQL numeric precision"));
+                }
+                unscaled.extend(std::iter::repeat_n('0', zeros));
+                scale = 0;
+            }
+            J::Decimal {
+                unscaled,
+                scale: usize::try_from(scale)?,
+            }
         }
         serde_json::Value::Array(v) => J::Array(
             v.into_iter()
@@ -288,10 +297,22 @@ mod tests {
         assert!(
             matches!(decode(17,b"\\x00ff").unwrap(),V::Binary{bytes_base64url} if bytes_base64url=="AP8")
         );
-        assert!(decode(1700, b"NaN").is_err());
+        assert!(matches!(
+            decode(1700, b"NaN").unwrap(),
+            V::Decimal { unscaled, scale: 0 } if unscaled == "NaN"
+        ));
+        assert!(matches!(
+            decode(1700, b"Infinity").unwrap(),
+            V::Decimal { unscaled, scale: 0 } if unscaled == "Infinity"
+        ));
         assert!(decode(114, b"{").is_err());
         assert!(decode(1184, b"2026-09-13 12:13:14.123456+00").is_ok());
         assert_eq!(decimal("1e-4").unwrap(), ("1".into(), 4));
+        assert_eq!(decimal("1e4").unwrap(), ("1".into(), -4));
+        assert_eq!(
+            decimal(&format!("1{}", "0".repeat(1_200))).unwrap().0.len(),
+            1_201
+        );
     }
 
     #[test]

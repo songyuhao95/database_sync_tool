@@ -605,7 +605,8 @@ fn parse_decimal(text: &str) -> io::Result<LogicalValue> {
     };
     Ok(LogicalValue::Decimal {
         unscaled,
-        scale: fraction.len(),
+        scale: i32::try_from(fraction.len())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     })
 }
 
@@ -644,13 +645,17 @@ pub fn decode_temporal_components(
         return Ok(LogicalValue::InvalidTemporal { kind, raw });
     }
     if data_type.eq_ignore_ascii_case("date") {
-        return Ok(LogicalValue::Date { year, month, day });
+        return Ok(LogicalValue::Date {
+            year: i32::from(year),
+            month,
+            day,
+        });
     }
     if data_type.eq_ignore_ascii_case("timestamp") {
         return timestamp_from_components(year, month, day, hour, minute, second, microsecond);
     }
     Ok(LogicalValue::LocalDatetime {
-        year,
+        year: i32::from(year),
         month,
         day,
         hour,
@@ -693,7 +698,11 @@ fn convert_json_dom(value: JsonDom) -> io::Result<JsonValue> {
             else {
                 unreachable!()
             };
-            JsonValue::Decimal { unscaled, scale }
+            JsonValue::Decimal {
+                unscaled,
+                scale: usize::try_from(scale)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            }
         }
         JsonDom::Scalar(JsonScalar::Number(JsonNumber::Double(value))) => {
             JsonValue::DoubleBits(format!("{:016x}", value.to_bits()))

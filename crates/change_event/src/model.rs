@@ -1,6 +1,7 @@
 //! The small, vendor-neutral in-memory model. JSON is its current diagnostic encoding.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 
 pub const FORMAT: &str = "cdc.change-event-json.v0.3";
 pub const PREVIOUS_FORMAT: &str = "cdc.change-event-json.v0.2";
@@ -8,7 +9,7 @@ pub const LEGACY_FORMAT: &str = "cdc.change-event-json.v0.1";
 pub const HISTORICAL_FORMAT: &str = "cdc.change-event-json.v0";
 pub const LOGICAL_CONTRACT_FORMAT: &str = "cdc.logical-value.v0.3";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SourceCursor {
     pub format: String,
     pub value: String,
@@ -96,7 +97,7 @@ pub struct ColumnDatum {
     pub datum: Datum,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "presence", content = "value", rename_all = "snake_case")]
 pub enum Datum {
     /// No historical value was supplied by the source.
@@ -105,6 +106,9 @@ pub enum Datum {
     Unchanged,
     Null,
     Value(LogicalValue),
+    /// Exact bytes emitted by the source change protocol with enough context
+    /// to identify and verify them. This is deliberately not a LogicalValue.
+    SourceRepresentationEnvelope(SourceRepresentationEnvelope),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -125,7 +129,11 @@ pub enum LogicalValue {
     },
     Decimal {
         unscaled: String,
-        scale: usize,
+        /// Decimal exponent. Negative values preserve values declared with a
+        /// negative scale without expanding or rounding their coefficient.
+        /// The tokens `NaN`, `Infinity`, and `-Infinity` with scale zero
+        /// represent the corresponding exact numeric special values.
+        scale: i32,
     },
     Float {
         bits: u8,
@@ -151,7 +159,8 @@ pub enum LogicalValue {
         bit_order: BitOrder,
     },
     Date {
-        year: u16,
+        /// Signed astronomical year numbering (year zero is 1 BCE).
+        year: i32,
         month: u8,
         day: u8,
     },
@@ -161,8 +170,18 @@ pub enum LogicalValue {
         second: u8,
         microsecond: u32,
     },
+    /// Time of day and its fixed UTC offset, as used by SQL time-with-zone
+    /// values. Offset seconds are retained exactly.
+    OffsetTime {
+        hour: u8,
+        minute: u8,
+        second: u8,
+        microsecond: u32,
+        offset_seconds: i32,
+    },
     LocalDatetime {
-        year: u16,
+        /// Signed astronomical year numbering (year zero is 1 BCE).
+        year: i32,
         month: u8,
         day: u8,
         hour: u8,
@@ -177,12 +196,25 @@ pub enum LogicalValue {
         seconds: u8,
         microsecond: u32,
     },
+    /// Calendar interval components remain separate: months are not a fixed
+    /// duration, and neither months nor days are folded into microseconds.
+    CalendarInterval {
+        months: i32,
+        days: i32,
+        microseconds: i64,
+    },
     Instant {
         unix_seconds: String,
         nanoseconds: u32,
     },
     Year {
-        value: u16,
+        /// Signed astronomical year numbering when the source type is a
+        /// calendar year; source type metadata defines any narrower domain.
+        value: i32,
+    },
+    TemporalInfinity {
+        kind: TemporalInfinityKind,
+        negative: bool,
     },
     /// An ENUM value is carried by its declared label.  Native ordinals are
     /// source evidence only and never enter the portable value contract.
@@ -253,14 +285,24 @@ pub enum LogicalValue {
     Domain {
         value: Box<LogicalValue>,
     },
-    /// A value whose native semantics are only available through a verified
-    /// source codec and definition fingerprint.
+    /// Historical v0.3 opaque carrier. New protocol-only payloads use
+    /// [`Datum::SourceRepresentationEnvelope`] so they cannot be mistaken for
+    /// a LogicalValue.
     Raw {
         carrier: RawValueCarrier,
     },
     Json {
         value: JsonValue,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalInfinityKind {
+    Date,
+    LocalDatetime,
+    Instant,
+    CalendarInterval,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -284,6 +326,178 @@ pub enum SpatialFormat {
     Wkb,
     Ewkb,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRepresentationFormat {
+    Text,
+    Binary,
+}
+
+/// Source identity and type evidence needed to interpret a protocol payload.
+/// Metadata is stored in a sorted map so its serialized form is deterministic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SourceRepresentationContext {
+    pub connector: crate::ConnectorIdentity,
+    pub server_build: crate::ServerBuildIdentity,
+    pub source_type_identity: String,
+    pub source_type_definition_digest: String,
+    pub protocol: String,
+    pub format: SourceRepresentationFormat,
+    pub type_metadata: BTreeMap<String, String>,
+    pub source_cursor: SourceCursor,
+}
+
+impl SourceRepresentationContext {
+    pub fn validate(&self) -> Result<(), SourceRepresentationError> {
+        for (field, value) in [
+            ("connector.kind", self.connector.kind.as_str()),
+            ("connector.version", self.connector.version.as_str()),
+            ("server_build.product", self.server_build.product.as_str()),
+            (
+                "server_build.distribution",
+                self.server_build.distribution.as_str(),
+            ),
+            ("server_build.version", self.server_build.version.as_str()),
+            ("server_build.build", self.server_build.build.as_str()),
+            ("source_type_identity", self.source_type_identity.as_str()),
+            (
+                "source_type_definition_digest",
+                self.source_type_definition_digest.as_str(),
+            ),
+            ("protocol", self.protocol.as_str()),
+            ("source_cursor.format", self.source_cursor.format.as_str()),
+            ("source_cursor.value", self.source_cursor.value.as_str()),
+        ] {
+            if value.trim().is_empty() || value.contains('\0') {
+                return Err(SourceRepresentationError::MissingEvidence { field });
+            }
+        }
+        validate_sha256_digest(&self.source_type_definition_digest)
+            .then_some(())
+            .ok_or(SourceRepresentationError::InvalidDigest {
+                field: "source_type_definition_digest",
+            })?;
+        if self
+            .type_metadata
+            .iter()
+            .any(|(key, value)| key.trim().is_empty() || key.contains('\0') || value.contains('\0'))
+        {
+            return Err(SourceRepresentationError::InvalidTypeMetadata);
+        }
+        Ok(())
+    }
+}
+
+/// A self-describing source protocol representation. Its integrity proves
+/// byte preservation only; it does not assert that the source value is
+/// semantically recoverable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SourceRepresentationEnvelope {
+    pub context: SourceRepresentationContext,
+    pub encoding: String,
+    pub payload_base64url: String,
+    pub payload_length: u64,
+    pub payload_sha256: String,
+}
+
+impl SourceRepresentationEnvelope {
+    pub fn new(
+        context: SourceRepresentationContext,
+        encoding: impl Into<String>,
+        payload: &[u8],
+    ) -> Self {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        Self {
+            context,
+            encoding: encoding.into(),
+            payload_base64url: URL_SAFE_NO_PAD.encode(payload),
+            payload_length: payload.len() as u64,
+            payload_sha256: digest_bytes(payload),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SourceRepresentationError> {
+        self.context.validate()?;
+        if self.encoding.trim().is_empty() || self.encoding.contains('\0') {
+            return Err(SourceRepresentationError::MissingEvidence { field: "encoding" });
+        }
+        let payload = self.raw_bytes_unchecked()?;
+        if u64::try_from(payload.len()).ok() != Some(self.payload_length) {
+            return Err(SourceRepresentationError::PayloadLengthMismatch);
+        }
+        if self.payload_sha256 != digest_bytes(&payload) {
+            return Err(SourceRepresentationError::PayloadDigestMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn raw_bytes(&self) -> Result<Vec<u8>, SourceRepresentationError> {
+        self.validate()?;
+        self.raw_bytes_unchecked()
+    }
+
+    fn raw_bytes_unchecked(&self) -> Result<Vec<u8>, SourceRepresentationError> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        URL_SAFE_NO_PAD
+            .decode(&self.payload_base64url)
+            .map_err(|_| SourceRepresentationError::InvalidPayload)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRepresentationError {
+    MissingEvidence { field: &'static str },
+    InvalidDigest { field: &'static str },
+    InvalidTypeMetadata,
+    InvalidPayload,
+    PayloadLengthMismatch,
+    PayloadDigestMismatch,
+}
+
+impl SourceRepresentationError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MissingEvidence { .. } => "source_representation.missing_evidence",
+            Self::InvalidDigest { .. } => "source_representation.invalid_digest",
+            Self::InvalidTypeMetadata => "source_representation.invalid_type_metadata",
+            Self::InvalidPayload => "source_representation.invalid_payload",
+            Self::PayloadLengthMismatch => "source_representation.payload_length_mismatch",
+            Self::PayloadDigestMismatch => "source_representation.payload_digest_mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for SourceRepresentationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingEvidence { field } => {
+                write!(formatter, "source representation is missing {field}")
+            }
+            Self::InvalidDigest { field } => {
+                write!(
+                    formatter,
+                    "source representation {field} is not a SHA-256 digest"
+                )
+            }
+            Self::InvalidTypeMetadata => {
+                formatter.write_str("source representation type metadata is invalid")
+            }
+            Self::InvalidPayload => {
+                formatter.write_str("source representation payload is invalid base64url")
+            }
+            Self::PayloadLengthMismatch => {
+                formatter.write_str("source representation payload length does not match")
+            }
+            Self::PayloadDigestMismatch => {
+                formatter.write_str("source representation payload digest does not match")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SourceRepresentationError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StructuredField {
@@ -329,6 +543,18 @@ pub struct RawValueCarrier {
     pub raw_bytes_base64url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_text: Option<String>,
+    /// Optional context on newly emitted carriers. Missing context is accepted
+    /// only for historical JSON v0.3 payloads and never implies recoverability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context: Option<Box<SourceRepresentationContext>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
+    /// True only when the named codec has been qualified to recover a semantic
+    /// value. Representation-only payloads must leave this false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversible: Option<bool>,
 }
 
 impl RawValueCarrier {
@@ -347,7 +573,27 @@ impl RawValueCarrier {
             encoding: encoding.into(),
             raw_bytes_base64url: raw_bytes_base64url.into(),
             canonical_text: canonical_text.map(Into::into),
+            source_context: None,
+            payload_length: None,
+            payload_sha256: None,
+            reversible: None,
         }
+    }
+
+    pub fn with_source_context(
+        mut self,
+        context: SourceRepresentationContext,
+        reversible: bool,
+    ) -> Result<Self, RawValueCarrierError> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let bytes = URL_SAFE_NO_PAD
+            .decode(&self.raw_bytes_base64url)
+            .map_err(|_| RawValueCarrierError::InvalidBytes)?;
+        self.source_context = Some(Box::new(context));
+        self.payload_length = Some(bytes.len() as u64);
+        self.payload_sha256 = Some(digest_bytes(&bytes));
+        self.reversible = Some(reversible);
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), RawValueCarrierError> {
@@ -365,10 +611,36 @@ impl RawValueCarrier {
             }
         }
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-        URL_SAFE_NO_PAD
+        let bytes = URL_SAFE_NO_PAD
             .decode(&self.raw_bytes_base64url)
-            .map_err(|_| RawValueCarrierError::InvalidBytes)
-            .map(|_| ())
+            .map_err(|_| RawValueCarrierError::InvalidBytes)?;
+        match (
+            &self.source_context,
+            self.payload_length,
+            self.payload_sha256.as_deref(),
+        ) {
+            (Some(context), Some(length), Some(digest)) => {
+                context
+                    .validate()
+                    .map_err(|_| RawValueCarrierError::InvalidEvidence)?;
+                if u64::try_from(bytes.len()).ok() != Some(length) {
+                    return Err(RawValueCarrierError::PayloadLengthMismatch);
+                }
+                if digest != digest_bytes(&bytes) {
+                    return Err(RawValueCarrierError::PayloadDigestMismatch);
+                }
+            }
+            (None, None, None) if self.reversible.is_none() => {
+                // Historical v0.3 RawValueCarrier shape. The absent marker
+                // preserves the historical wire format and implies no value
+                // recovery.
+            }
+            _ => return Err(RawValueCarrierError::InvalidEvidence),
+        }
+        if self.reversible == Some(true) && self.codec_identity.trim().is_empty() {
+            return Err(RawValueCarrierError::InvalidEvidence);
+        }
+        Ok(())
     }
 
     pub fn stable_digest(&self) -> String {
@@ -388,6 +660,9 @@ impl RawValueCarrier {
 pub enum RawValueCarrierError {
     MissingEvidence { field: &'static str },
     InvalidBytes,
+    InvalidEvidence,
+    PayloadLengthMismatch,
+    PayloadDigestMismatch,
 }
 
 impl RawValueCarrierError {
@@ -395,6 +670,9 @@ impl RawValueCarrierError {
         match self {
             Self::MissingEvidence { .. } => "raw_value_carrier.missing_evidence",
             Self::InvalidBytes => "raw_value_carrier.invalid_bytes",
+            Self::InvalidEvidence => "raw_value_carrier.invalid_evidence",
+            Self::PayloadLengthMismatch => "raw_value_carrier.payload_length_mismatch",
+            Self::PayloadDigestMismatch => "raw_value_carrier.payload_digest_mismatch",
         }
     }
 }
@@ -407,6 +685,15 @@ impl std::fmt::Display for RawValueCarrierError {
             }
             Self::InvalidBytes => {
                 formatter.write_str("raw value carrier bytes are invalid base64url")
+            }
+            Self::InvalidEvidence => {
+                formatter.write_str("raw value carrier evidence is incomplete or invalid")
+            }
+            Self::PayloadLengthMismatch => {
+                formatter.write_str("raw value carrier payload length does not match")
+            }
+            Self::PayloadDigestMismatch => {
+                formatter.write_str("raw value carrier payload digest does not match")
             }
         }
     }
@@ -544,4 +831,19 @@ pub fn stable_digest<T: Serialize>(value: &T) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hex}")
+}
+
+fn validate_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }

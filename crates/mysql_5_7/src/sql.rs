@@ -1050,6 +1050,9 @@ fn key_predicates(row: &[ColumnDatum]) -> io::Result<(String, Vec<Value>)> {
                     params.push(bind_datum(&column.datum)?);
                     Ok(format!("{name} = ?"))
                 }
+                Datum::SourceRepresentationEnvelope(_) => Err(capability_failure(
+                    "source representation envelopes cannot be used as a row locator",
+                )),
             }
         })
         .collect::<io::Result<Vec<_>>>()?;
@@ -1103,6 +1106,9 @@ fn bind_datum_with_plan(
             }
             _ => bind_logical_value(value),
         },
+        Datum::SourceRepresentationEnvelope(_) => Err(capability_failure(
+            "MySQL Sink has no qualified carrier plan for source representation envelopes",
+        )),
     }
 }
 
@@ -1146,6 +1152,9 @@ fn key_predicates_with_plans(
                         value_placeholder_for_key(schema, table, column, plans)
                     ))
                 }
+                Datum::SourceRepresentationEnvelope(_) => Err(capability_failure(
+                    "source representation envelopes cannot be used as a row locator",
+                )),
             }
         })
         .collect::<io::Result<Vec<_>>>()?;
@@ -1250,6 +1259,9 @@ fn bind_datum(datum: &Datum) -> io::Result<Value> {
         )),
         Datum::Null => Ok(Value::NULL),
         Datum::Value(value) => bind_logical_value(value),
+        Datum::SourceRepresentationEnvelope(_) => Err(capability_failure(
+            "MySQL Sink has no qualified carrier plan for source representation envelopes",
+        )),
     }
 }
 
@@ -1275,12 +1287,15 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
         }
         LogicalValue::Decimal { unscaled, scale } => {
             let digits = unscaled.strip_prefix(['-', '+']).unwrap_or(unscaled);
-            if digits.len() > 65 || *scale > 30 {
+            if digits.len() > 65 || !(0..=30).contains(scale) {
                 return Err(capability_failure(
                     "DECIMAL precision exceeds the MySQL target capability",
                 ));
             }
-            let value = render_decimal(unscaled, *scale)?;
+            let value = render_decimal(
+                unscaled,
+                usize::try_from(*scale).map_err(|_| capability_failure("invalid DECIMAL scale"))?,
+            )?;
             Ok(Value::Bytes(value.into_bytes()))
         }
         LogicalValue::Float { bits, ieee754_hex } => match bits {
@@ -1331,7 +1346,9 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
         LogicalValue::BitString {
             bytes_base64url, ..
         } => Ok(Value::Bytes(decode_bytes(bytes_base64url)?)),
-        LogicalValue::Date { year, month, day } => Ok(Value::Date(*year, *month, *day, 0, 0, 0, 0)),
+        LogicalValue::Date { year, month, day } => {
+            Ok(Value::Date(mysql_year(*year)?, *month, *day, 0, 0, 0, 0))
+        }
         LogicalValue::LocalDatetime {
             year,
             month,
@@ -1341,7 +1358,7 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
             second,
             microsecond,
         } => Ok(Value::Date(
-            *year,
+            mysql_year(*year)?,
             *month,
             *day,
             *hour,
@@ -1379,7 +1396,11 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
             unix_seconds,
             nanoseconds,
         } => unix_instant_value(unix_seconds, *nanoseconds),
-        LogicalValue::Year { value } => Ok(Value::UInt(u64::from(*value))),
+        LogicalValue::Year { value } => {
+            Ok(Value::UInt(u64::try_from(*value).map_err(|_| {
+                capability_failure("negative YEAR is unsupported")
+            })?))
+        }
         LogicalValue::Enum { label } => Ok(Value::Bytes(label.as_bytes().to_vec())),
         LogicalValue::Set { members } => Ok(Value::Bytes(members.join(",").into_bytes())),
         LogicalValue::Spatial { .. }
@@ -1391,6 +1412,9 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
         | LogicalValue::MultiRange { .. }
         | LogicalValue::Null
         | LogicalValue::InvalidTemporal { .. }
+        | LogicalValue::OffsetTime { .. }
+        | LogicalValue::CalendarInterval { .. }
+        | LogicalValue::TemporalInfinity { .. }
         | LogicalValue::Network { .. }
         | LogicalValue::Xml { .. }
         | LogicalValue::Domain { .. }
@@ -1486,6 +1510,10 @@ fn render_decimal(unscaled: &str, scale: usize) -> io::Result<String> {
         format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
     };
     Ok(format!("{}{}", if negative { "-" } else { "" }, value))
+}
+
+fn mysql_year(year: i32) -> io::Result<u16> {
+    u16::try_from(year).map_err(|_| capability_failure("year is outside the MySQL driver range"))
 }
 
 fn render_float(bits: u8, hexadecimal: &str) -> io::Result<String> {
