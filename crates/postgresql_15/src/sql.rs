@@ -1,10 +1,10 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{
     BitOrder, CapabilityManifest, CapabilityProbeEntry, CapabilityProbeStatus,
-    ColumnConversionPlan, ColumnDatum, Datum, JsonEntry, JsonValue, LogicalValue, Operation,
-    PlanConfirmationState, QualificationLevel, RowChange, ServerBuildIdentity, SourceCursor,
-    TargetCapabilityFailure, TargetCapabilityProbe, TargetColumnMetadata, TargetSessionProfile,
-    ValidatedTransaction,
+    ColumnConversionPlan, ColumnDatum, Datum, JsonEntry, JsonValue, LocatorImpact, LogicalValue,
+    Operation, PlanConfirmationState, QualificationLevel, RowChange, ServerBuildIdentity,
+    SourceCursor, TargetCapabilityFailure, TargetCapabilityProbe, TargetColumnMetadata,
+    TargetSessionProfile, ValidatedTransaction,
 };
 use sqlx::{
     Connection, PgConnection, Postgres, Row,
@@ -31,6 +31,7 @@ const SUPPORTED_LOGICAL_TYPES: &[&str] = &[
     "duration",
     "year",
     "json",
+    "map",
     "enum",
     "set",
     "array",
@@ -42,6 +43,10 @@ const SUPPORTED_LOGICAL_TYPES: &[&str] = &[
     "network",
     "xml",
     "custom",
+    "invalid_temporal",
+    "offset_time",
+    "calendar_interval",
+    "temporal_infinity",
 ];
 
 pub const CAPABILITY_MANIFEST: CapabilityManifest = CapabilityManifest {
@@ -182,6 +187,21 @@ pub(crate) struct PlannedStatement {
     parameters: Vec<Parameter>,
     probe: Option<PreparedQuery>,
     verification: Option<PreparedQuery>,
+    carrier_readbacks: Vec<CarrierReadbackCheck>,
+}
+
+#[derive(Debug, Clone)]
+struct CarrierReadbackCheck {
+    query: PreparedQuery,
+    column: String,
+    expected: CarrierReadbackExpected,
+}
+
+#[derive(Debug, Clone)]
+enum CarrierReadbackExpected {
+    SqlNull { text: bool },
+    LogicalValue(LogicalValue),
+    SourceRepresentation(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -241,28 +261,91 @@ struct StatementBuilder {
 
 impl StatementBuilder {
     fn datum(&mut self, column: &ColumnDatum) -> io::Result<RenderedDatum> {
-        match &column.datum {
-            Datum::Unavailable | Datum::Unchanged => Err(capability_failure(
-                "unavailable or unchanged values cannot be written in this position",
+        self.datum_with_plan(column, None)
+    }
+
+    fn datum_with_plan(
+        &mut self,
+        column: &ColumnDatum,
+        plan: Option<&ColumnConversionPlan>,
+    ) -> io::Result<RenderedDatum> {
+        let kind = plan.and_then(|plan| {
+            plan.target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str)
+        });
+        match (&column.datum, kind) {
+            (Datum::Value(value), Some("logical_value_json")) => {
+                let plan = plan.expect("conversion kind has a plan");
+                change_event::validate_value_against_plan(plan, value).map_err(io::Error::other)?;
+                let json = serde_json::to_string(value).map_err(io::Error::other)?;
+                self.push_parameter(
+                    Parameter::Text(json),
+                    &plan.target.native_type,
+                    "'\"<tagged LogicalValue carrier>\"'".into(),
+                )
+            }
+            (Datum::SourceRepresentationEnvelope(envelope), Some("source_representation")) => {
+                let plan = plan.expect("conversion kind has a plan");
+                change_event::validate_source_representation_envelope_against_plan(plan, envelope)
+                    .map_err(io::Error::other)?;
+                let bytes = serde_json::to_vec(envelope).map_err(io::Error::other)?;
+                let diagnostic = format!(
+                    "decode('', 'hex') /* Source Representation Envelope omitted: {} payload bytes, sha256={} */",
+                    envelope.payload_length, envelope.payload_sha256
+                );
+                self.push_parameter(
+                    Parameter::Binary(bytes),
+                    &plan.target.native_type,
+                    diagnostic,
+                )
+            }
+            (Datum::Null, Some("logical_value_json" | "source_representation")) => {
+                Ok(RenderedDatum {
+                    sql: "NULL".into(),
+                    diagnostic_sql: "NULL".into(),
+                })
+            }
+            (Datum::Unchanged, Some("logical_value_json" | "source_representation")) => Err(
+                capability_failure("cannot bind an unchanged carrier value as a DML parameter"),
+            ),
+            (Datum::Unavailable, Some("logical_value_json" | "source_representation")) => Err(
+                capability_failure("cannot bind an unavailable carrier value as a DML parameter"),
+            ),
+            (Datum::SourceRepresentationEnvelope(_), _) => Err(capability_failure(
+                "PostgreSQL Sink has no qualified carrier plan for source representation envelopes",
             )),
-            Datum::Null => Ok(RenderedDatum {
+            (Datum::Value(value), _) => {
+                let target_type = plan
+                    .map(|plan| plan.target.native_type.as_str())
+                    .unwrap_or(&column.native_type);
+                let parameter = parameter_for(value, target_type)?;
+                let diagnostic_sql = render_logical_value(value)?;
+                self.push_parameter(parameter, target_type, diagnostic_sql)
+            }
+            (Datum::Null, _) => Ok(RenderedDatum {
                 sql: "NULL".into(),
                 diagnostic_sql: "NULL".into(),
             }),
-            Datum::Value(value) => {
-                let parameter = parameter_for(value, &column.native_type)?;
-                let diagnostic_sql = render_logical_value(value)?;
-                self.parameters.push(parameter.clone());
-                let index = self.parameters.len();
-                Ok(RenderedDatum {
-                    sql: parameter_expression(index, &parameter, &column.native_type)?,
-                    diagnostic_sql,
-                })
-            }
-            Datum::SourceRepresentationEnvelope(_) => Err(capability_failure(
-                "PostgreSQL Sink has no qualified carrier plan for source representation envelopes",
+            (Datum::Unchanged | Datum::Unavailable, _) => Err(capability_failure(
+                "unavailable or unchanged values cannot be written in this position",
             )),
         }
+    }
+
+    fn push_parameter(
+        &mut self,
+        parameter: Parameter,
+        target_type: &str,
+        diagnostic_sql: String,
+    ) -> io::Result<RenderedDatum> {
+        self.parameters.push(parameter.clone());
+        let index = self.parameters.len();
+        Ok(RenderedDatum {
+            sql: parameter_expression(index, &parameter, target_type)?,
+            diagnostic_sql,
+        })
     }
 
     fn finish(self) -> Vec<Parameter> {
@@ -302,7 +385,50 @@ pub fn sql_with_plans_for_version(
         change_event::convert_transaction_with_plans(validated.transaction().clone(), plans)
             .map_err(io::Error::other)?;
     let converted = change_event::validate(converted).map_err(io::Error::other)?;
-    sql_for_version(target_version, &converted)
+    planned_sql_for_version(target_version, &converted, plans)
+}
+
+fn planned_sql_for_version(
+    target_version: &'static str,
+    validated: &ValidatedTransaction,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<SqlTransaction> {
+    let transaction = validated.transaction();
+    let mut statements = Vec::with_capacity(transaction.changes.len());
+    for change in &transaction.changes {
+        ensure_supported_change_with_plans(change, plans)?;
+        if change.schema.eq_ignore_ascii_case("cdc") {
+            return Err(capability_failure(
+                "cdc schema is reserved for replication control data",
+            ));
+        }
+        let rendered = render_change(change, Some(plans))?;
+        let probe = render_probe(change, Some(plans))?;
+        let verification = render_verification(change, Some(plans))?;
+        let carrier_readbacks = render_carrier_readbacks(change, plans)?;
+        statements.push(PlannedStatement {
+            sql: rendered.sql,
+            diagnostic_sql: rendered.diagnostic_sql,
+            parameters: rendered.parameters,
+            probe,
+            verification,
+            carrier_readbacks,
+        });
+    }
+    Ok(SqlTransaction {
+        source_uuid: transaction.source.id.clone(),
+        source_transaction_id: transaction.id.clone(),
+        commit_cursor: transaction.commit_cursor.clone(),
+        target_version,
+        tables: transaction
+            .changes
+            .iter()
+            .map(|change| (change.schema.clone(), change.table.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        statements,
+    })
 }
 
 fn validate_plan_coverage(
@@ -403,6 +529,68 @@ fn validate_plan_headers(plans: &[ColumnConversionPlan], target_version: &str) -
                 "the conversion plan requires route confirmation before apply",
             ));
         }
+        let conversion_kind = plan
+            .target
+            .parameters
+            .get("conversion_kind")
+            .map(String::as_str);
+        let expected_carrier = match conversion_kind {
+            Some("logical_value_json") => Some(("text", "postgresql_text_tagged_json")),
+            Some("source_representation") => Some(("bytea", "postgresql_bytea")),
+            _ => None,
+        };
+        if let Some((native_type, storage)) = expected_carrier {
+            if !plan.target.native_type.eq_ignore_ascii_case(native_type)
+                || plan
+                    .target
+                    .parameters
+                    .get("target_storage")
+                    .map(String::as_str)
+                    != Some(storage)
+            {
+                return Err(plan_failure(
+                    plan,
+                    "target_capability.carrier_representation_mismatch",
+                    "the PostgreSQL carrier plan does not match the sink's qualified physical representation",
+                ));
+            }
+            let capacity = plan
+                .target
+                .parameters
+                .get("target_capacity_bytes")
+                .and_then(|capacity| capacity.parse::<usize>().ok())
+                .filter(|capacity| *capacity > 0)
+                .ok_or_else(|| {
+                    plan_failure(
+                        plan,
+                        "target_capability.carrier_capacity_missing",
+                        "the PostgreSQL carrier plan is missing a valid positive byte capacity",
+                    )
+                })?;
+            if capacity > 1_073_741_823 {
+                return Err(plan_failure(
+                    plan,
+                    "target_capability.carrier_capacity_exceeds_postgresql_limit",
+                    "the carrier capacity exceeds PostgreSQL's supported field size",
+                ));
+            }
+        }
+        if matches!(
+            plan.target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str),
+            Some("logical_value_json" | "source_representation")
+        ) && (matches!(
+            plan.locator_impact,
+            LocatorImpact::Preserved | LocatorImpact::Blocked
+        )) {
+            return Err(plan_failure(
+                plan,
+                "target_capability.carrier_key_forbidden",
+                "JSON and source-representation carriers cannot be used as a primary key, unique key, or Row Locator",
+            ));
+        }
     }
     Ok(())
 }
@@ -429,15 +617,16 @@ pub fn sql_for_version(
                 "cdc schema is reserved for replication control data",
             ));
         }
-        let rendered = render_change(change)?;
-        let probe = render_probe(change)?;
-        let verification = render_verification(change)?;
+        let rendered = render_change(change, None)?;
+        let probe = render_probe(change, None)?;
+        let verification = render_verification(change, None)?;
         statements.push(PlannedStatement {
             sql: rendered.sql,
             diagnostic_sql: rendered.diagnostic_sql,
             parameters: rendered.parameters,
             probe,
             verification,
+            carrier_readbacks: Vec::new(),
         });
     }
     Ok(SqlTransaction {
@@ -456,16 +645,35 @@ pub fn sql_for_version(
     })
 }
 
-fn render_change(change: &RowChange) -> io::Result<RenderedStatement> {
+fn render_change(
+    change: &RowChange,
+    plans: Option<&[ColumnConversionPlan]>,
+) -> io::Result<RenderedStatement> {
     let table = qualified_table(&change.schema, &change.table);
     match change.operation {
-        Operation::Insert => render_insert(&table, change),
-        Operation::Update => render_update(&table, change),
-        Operation::Delete => render_delete(&table, change),
+        Operation::Insert => render_insert(&table, change, plans),
+        Operation::Update => render_update(&table, change, plans),
+        Operation::Delete => render_delete(&table, change, plans),
     }
 }
 
-fn render_insert(table: &str, change: &RowChange) -> io::Result<RenderedStatement> {
+fn column_plan<'a>(
+    schema: &str,
+    table: &str,
+    column: &ColumnDatum,
+    plans: Option<&'a [ColumnConversionPlan]>,
+) -> Option<&'a ColumnConversionPlan> {
+    let lineage = format!("catalog:{schema}.{table}.{}", column.name);
+    plans?
+        .iter()
+        .find(|plan| plan.source_field.lineage_id == lineage)
+}
+
+fn render_insert(
+    table: &str,
+    change: &RowChange,
+    plans: Option<&[ColumnConversionPlan]>,
+) -> io::Result<RenderedStatement> {
     let after = change
         .after
         .as_ref()
@@ -477,7 +685,12 @@ fn render_insert(table: &str, change: &RowChange) -> io::Result<RenderedStatemen
     let mut builder = StatementBuilder::default();
     let values = columns
         .iter()
-        .map(|column| builder.datum(column))
+        .map(|column| {
+            builder.datum_with_plan(
+                column,
+                column_plan(&change.schema, &change.table, column, plans),
+            )
+        })
         .collect::<io::Result<Vec<_>>>()?;
     let parameters = builder.finish();
     Ok(RenderedStatement {
@@ -503,7 +716,11 @@ fn render_insert(table: &str, change: &RowChange) -> io::Result<RenderedStatemen
     })
 }
 
-fn render_update(table: &str, change: &RowChange) -> io::Result<RenderedStatement> {
+fn render_update(
+    table: &str,
+    change: &RowChange,
+    plans: Option<&[ColumnConversionPlan]>,
+) -> io::Result<RenderedStatement> {
     let before = change
         .before
         .as_ref()
@@ -522,7 +739,10 @@ fn render_update(table: &str, change: &RowChange) -> io::Result<RenderedStatemen
     let mut assignments = Vec::with_capacity(columns.len());
     let mut diagnostic_assignments = Vec::with_capacity(columns.len());
     for column in columns {
-        let value = builder.datum(column)?;
+        let value = builder.datum_with_plan(
+            column,
+            column_plan(&change.schema, &change.table, column, plans),
+        )?;
         assignments.push(format!(
             "{} = {}",
             quote_identifier(&column.name),
@@ -534,7 +754,8 @@ fn render_update(table: &str, change: &RowChange) -> io::Result<RenderedStatemen
             value.diagnostic_sql
         ));
     }
-    let (predicates, diagnostic_predicates) = key_predicates(before, &mut builder)?;
+    let (predicates, diagnostic_predicates) =
+        key_predicates(&change.schema, &change.table, before, &mut builder, plans)?;
     let parameters = builder.finish();
     Ok(RenderedStatement {
         sql: format!(
@@ -551,13 +772,18 @@ fn render_update(table: &str, change: &RowChange) -> io::Result<RenderedStatemen
     })
 }
 
-fn render_delete(table: &str, change: &RowChange) -> io::Result<RenderedStatement> {
+fn render_delete(
+    table: &str,
+    change: &RowChange,
+    plans: Option<&[ColumnConversionPlan]>,
+) -> io::Result<RenderedStatement> {
     let before = change
         .before
         .as_ref()
         .ok_or_else(|| capability_failure("DELETE ChangeEvent is missing its before image"))?;
     let mut builder = StatementBuilder::default();
-    let (predicates, diagnostic_predicates) = key_predicates(before, &mut builder)?;
+    let (predicates, diagnostic_predicates) =
+        key_predicates(&change.schema, &change.table, before, &mut builder, plans)?;
     let parameters = builder.finish();
     Ok(RenderedStatement {
         sql: format!("DELETE FROM {table} WHERE {predicates};"),
@@ -566,7 +792,10 @@ fn render_delete(table: &str, change: &RowChange) -> io::Result<RenderedStatemen
     })
 }
 
-fn render_probe(change: &RowChange) -> io::Result<Option<PreparedQuery>> {
+fn render_probe(
+    change: &RowChange,
+    plans: Option<&[ColumnConversionPlan]>,
+) -> io::Result<Option<PreparedQuery>> {
     if matches!(change.operation, Operation::Insert) {
         return Ok(None);
     }
@@ -575,7 +804,8 @@ fn render_probe(change: &RowChange) -> io::Result<Option<PreparedQuery>> {
         .as_ref()
         .ok_or_else(|| capability_failure("row locator probe is missing its before image"))?;
     let mut builder = StatementBuilder::default();
-    let (predicates, _) = key_predicates(before, &mut builder)?;
+    let (predicates, _) =
+        key_predicates(&change.schema, &change.table, before, &mut builder, plans)?;
     Ok(Some(PreparedQuery {
         sql: format!(
             "SELECT 1 FROM {} WHERE {predicates} LIMIT 2 FOR UPDATE",
@@ -585,58 +815,12 @@ fn render_probe(change: &RowChange) -> io::Result<Option<PreparedQuery>> {
     }))
 }
 
-fn render_verification(change: &RowChange) -> io::Result<Option<PreparedQuery>> {
-    if matches!(change.operation, Operation::Delete) {
-        return Ok(None);
-    }
-    let after = change.after.as_ref().ok_or_else(|| {
-        capability_failure("generated-column verification is missing its after image")
-    })?;
-    let generated = after
-        .iter()
-        .filter(|column| column.generated)
-        .collect::<Vec<_>>();
-    if generated.is_empty() {
-        return Ok(None);
-    }
-    let mut builder = StatementBuilder::default();
-    let (keys, _) = key_predicates(after, &mut builder)?;
-    let mut predicates = vec![keys];
-    for column in generated {
-        let name = quote_identifier(&column.name);
-        match &column.datum {
-            Datum::Null => predicates.push(format!("{name} IS NULL")),
-            Datum::Value(_) => {
-                let value = builder.datum(column)?;
-                predicates.push(format!("{name} IS NOT DISTINCT FROM {}", value.sql));
-            }
-            Datum::Unavailable | Datum::Unchanged => {
-                return Err(capability_failure(format!(
-                    "generated column {} has no captured observation",
-                    column.name
-                )));
-            }
-            Datum::SourceRepresentationEnvelope(_) => {
-                return Err(capability_failure(format!(
-                    "generated column {} has no LogicalValue observation",
-                    column.name
-                )));
-            }
-        }
-    }
-    Ok(Some(PreparedQuery {
-        sql: format!(
-            "SELECT 1 FROM {} WHERE {} LIMIT 2 FOR UPDATE",
-            qualified_table(&change.schema, &change.table),
-            predicates.join(" AND ")
-        ),
-        parameters: builder.finish(),
-    }))
-}
-
 fn key_predicates(
+    schema: &str,
+    table: &str,
     row: &[ColumnDatum],
     builder: &mut StatementBuilder,
+    plans: Option<&[ColumnConversionPlan]>,
 ) -> io::Result<(String, String)> {
     let mut keys = row
         .iter()
@@ -663,9 +847,10 @@ fn key_predicates(
                 ));
             }
             Datum::Value(_) => {
-                let value = builder.datum(column)?;
-                predicates.push(format!("{name} = {}", value.sql));
-                diagnostic_predicates.push(format!("{name} = {}", value.diagnostic_sql));
+                let rendered =
+                    builder.datum_with_plan(column, column_plan(schema, table, column, plans))?;
+                predicates.push(format!("{name} = {}", rendered.sql));
+                diagnostic_predicates.push(format!("{name} = {}", rendered.diagnostic_sql));
             }
             Datum::SourceRepresentationEnvelope(_) => {
                 return Err(capability_failure(
@@ -678,6 +863,168 @@ fn key_predicates(
         predicates.join(" AND "),
         diagnostic_predicates.join(" AND "),
     ))
+}
+
+fn render_carrier_readbacks(
+    change: &RowChange,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<Vec<CarrierReadbackCheck>> {
+    if change.operation == Operation::Delete {
+        return Ok(Vec::new());
+    }
+    let after = change
+        .after
+        .as_deref()
+        .ok_or_else(|| capability_failure("carrier read-back is missing its after image"))?;
+    let before = change.before.as_deref().unwrap_or_default();
+    let mut locator = after
+        .iter()
+        .filter(|column| column.primary_key_ordinal.is_some())
+        .map(|key| {
+            if matches!(&key.datum, Datum::Unchanged | Datum::Unavailable) {
+                before
+                    .iter()
+                    .find(|prior| {
+                        prior.primary_key_ordinal == key.primary_key_ordinal
+                            && prior.name == key.name
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        capability_failure(
+                            "carrier read-back cannot resolve an unchanged row locator",
+                        )
+                    })
+            } else {
+                Ok(key.clone())
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if locator.is_empty() {
+        return Err(capability_failure(
+            "carrier read-back requires a primary-key row locator",
+        ));
+    }
+    locator.sort_by_key(|column| column.primary_key_ordinal);
+    let mut readbacks = Vec::new();
+    for column in after.iter().filter(|column| !column.generated) {
+        let Some(plan) = column_plan(&change.schema, &change.table, column, Some(plans)) else {
+            continue;
+        };
+        let kind = plan
+            .target
+            .parameters
+            .get("conversion_kind")
+            .map(String::as_str);
+        let expected = match (&column.datum, kind) {
+            (Datum::Value(value), Some("logical_value_json")) => {
+                change_event::validate_value_against_plan(plan, value).map_err(io::Error::other)?;
+                CarrierReadbackExpected::LogicalValue(value.clone())
+            }
+            (Datum::SourceRepresentationEnvelope(envelope), Some("source_representation")) => {
+                change_event::validate_source_representation_envelope_against_plan(plan, envelope)
+                    .map_err(io::Error::other)?;
+                CarrierReadbackExpected::SourceRepresentation(
+                    serde_json::to_vec(envelope).map_err(io::Error::other)?,
+                )
+            }
+            (Datum::Null, Some("logical_value_json")) => {
+                CarrierReadbackExpected::SqlNull { text: true }
+            }
+            (Datum::Null, Some("source_representation")) => {
+                CarrierReadbackExpected::SqlNull { text: false }
+            }
+            (
+                Datum::Unchanged | Datum::Unavailable,
+                Some("logical_value_json" | "source_representation"),
+            )
+            | (_, None)
+            | (_, Some(_)) => continue,
+        };
+        let mut builder = StatementBuilder::default();
+        let (predicates, _) = key_predicates(
+            &change.schema,
+            &change.table,
+            &locator,
+            &mut builder,
+            Some(plans),
+        )?;
+        let selected = if matches!(
+            &expected,
+            CarrierReadbackExpected::LogicalValue(_)
+                | CarrierReadbackExpected::SqlNull { text: true }
+        ) {
+            format!("{}::text", quote_identifier(&column.name))
+        } else {
+            quote_identifier(&column.name)
+        };
+        readbacks.push(CarrierReadbackCheck {
+            query: PreparedQuery {
+                sql: format!(
+                    "SELECT {selected} FROM {} WHERE {predicates} LIMIT 2 FOR UPDATE",
+                    qualified_table(&change.schema, &change.table),
+                ),
+                parameters: builder.finish(),
+            },
+            column: column.name.clone(),
+            expected,
+        });
+    }
+    Ok(readbacks)
+}
+
+fn render_verification(
+    change: &RowChange,
+    plans: Option<&[ColumnConversionPlan]>,
+) -> io::Result<Option<PreparedQuery>> {
+    if matches!(change.operation, Operation::Delete) {
+        return Ok(None);
+    }
+    let after = change.after.as_ref().ok_or_else(|| {
+        capability_failure("generated-column verification is missing its after image")
+    })?;
+    let generated = after
+        .iter()
+        .filter(|column| column.generated)
+        .collect::<Vec<_>>();
+    if generated.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = StatementBuilder::default();
+    let (keys, _) = key_predicates(&change.schema, &change.table, after, &mut builder, plans)?;
+    let mut predicates = vec![keys];
+    for column in generated {
+        let name = quote_identifier(&column.name);
+        match &column.datum {
+            Datum::Null => predicates.push(format!("{name} IS NULL")),
+            Datum::Value(_) => {
+                let value = builder.datum_with_plan(
+                    column,
+                    column_plan(&change.schema, &change.table, column, plans),
+                )?;
+                predicates.push(format!("{name} IS NOT DISTINCT FROM {}", value.sql));
+            }
+            Datum::Unavailable | Datum::Unchanged => {
+                return Err(capability_failure(format!(
+                    "generated column {} has no captured observation",
+                    column.name
+                )));
+            }
+            Datum::SourceRepresentationEnvelope(_) => {
+                return Err(capability_failure(format!(
+                    "generated column {} has no LogicalValue observation",
+                    column.name
+                )));
+            }
+        }
+    }
+    Ok(Some(PreparedQuery {
+        sql: format!(
+            "SELECT 1 FROM {} WHERE {} LIMIT 2 FOR UPDATE",
+            qualified_table(&change.schema, &change.table),
+            predicates.join(" AND ")
+        ),
+        parameters: builder.finish(),
+    }))
 }
 
 fn writable_columns(row: &[ColumnDatum]) -> Vec<&ColumnDatum> {
@@ -712,6 +1059,92 @@ fn ensure_supported_change(change: &RowChange) -> io::Result<()> {
     Ok(())
 }
 
+fn ensure_supported_change_with_plans(
+    change: &RowChange,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<()> {
+    let identity = change
+        .after
+        .as_ref()
+        .or(change.before.as_ref())
+        .ok_or_else(|| capability_failure("row change image is missing"))?;
+    ensure_supported_image_with_plans(change, identity, plans)?;
+    if let Some(before) = &change.before {
+        ensure_supported_image_with_plans(change, before, plans)?;
+    }
+    if let Some(after) = &change.after {
+        ensure_supported_image_with_plans(change, after, plans)?;
+    }
+    Ok(())
+}
+
+fn ensure_supported_image_with_plans(
+    change: &RowChange,
+    image: &[ColumnDatum],
+    plans: &[ColumnConversionPlan],
+) -> io::Result<()> {
+    if image.is_empty() {
+        return Err(capability_failure("row image has no columns"));
+    }
+    if !image
+        .iter()
+        .any(|column| column.primary_key_ordinal.is_some())
+    {
+        return Err(capability_failure("row has no primary key"));
+    }
+    for column in image {
+        if column.generated && matches!(&column.datum, Datum::Unavailable | Datum::Unchanged) {
+            return Err(capability_failure(format!(
+                "generated column {} has no captured observation",
+                column.name
+            )));
+        }
+        let plan = column_plan(&change.schema, &change.table, column, Some(plans));
+        let kind = plan.and_then(|plan| {
+            plan.target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str)
+        });
+        match (&column.datum, kind) {
+            (Datum::Value(value), Some("logical_value_json")) => {
+                change_event::validate_value_against_plan(
+                    plan.expect("conversion kind has a plan"),
+                    value,
+                )
+                .map_err(io::Error::other)?;
+            }
+            (Datum::SourceRepresentationEnvelope(envelope), Some("source_representation")) => {
+                change_event::validate_source_representation_envelope_against_plan(
+                    plan.expect("conversion kind has a plan"),
+                    envelope,
+                )
+                .map_err(io::Error::other)?;
+            }
+            (
+                Datum::Null | Datum::Unchanged | Datum::Unavailable,
+                Some("logical_value_json" | "source_representation"),
+            ) => {}
+            (Datum::SourceRepresentationEnvelope(_), _) => {
+                return Err(capability_failure(format!(
+                    "column {} has a Source Representation Envelope but no matching carrier plan",
+                    column.name
+                )));
+            }
+            (Datum::Value(value), _) => {
+                let target_type = plan
+                    .map(|plan| plan.target.native_type.as_str())
+                    .unwrap_or(&column.native_type);
+                parameter_for(value, target_type).map_err(|error| {
+                    capability_failure(format!("column {}: {error}", column.name))
+                })?;
+            }
+            (Datum::Null | Datum::Unchanged | Datum::Unavailable, _) => {}
+        }
+    }
+    Ok(())
+}
+
 fn ensure_supported_image(image: &[ColumnDatum]) -> io::Result<()> {
     if image.is_empty() {
         return Err(capability_failure("row image has no columns"));
@@ -723,7 +1156,7 @@ fn ensure_supported_image(image: &[ColumnDatum]) -> io::Result<()> {
         return Err(capability_failure("row has no primary key"));
     }
     for column in image {
-        if column.generated && matches!(column.datum, Datum::Unavailable | Datum::Unchanged) {
+        if column.generated && matches!(&column.datum, Datum::Unavailable | Datum::Unchanged) {
             return Err(capability_failure(format!(
                 "generated column {} has no captured observation",
                 column.name
@@ -1953,6 +2386,61 @@ pub(crate) async fn execute_statements(
                 ));
             }
         }
+        for readback in &statement.carrier_readbacks {
+            verify_carrier_readback(transaction, readback).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn verify_carrier_readback(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    check: &CarrierReadbackCheck,
+) -> io::Result<()> {
+    let rows = bind_query(&check.query.sql, &check.query.parameters)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(io::Error::other)?;
+    if rows.len() != 1 {
+        return Err(capability_failure(format!(
+            "carrier read-back for column {} matched {} rows; transaction rolled back",
+            check.column,
+            rows.len()
+        )));
+    }
+    let row = &rows[0];
+    let matches = match &check.expected {
+        CarrierReadbackExpected::SqlNull { text: true } => {
+            let actual: Option<String> = row.try_get(0).map_err(io::Error::other)?;
+            actual.is_none()
+        }
+        CarrierReadbackExpected::SqlNull { text: false } => {
+            let actual: Option<Vec<u8>> = row.try_get(0).map_err(io::Error::other)?;
+            actual.is_none()
+        }
+        CarrierReadbackExpected::LogicalValue(expected) => {
+            let actual: Option<String> = row.try_get(0).map_err(io::Error::other)?;
+            actual
+                .and_then(|json| serde_json::from_str::<LogicalValue>(&json).ok())
+                .is_some_and(|actual| actual == *expected)
+        }
+        CarrierReadbackExpected::SourceRepresentation(expected) => {
+            let actual: Option<Vec<u8>> = row.try_get(0).map_err(io::Error::other)?;
+            actual.is_some_and(|bytes| {
+                let Ok(envelope) =
+                    serde_json::from_slice::<change_event::SourceRepresentationEnvelope>(&bytes)
+                else {
+                    return false;
+                };
+                envelope.validate().is_ok() && bytes == *expected
+            })
+        }
+    };
+    if !matches {
+        return Err(capability_failure(format!(
+            "carrier read-back for column {} changed or invalidated its stored value; transaction rolled back",
+            check.column
+        )));
     }
     Ok(())
 }

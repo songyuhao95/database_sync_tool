@@ -104,6 +104,24 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
         .as_array()
         .unwrap();
     assert_eq!(capability_invalidation.len(), 1);
+    for (database, expected_suite) in [
+        ("postgresql_15", "postgresql_15.representation_carriers"),
+        ("postgresql_16", "postgresql_16.representation_carriers"),
+        ("postgresql_17", "postgresql_17.representation_carriers"),
+    ] {
+        let sink = sinks
+            .iter()
+            .find(|sink| sink["database"] == database)
+            .expect("each PostgreSQL version is a live sink component");
+        assert!(
+            sink["additional_suites"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|suite| suite == expected_suite),
+            "the PostgreSQL carrier suite must gate {database} qualification"
+        );
+    }
 
     let suites = matrix["suites"].as_array().unwrap();
     assert_eq!(
@@ -209,7 +227,7 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "sink")
             .count(),
-        9
+        12
     );
     for suite_id in [
         "mysql_5_7.representation_carriers",
@@ -225,6 +243,28 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
         assert!(suite["args"].as_array().unwrap().iter().any(|argument| {
             argument.as_str().is_some_and(|argument| {
                 argument.ends_with("_live_representation_readback_and_checkpoint")
+            })
+        }));
+    }
+    for suite_id in [
+        "postgresql_15.representation_carriers",
+        "postgresql_16.representation_carriers",
+        "postgresql_17.representation_carriers",
+    ] {
+        let suite = suites
+            .iter()
+            .find(|suite| suite["id"] == suite_id)
+            .unwrap_or_else(|| panic!("PostgreSQL carrier suite {suite_id} is registered"));
+        assert_eq!(suite["mode"], "Live");
+        assert_eq!(suite["category"], "sink");
+        assert_eq!(suite["required_for_live_qualified"], true);
+        assert_eq!(
+            suite["source_fixtures"],
+            serde_json::json!(["postgresql_15"])
+        );
+        assert!(suite["args"].as_array().unwrap().iter().any(|argument| {
+            argument.as_str().is_some_and(|argument| {
+                argument.ends_with("_sink_representation_carriers_live_qualification")
             })
         }));
     }

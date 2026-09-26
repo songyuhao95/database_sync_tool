@@ -847,6 +847,51 @@
       ]
     },
     {
+      "id": "postgresql_15.representation_carriers",
+      "mode": "Live",
+      "category": "sink",
+      "required_for_live_qualified": true,
+      "source_fixtures": ["postgresql_15"],
+      "databases": ["postgresql_15"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "postgresql_sink_representation_carriers",
+        "postgresql15_sink_representation_carriers_live_qualification", "--", "--ignored", "--exact",
+        "--nocapture", "--test-threads=1"
+      ],
+      "required_env": ["PG_CDC_HOST", "PG_CDC_PORT", "PG_CDC_ADMIN_USER", "PG_CDC_WRITER_USER", "PG_CDC_TEST_PASSWORD"]
+    },
+    {
+      "id": "postgresql_16.representation_carriers",
+      "mode": "Live",
+      "category": "sink",
+      "required_for_live_qualified": true,
+      "source_fixtures": ["postgresql_15"],
+      "databases": ["postgresql_16"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "postgresql_sink_representation_carriers",
+        "postgresql16_sink_representation_carriers_live_qualification", "--", "--ignored", "--exact",
+        "--nocapture", "--test-threads=1"
+      ],
+      "required_env": ["PG_CDC16_HOST", "PG_CDC16_PORT", "PG_CDC16_ADMIN_USER", "PG_CDC16_WRITER_USER", "PG_CDC16_TEST_PASSWORD"]
+    },
+    {
+      "id": "postgresql_17.representation_carriers",
+      "mode": "Live",
+      "category": "sink",
+      "required_for_live_qualified": true,
+      "source_fixtures": ["postgresql_15"],
+      "databases": ["postgresql_17"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "postgresql_sink_representation_carriers",
+        "postgresql17_sink_representation_carriers_live_qualification", "--", "--ignored", "--exact",
+        "--nocapture", "--test-threads=1"
+      ],
+      "required_env": ["PG_CDC17_HOST", "PG_CDC17_PORT", "PG_CDC17_ADMIN_USER", "PG_CDC17_WRITER_USER", "PG_CDC17_TEST_PASSWORD"]
+    },
+    {
       "id": "postgresql_15.capability_invalidation",
       "mode": "Live",
       "category": "capability_invalidation",

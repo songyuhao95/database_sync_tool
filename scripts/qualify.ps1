@@ -223,11 +223,25 @@ foreach ($suiteId in $capabilityInvalidationSpecs) {
     }
 }
 foreach ($sinkSpec in $sinkSpecs) {
-    $sinkSuite = $suiteDefinitions | Where-Object { $_.id -eq $sinkSpec.suite } | Select-Object -First 1
-    if ($null -ne $sinkSuite -and
-        ([string]$sinkSuite.category -ne 'sink' -or
-         ((@($sinkSuite.source_fixtures) -join ',') -ne ($roster -join ',')))) {
-        throw "Sink suite $($sinkSpec.suite) must declare all six source fixtures."
+    $suiteIds = @([string]$sinkSpec.suite)
+    if ($null -ne $sinkSpec.additional_suites) {
+        $suiteIds += @($sinkSpec.additional_suites | ForEach-Object { [string]$_ })
+    }
+    foreach ($suiteId in $suiteIds) {
+        $sinkSuite = $suiteDefinitions | Where-Object { $_.id -eq $suiteId } | Select-Object -First 1
+        if ($null -eq $sinkSuite -or [string]$sinkSuite.mode -ne 'Live' -or
+            [string]$sinkSuite.category -ne 'sink' -or
+            -not (@($sinkSuite.databases) -contains [string]$sinkSpec.database)) {
+            throw "Sink suite $suiteId must be a live sink suite for $($sinkSpec.database)."
+        }
+        if ($suiteId -ne [string]$sinkSpec.suite -and
+            -not [bool]$sinkSuite.required_for_live_qualified) {
+            throw "Additional sink suite $suiteId must be required for live qualification."
+        }
+        if ($suiteId -eq [string]$sinkSpec.suite -and
+            ((@($sinkSuite.source_fixtures) -join ',') -ne ($roster -join ','))) {
+            throw "Primary sink suite $suiteId must declare all six source fixtures."
+        }
     }
 }
 
@@ -404,15 +418,38 @@ try {
     })
     $sinkQualification = @($sinkSpecs | ForEach-Object {
         $spec = $_
-        $result = Get-SuiteResult $spec.suite
+        $suiteIds = @([string]$spec.suite)
+        if ($null -ne $spec.additional_suites) {
+            $suiteIds += @($spec.additional_suites | ForEach-Object { [string]$_ })
+        }
+        $suiteEvidence = @($suiteIds | ForEach-Object {
+            $suiteId = [string]$_
+            $result = Get-SuiteResult $suiteId
+            [ordered]@{
+                suite = $suiteId
+                status = if ($null -ne $result) { $result.status } else { 'REQUIRES_LIVE' }
+                log = if ($null -ne $result) { $result.log } else { $null }
+                reason = if ($null -ne $result) { $null } else { 'live_suite_not_registered' }
+            }
+        })
+        $suiteStatuses = @($suiteEvidence | ForEach-Object { [string]$_.status })
+        $status = if ($suiteStatuses -contains 'FAIL') {
+            'FAIL'
+        } elseif ($suiteStatuses.Count -gt 0 -and @($suiteStatuses | Where-Object { $_ -ne 'PASS' }).Count -eq 0) {
+            'PASS'
+        } else {
+            'REQUIRES_LIVE'
+        }
         $suite = $suiteDefinitions | Where-Object { $_.id -eq $spec.suite } | Select-Object -First 1
         [ordered]@{
             database = $spec.database
             suite = $spec.suite
-            status = if ($null -ne $result) { $result.status } else { 'REQUIRES_LIVE' }
+            additional_suites = @($spec.additional_suites)
+            suites = $suiteEvidence
+            status = $status
             source_fixtures = if ($null -ne $suite) { @($suite.source_fixtures) } else { @($roster) }
-            log = if ($null -ne $result) { $result.log } else { $null }
-            reason = if ($null -ne $result) { $null } else { 'live_suite_not_registered' }
+            log = if ($suiteEvidence.Count -gt 0) { $suiteEvidence[0].log } else { $null }
+            reason = if ($status -eq 'REQUIRES_LIVE') { 'one_or_more_live_sink_suites_not_registered' } else { $null }
             evidence_scope = 'live_sink_adapter'
         }
     })

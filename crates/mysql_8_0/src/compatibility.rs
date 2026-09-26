@@ -640,6 +640,9 @@ fn add_logical_value_json_carrier(capabilities: &mut Vec<CapabilityEntry>) {
     target
         .parameters
         .insert("value_strategy".into(), "tagged_json_v0_3".into());
+    target
+        .parameters
+        .insert("target_storage".into(), "mysql_json_tagged_value".into());
     let logical = LogicalType::Opaque {
         source_type: "*".into(),
         format: "logical_value".into(),

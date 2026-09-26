@@ -1902,32 +1902,63 @@ pub fn validate_value_against_plan(
                 .parameters
                 .get("source_logical_type_json")
                 .and_then(|encoded| serde_json::from_str::<LogicalType>(encoded).ok());
-            if plan.target.native_type.eq_ignore_ascii_case("json")
+            if plan
+                .target
+                .parameters
+                .get("logical_value_schema")
+                .map(String::as_str)
+                == Some("change_event.logical_value.v0_3")
                 && plan
                     .target
                     .parameters
-                    .get("logical_value_schema")
+                    .get("value_strategy")
                     .map(String::as_str)
-                    == Some("change_event.logical_value.v0_3")
+                    == Some("tagged_json_v0_3")
+                && plan
+                    .target
+                    .parameters
+                    .get("target_storage")
+                    .is_some_and(|storage| !storage.is_empty())
                 && source_type.as_ref().is_some_and(|source_type| {
                     plan.target.parameters.get("source_logical_type_digest")
                         == Some(&crate::stable_digest(source_type))
                         && source_type.matches_value(value)
                 })
             {
-                serde_json::to_vec(value).map_err(|error| {
+                let encoded = serde_json::to_vec(value).map_err(|error| {
                     plan_failure(
                         plan,
                         "target_capability.logical_value_json_invalid",
                         format!("the tagged LogicalValue could not be serialized: {error}"),
                     )
                 })?;
+                let capacity = plan
+                    .target
+                    .parameters
+                    .get("target_capacity_bytes")
+                    .map(|capacity| {
+                        capacity.parse::<usize>().map_err(|_| {
+                            plan_failure(
+                                plan,
+                                "target_capability.logical_value_carrier_capacity_invalid",
+                                "the tagged LogicalValue carrier capacity is invalid",
+                            )
+                        })
+                    })
+                    .transpose()?;
+                if capacity.is_some_and(|capacity| encoded.len() > capacity) {
+                    return Err(plan_failure(
+                        plan,
+                        "target_capability.logical_value_carrier_capacity_exceeded",
+                        "the tagged LogicalValue exceeds the qualified target carrier capacity",
+                    ));
+                }
                 return Ok(());
             }
             return Err(plan_failure(
                 plan,
                 "target_capability.logical_value_carrier_invalid",
-                "the tagged LogicalValue plan does not match a qualified MySQL JSON carrier",
+                "the tagged LogicalValue plan does not match a qualified, versioned value carrier",
             ));
         }
         Some("source_representation") => {
@@ -2112,6 +2143,13 @@ pub fn validate_source_representation_envelope_against_plan(
             "this plan does not provide an explicit Source Representation Envelope carrier",
         ));
     }
+    if plan.target.native_type.is_empty() || parameter("target_storage").is_none_or(str::is_empty) {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_target_missing",
+            "the plan does not identify its qualified binary carrier target",
+        ));
+    }
     envelope.validate().map_err(|error| {
         plan_failure(
             plan,
@@ -2119,6 +2157,31 @@ pub fn validate_source_representation_envelope_against_plan(
             "the source representation envelope failed integrity validation",
         )
     })?;
+    let encoded_capacity = serde_json::to_vec(envelope)
+        .map_err(|_| {
+            plan_failure(
+                plan,
+                "target_capability.source_representation_invalid",
+                "the source representation envelope could not be encoded for target storage",
+            )
+        })?
+        .len();
+    if let Some(capacity) = parameter("target_capacity_bytes") {
+        let capacity = capacity.parse::<usize>().map_err(|_| {
+            plan_failure(
+                plan,
+                "target_capability.source_representation_capacity_invalid",
+                "the source representation carrier capacity is invalid",
+            )
+        })?;
+        if encoded_capacity > capacity {
+            return Err(plan_failure(
+                plan,
+                "target_capability.source_representation_capacity_exceeded",
+                "the source representation envelope exceeds the qualified target carrier capacity",
+            ));
+        }
+    }
     if envelope.context.connector != plan.source_connector {
         return Err(plan_failure(
             plan,
@@ -6060,9 +6123,6 @@ fn bind_source_representation_evidence(
                 "source_type_identity_policy".into(),
                 "retain_and_bind_to_definition_digest".into(),
             );
-            target
-                .parameters
-                .insert("target_capacity_bytes".into(), "4294967295".into());
         }
         Some("logical_value_json" | "recursive") => {
             target.parameters.insert(
@@ -6633,15 +6693,24 @@ fn validate_explicit_parameters(
             Ok(())
         }
         Some("logical_value_json") => {
-            if !matches!(destination.logical_type, LogicalType::Json { .. })
+            if !target
+                .native_type
+                .eq_ignore_ascii_case(&destination.native_type)
                 || target
                     .parameters
                     .get("logical_value_schema")
                     .map(String::as_str)
                     != Some("change_event.logical_value.v0_3")
+                || target.parameters.get("value_strategy").map(String::as_str)
+                    != Some("tagged_json_v0_3")
+                || target
+                    .parameters
+                    .get("target_storage")
+                    .is_none_or(String::is_empty)
             {
                 return Err(
-                    "tagged LogicalValue storage requires the versioned JSON carrier".into(),
+                    "tagged LogicalValue storage requires a versioned value-carrier declaration"
+                        .into(),
                 );
             }
             Ok(())
@@ -6649,18 +6718,20 @@ fn validate_explicit_parameters(
         Some("source_representation") => {
             if !matches!(source.logical_type, LogicalType::Raw { .. })
                 || !matches!(destination.logical_type, LogicalType::Binary { .. })
-                || !destination.native_type.eq_ignore_ascii_case("longblob")
-                || target.native_type != "longblob"
+                || !destination
+                    .native_type
+                    .eq_ignore_ascii_case(&target.native_type)
                 || target
                     .parameters
                     .get("source_representation_codec")
                     .map(String::as_str)
                     != Some("source_representation_envelope_json_v1")
+                || target
+                    .parameters
+                    .get("target_storage")
+                    .is_none_or(String::is_empty)
             {
-                return Err(
-                    "Source Representation Envelope storage requires a pre-created MySQL LONGBLOB"
-                        .into(),
-                );
+                return Err("Source Representation Envelope storage requires the qualified pre-created binary carrier".into());
             }
             Ok(())
         }
@@ -7087,14 +7158,40 @@ fn explicit_template_matches_binding(
                     || selected_rule.is_some_and(|rule| rule.id == capability.rule.id))
         }
         Some("logical_value_json") => {
-            matches!(input_target.logical_type, LogicalType::Json { .. })
+            input_target
+                .native_type
+                .eq_ignore_ascii_case(&capability.target.native_type)
+                && capability
+                    .target
+                    .parameters
+                    .get("logical_value_schema")
+                    .map(String::as_str)
+                    == Some("change_event.logical_value.v0_3")
+                && capability
+                    .target
+                    .parameters
+                    .get("value_strategy")
+                    .map(String::as_str)
+                    == Some("tagged_json_v0_3")
+                && capability
+                    .target
+                    .parameters
+                    .get("target_storage")
+                    .is_some_and(|storage| !storage.is_empty())
                 && selected_rule.is_some_and(|rule| rule.id == capability.rule.id)
         }
         Some("source_representation") => {
             has_source_representation_evidence
                 && matches!(input_source.logical_type, LogicalType::Raw { .. })
                 && matches!(input_target.logical_type, LogicalType::Binary { .. })
-                && input_target.native_type.eq_ignore_ascii_case("longblob")
+                && input_target
+                    .native_type
+                    .eq_ignore_ascii_case(&capability.target.native_type)
+                && capability
+                    .target
+                    .parameters
+                    .get("target_storage")
+                    .is_some_and(|storage| !storage.is_empty())
                 && selected_rule.is_some_and(|rule| rule.id == capability.rule.id)
         }
         _ => false,

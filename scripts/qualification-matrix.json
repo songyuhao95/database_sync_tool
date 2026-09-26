@@ -17,9 +17,9 @@
       {"database": "mysql_5_7", "suite": "mysql_5_7.apply"},
       {"database": "mysql_8_0", "suite": "mysql_8_0.apply"},
       {"database": "mysql_8_4", "suite": "mysql_8_4.apply"},
-      {"database": "postgresql_15", "suite": "postgresql_15.apply"},
-      {"database": "postgresql_16", "suite": "postgresql_16.apply"},
-      {"database": "postgresql_17", "suite": "postgresql_17.apply"}
+      {"database": "postgresql_15", "suite": "postgresql_15.apply", "additional_suites": ["postgresql_15.representation_carriers"]},
+      {"database": "postgresql_16", "suite": "postgresql_16.apply", "additional_suites": ["postgresql_16.representation_carriers"]},
+      {"database": "postgresql_17", "suite": "postgresql_17.apply", "additional_suites": ["postgresql_17.representation_carriers"]}
     ],
     "transaction_recovery": ["transaction_recovery.common"],
     "capability_invalidation": ["postgresql_15.capability_invalidation"],

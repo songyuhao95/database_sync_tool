@@ -44,6 +44,8 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
         add_exact(&mut capabilities, logical, native, suffix);
     }
     add_structured_json(&mut capabilities);
+    add_logical_value_json_carrier(&mut capabilities);
+    add_source_representation_carrier(&mut capabilities);
     add_enum(&mut capabilities);
     add_structured_capabilities(&mut capabilities);
     for (bits, native) in [(16, "smallint"), (32, "integer"), (64, "bigint")] {
@@ -416,6 +418,87 @@ fn add_structured_json(capabilities: &mut Vec<CapabilityEntry>) {
         supported_operations: operations(),
         supported_presence: presence(),
         rule,
+    });
+}
+
+fn add_logical_value_json_carrier(capabilities: &mut Vec<CapabilityEntry>) {
+    let code = "postgresql15.explicit.logical_value_json_carrier".to_owned();
+    // PostgreSQL JSONB rejects U+0000 even when it arrives as a valid escaped
+    // JSON string. Store the tagged JSON document as TEXT so every valid
+    // LogicalValue can be read back without changing its Unicode payload.
+    let mut target = TargetRepresentation::new("text");
+    target
+        .parameters
+        .insert("conversion_kind".into(), "logical_value_json".into());
+    target.parameters.insert(
+        "logical_value_schema".into(),
+        "change_event.logical_value.v0_3".into(),
+    );
+    target
+        .parameters
+        .insert("value_strategy".into(), "tagged_json_v0_3".into());
+    target.parameters.insert(
+        "target_storage".into(),
+        "postgresql_text_tagged_json".into(),
+    );
+    target
+        .parameters
+        .insert("target_capacity_bytes".into(), "1073741823".into());
+    let logical = LogicalType::Opaque {
+        source_type: "*".into(),
+        format: "logical_value".into(),
+    };
+    let mut rule = explicit_rule(&code, logical.clone(), target.clone(), Vec::new());
+    rule.version = "postgresql-15.sink-carrier.v1".into();
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        supported_operations: operations(),
+        supported_presence: vec![
+            PresenceState::Value,
+            PresenceState::Null,
+            PresenceState::Unchanged,
+        ],
+        rule,
+    });
+}
+
+fn add_source_representation_carrier(capabilities: &mut Vec<CapabilityEntry>) {
+    let code = "postgresql15.explicit.source_representation.bytea".to_owned();
+    let mut target = TargetRepresentation::new("bytea");
+    target
+        .parameters
+        .insert("conversion_kind".into(), "source_representation".into());
+    target.parameters.insert(
+        "source_representation_codec".into(),
+        "source_representation_envelope_json_v1".into(),
+    );
+    target
+        .parameters
+        .insert("target_storage".into(), "postgresql_bytea".into());
+    target
+        .parameters
+        .insert("target_capacity_bytes".into(), "1073741823".into());
+    let logical = LogicalType::Opaque {
+        source_type: "*".into(),
+        format: "source_representation".into(),
+    };
+    let supported_presence = vec![
+        PresenceState::SourceRepresentation,
+        PresenceState::Null,
+        PresenceState::Unchanged,
+    ];
+    let mut rule = explicit_rule(&code, logical.clone(), target.clone(), Vec::new());
+    rule.version = "postgresql-15.sink-carrier.v1".into();
+    rule.supported_presence = supported_presence.clone();
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        rule,
+        supported_operations: operations(),
+        supported_presence,
     });
 }
 
