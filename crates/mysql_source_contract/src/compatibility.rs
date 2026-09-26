@@ -362,6 +362,8 @@ pub fn capability_manifest(
     );
     add_spatial(&mut capabilities, code_prefix, connector_version);
     add_recursive_json_value_carrier(&mut capabilities, code_prefix, connector_version);
+    add_logical_value_json_carrier(&mut capabilities, code_prefix, connector_version);
+    add_source_representation_carrier(&mut capabilities, code_prefix, connector_version);
     add_enum_set(&mut capabilities, false, code_prefix, connector_version);
     add_enum_set(&mut capabilities, true, code_prefix, connector_version);
 
@@ -596,6 +598,94 @@ fn add_recursive_json_value_carrier(
         rule,
         supported_operations: operations(),
         supported_presence: presence(),
+    });
+}
+
+fn add_logical_value_json_carrier(
+    capabilities: &mut Vec<CapabilityEntry>,
+    code_prefix: &str,
+    connector_version: &str,
+) {
+    let code = format!("{code_prefix}.explicit.logical_value_json_carrier");
+    let mut target = TargetRepresentation::new("json");
+    target
+        .parameters
+        .insert("conversion_kind".into(), "logical_value_json".into());
+    target.parameters.insert(
+        "logical_value_schema".into(),
+        "change_event.logical_value.v0_3".into(),
+    );
+    target
+        .parameters
+        .insert("value_strategy".into(), "tagged_json_v0_3".into());
+    let logical = LogicalType::Opaque {
+        source_type: "*".into(),
+        format: "logical_value".into(),
+    };
+    let rule = explicit_rule(
+        &code,
+        logical.clone(),
+        target.clone(),
+        Vec::new(),
+        code_prefix,
+        connector_version,
+    );
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        rule,
+        supported_operations: operations(),
+        supported_presence: vec![
+            PresenceState::Value,
+            PresenceState::Null,
+            PresenceState::Unchanged,
+        ],
+    });
+}
+
+fn add_source_representation_carrier(
+    capabilities: &mut Vec<CapabilityEntry>,
+    code_prefix: &str,
+    connector_version: &str,
+) {
+    let code = format!("{code_prefix}.explicit.source_representation.longblob");
+    let mut target = TargetRepresentation::new("longblob");
+    target
+        .parameters
+        .insert("conversion_kind".into(), "source_representation".into());
+    target.parameters.insert(
+        "source_representation_codec".into(),
+        "source_representation_envelope_json_v1".into(),
+    );
+    target
+        .parameters
+        .insert("target_storage".into(), "mysql_longblob".into());
+    let logical = LogicalType::Opaque {
+        source_type: "*".into(),
+        format: "source_representation".into(),
+    };
+    let presence = vec![
+        PresenceState::SourceRepresentation,
+        PresenceState::Null,
+        PresenceState::Unchanged,
+    ];
+    let mut rule = explicit_rule(
+        &code,
+        logical.clone(),
+        target.clone(),
+        Vec::new(),
+        code_prefix,
+        connector_version,
+    );
+    rule.supported_presence = presence.clone();
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        rule,
+        supported_operations: operations(),
+        supported_presence: presence,
     });
 }
 

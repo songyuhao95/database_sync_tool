@@ -209,8 +209,25 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "sink")
             .count(),
-        6
+        9
     );
+    for suite_id in [
+        "mysql_5_7.representation_carriers",
+        "mysql_8_0.representation_carriers",
+        "mysql_8_4.representation_carriers",
+    ] {
+        let suite = suites
+            .iter()
+            .find(|suite| suite["id"] == suite_id)
+            .unwrap_or_else(|| panic!("representation read-back suite {suite_id} is registered"));
+        assert_eq!(suite["mode"], "Live");
+        assert_eq!(suite["category"], "sink");
+        assert!(suite["args"].as_array().unwrap().iter().any(|argument| {
+            argument.as_str().is_some_and(|argument| {
+                argument.ends_with("_live_representation_readback_and_checkpoint")
+            })
+        }));
+    }
     assert_eq!(
         suites
             .iter()

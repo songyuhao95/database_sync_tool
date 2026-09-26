@@ -79,6 +79,7 @@ pub fn source_type_mapping(
         source_definition_fingerprint: None,
         source_build: None,
         environment_fingerprint: None,
+        source_representation_evidence: None,
     })
 }
 

@@ -12,7 +12,10 @@ use crate::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 pub const COMPATIBILITY_FORMAT: &str = "cdc.change-event-compatibility.v0.1";
 pub const DIGEST_ALGORITHM: &str = "sha256";
@@ -1283,6 +1286,26 @@ pub struct SourceTypeMapping {
     pub source_build: Option<ServerBuildIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_fingerprint: Option<String>,
+    /// Exact source-protocol context expected when this mapping uses a
+    /// representation-only envelope. It binds the opaque type identity and
+    /// stable type metadata into the persisted target plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_representation_evidence: Option<SourceRepresentationTypeEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SourceRepresentationTypeEvidence {
+    pub source_type_identity: String,
+    pub protocol: String,
+    pub format: crate::SourceRepresentationFormat,
+    /// Stable, type-defining metadata. Every key and value is copied into and
+    /// checked against the persisted plan.
+    pub type_metadata: BTreeMap<String, String>,
+    /// Runtime context keys that are intentionally not fixed by the type
+    /// definition (for example relation and column identity). The key set is
+    /// bound into the plan; the SourceAdapter must validate their values.
+    #[serde(default)]
+    pub allowed_context_metadata_keys: BTreeSet<String>,
 }
 
 impl SourceTypeMapping {
@@ -1303,6 +1326,7 @@ impl SourceTypeMapping {
             source_definition_fingerprint: None,
             source_build: None,
             environment_fingerprint: None,
+            source_representation_evidence: None,
         }
     }
 
@@ -1866,6 +1890,55 @@ pub fn validate_value_against_plan(
     plan: &ColumnConversionPlan,
     value: &LogicalValue,
 ) -> Result<(), TargetCapabilityFailure> {
+    match plan
+        .target
+        .parameters
+        .get("conversion_kind")
+        .map(String::as_str)
+    {
+        Some("logical_value_json") => {
+            let source_type = plan
+                .target
+                .parameters
+                .get("source_logical_type_json")
+                .and_then(|encoded| serde_json::from_str::<LogicalType>(encoded).ok());
+            if plan.target.native_type.eq_ignore_ascii_case("json")
+                && plan
+                    .target
+                    .parameters
+                    .get("logical_value_schema")
+                    .map(String::as_str)
+                    == Some("change_event.logical_value.v0_3")
+                && source_type.as_ref().is_some_and(|source_type| {
+                    plan.target.parameters.get("source_logical_type_digest")
+                        == Some(&crate::stable_digest(source_type))
+                        && source_type.matches_value(value)
+                })
+            {
+                serde_json::to_vec(value).map_err(|error| {
+                    plan_failure(
+                        plan,
+                        "target_capability.logical_value_json_invalid",
+                        format!("the tagged LogicalValue could not be serialized: {error}"),
+                    )
+                })?;
+                return Ok(());
+            }
+            return Err(plan_failure(
+                plan,
+                "target_capability.logical_value_carrier_invalid",
+                "the tagged LogicalValue plan does not match a qualified MySQL JSON carrier",
+            ));
+        }
+        Some("source_representation") => {
+            return Err(plan_failure(
+                plan,
+                "target_capability.source_representation_value_mismatch",
+                "a protocol-only carrier plan accepts Source Representation Envelopes, not LogicalValues",
+            ));
+        }
+        _ => {}
+    }
     let range_kind = plan.target.parameters.get("range_kind").map(String::as_str);
     if range_kind.is_some()
         && plan
@@ -2009,17 +2082,223 @@ pub fn validate_datum_against_plan(
         // second copy of the manifest's presence list; the common event
         // validator has already checked the operation/image relationship.
         Datum::Null | Datum::Unchanged => Ok(()),
-        Datum::SourceRepresentationEnvelope(_) => Err(plan_failure(
-            plan,
-            "target_capability.source_representation_not_supported",
-            "this conversion plan does not provide a carrier for source representation envelopes",
-        )),
+        Datum::SourceRepresentationEnvelope(envelope) => {
+            validate_source_representation_envelope_against_plan(plan, envelope)
+        }
         Datum::Unavailable => Err(plan_failure(
             plan,
             "target_capability.unavailable_value",
             "an unavailable source value cannot be written by a conversion plan",
         )),
     }
+}
+
+/// Validate a protocol-only representation against the explicit, digest-bound
+/// carrier plan. This proves that the stored payload belongs to the selected
+/// source type/build; it does not claim that the source value can be decoded.
+#[allow(clippy::result_large_err)]
+pub fn validate_source_representation_envelope_against_plan(
+    plan: &ColumnConversionPlan,
+    envelope: &crate::SourceRepresentationEnvelope,
+) -> Result<(), TargetCapabilityFailure> {
+    let parameter = |name: &str| plan.target.parameters.get(name).map(String::as_str);
+    if parameter("conversion_kind") != Some("source_representation")
+        || parameter("source_representation_codec")
+            != Some("source_representation_envelope_json_v1")
+    {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_not_supported",
+            "this plan does not provide an explicit Source Representation Envelope carrier",
+        ));
+    }
+    envelope.validate().map_err(|error| {
+        plan_failure(
+            plan,
+            error.code(),
+            "the source representation envelope failed integrity validation",
+        )
+    })?;
+    if envelope.context.connector != plan.source_connector {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_connector_mismatch",
+            "the source representation envelope belongs to another source connector",
+        ));
+    }
+    if plan.source_build.as_ref() != Some(&envelope.context.server_build) {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_build_mismatch",
+            "the source representation envelope build differs from the approved plan",
+        ));
+    }
+    let expected_identity = parameter("source_representation_type_identity").ok_or_else(|| {
+        plan_failure(
+            plan,
+            "target_capability.source_representation_identity_missing",
+            "the approved plan is missing the source protocol type identity",
+        )
+    })?;
+    if envelope.context.source_type_identity != expected_identity {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_identity_mismatch",
+            "the source representation envelope belongs to another protocol type identity",
+        ));
+    }
+    let expected_protocol = parameter("source_representation_protocol").ok_or_else(|| {
+        plan_failure(
+            plan,
+            "target_capability.source_representation_protocol_missing",
+            "the approved plan is missing the source protocol identity",
+        )
+    })?;
+    let expected_format = parameter("source_representation_format").ok_or_else(|| {
+        plan_failure(
+            plan,
+            "target_capability.source_representation_format_missing",
+            "the approved plan is missing the source protocol format",
+        )
+    })?;
+    let actual_format = match envelope.context.format {
+        crate::SourceRepresentationFormat::Text => "text",
+        crate::SourceRepresentationFormat::Binary => "binary",
+    };
+    if envelope.context.protocol != expected_protocol || actual_format != expected_format {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_protocol_mismatch",
+            "the source representation protocol or format differs from the approved plan",
+        ));
+    }
+    let expected_metadata_json =
+        parameter("source_representation_type_metadata_json").ok_or_else(|| {
+            plan_failure(
+                plan,
+                "target_capability.source_representation_metadata_missing",
+                "the approved plan is missing stable source type metadata",
+            )
+        })?;
+    let expected_metadata =
+        serde_json::from_str::<BTreeMap<String, String>>(expected_metadata_json).map_err(|_| {
+            plan_failure(
+                plan,
+                "target_capability.source_representation_metadata_invalid",
+                "the approved source type metadata is not valid serialized evidence",
+            )
+        })?;
+    if expected_metadata.is_empty()
+        || parameter("source_representation_type_metadata_digest")
+            != Some(crate::stable_digest(&expected_metadata).as_str())
+    {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_metadata_invalid",
+            "the approved source type metadata digest is missing or invalid",
+        ));
+    }
+    let expected_context_keys_json = parameter("source_representation_context_metadata_keys_json")
+        .ok_or_else(|| {
+            plan_failure(
+                plan,
+                "target_capability.source_representation_context_metadata_missing",
+                "the approved plan is missing its runtime context metadata policy",
+            )
+        })?;
+    let expected_context_keys =
+        serde_json::from_str::<BTreeSet<String>>(expected_context_keys_json).map_err(|_| {
+            plan_failure(
+                plan,
+                "target_capability.source_representation_context_metadata_invalid",
+                "the approved runtime context metadata policy is invalid",
+            )
+        })?;
+    if parameter("source_representation_context_metadata_keys_digest")
+        != Some(crate::stable_digest(&expected_context_keys).as_str())
+        || expected_metadata
+            .keys()
+            .any(|key| expected_context_keys.contains(key))
+        || expected_context_keys
+            .iter()
+            .any(|key| key.trim().is_empty())
+    {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_context_metadata_invalid",
+            "the approved runtime context metadata keys are missing, duplicated, or overlap type metadata",
+        ));
+    }
+    if expected_metadata
+        .iter()
+        .any(|(key, expected)| envelope.context.type_metadata.get(key) != Some(expected))
+    {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_metadata_mismatch",
+            "the source representation type metadata differs from the approved definition evidence",
+        ));
+    }
+    let expected_metadata_keys = expected_metadata
+        .keys()
+        .chain(expected_context_keys.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let actual_metadata_keys = envelope
+        .context
+        .type_metadata
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if actual_metadata_keys != expected_metadata_keys {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_metadata_unbound",
+            "the source representation contains metadata keys that are absent from the approved type or runtime-context policy",
+        ));
+    }
+    let Some(expected_digest) = parameter("source_type_definition_digest") else {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_definition_missing",
+            "the approved plan is missing the source type definition digest",
+        ));
+    };
+    let actual_digest = envelope
+        .context
+        .source_type_definition_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&envelope.context.source_type_definition_digest);
+    if actual_digest != expected_digest {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_definition_mismatch",
+            "the source representation envelope belongs to another type definition",
+        ));
+    }
+    let expected_native = parameter("source_type_native").ok_or_else(|| {
+        plan_failure(
+            plan,
+            "target_capability.source_representation_native_type_missing",
+            "the approved plan is missing the source native type identity",
+        )
+    })?;
+    if envelope.encoding != parameter("source_type_encoding").unwrap_or_default()
+        || envelope.context.source_type_identity.trim().is_empty()
+        || envelope
+            .context
+            .type_metadata
+            .get("native_type")
+            .is_some_and(|native| native != expected_native)
+        || parameter("source_codec_identity").is_none_or(str::is_empty)
+    {
+        return Err(plan_failure(
+            plan,
+            "target_capability.source_representation_codec_mismatch",
+            "the source representation envelope codec evidence differs from the approved plan",
+        ));
+    }
+    Ok(())
 }
 
 fn plan_parameter<'a>(plan: &'a ColumnConversionPlan, name: &str) -> Option<&'a str> {
@@ -3653,12 +3932,9 @@ fn convert_image_with_plans(
                     "an unavailable source value cannot be written by a conversion plan",
                 ));
             }
-            Datum::SourceRepresentationEnvelope(_) => {
-                return Err(plan_failure(
-                    plan,
-                    "target_capability.source_representation_not_supported",
-                    "this conversion plan does not provide a carrier for source representation envelopes",
-                ));
+            Datum::SourceRepresentationEnvelope(envelope) => {
+                validate_source_representation_envelope_against_plan(plan, envelope)?;
+                Datum::SourceRepresentationEnvelope(envelope.clone())
             }
         };
     }
@@ -4340,6 +4616,10 @@ pub fn explain_compatibility(
                 &input.source_field,
                 &input.target_field,
                 input.options.selected_rule.as_ref(),
+                input
+                    .source_type_mapping
+                    .source_representation_evidence
+                    .is_some(),
             )
         })
         .filter(|_| input.source_field.generated == input.target_field.generated)
@@ -4685,6 +4965,10 @@ pub fn explain_field_compatibility(
                 &input.source_field,
                 &input.target_field,
                 input.options.selected_rule.as_ref(),
+                input
+                    .source_type_mapping
+                    .source_representation_evidence
+                    .is_some(),
             )
         })
         .filter(|_| input.source_field.generated == input.target_field.generated)
@@ -5670,6 +5954,154 @@ fn temporal_details_with_parameters(
     )
 }
 
+fn bind_source_representation_evidence(
+    target: &mut TargetRepresentation,
+    source: &FieldDefinition,
+    mapping: &SourceTypeMapping,
+) {
+    target.parameters.insert(
+        "source_logical_type_digest".into(),
+        crate::stable_digest(&source.logical_type),
+    );
+    target.parameters.insert(
+        "source_logical_type_json".into(),
+        serde_json::to_string(&source.logical_type)
+            .expect("LogicalType source evidence must serialize"),
+    );
+    target
+        .parameters
+        .insert("source_mapping_id".into(), mapping.mapping_id.clone());
+    target.parameters.insert(
+        "source_mapping_version".into(),
+        mapping.mapping_version.clone(),
+    );
+    if let Some(digest) = &mapping.evidence_digest {
+        target
+            .parameters
+            .insert("source_mapping_evidence_digest".into(), digest.clone());
+    }
+    if let Some(fingerprint) = &mapping.source_definition_fingerprint {
+        target
+            .parameters
+            .insert("source_definition_fingerprint".into(), fingerprint.clone());
+    }
+    if let Some(fingerprint) = &mapping.environment_fingerprint {
+        target
+            .parameters
+            .insert("source_environment_fingerprint".into(), fingerprint.clone());
+    }
+    if let LogicalType::Raw {
+        codec_identity,
+        native_type: _,
+        source_definition_digest,
+        encoding,
+    } = &source.logical_type
+    {
+        target
+            .parameters
+            .insert("source_codec_identity".into(), codec_identity.clone());
+        target
+            .parameters
+            .insert("source_type_native".into(), source.native_type.clone());
+        target.parameters.insert(
+            "source_type_definition_digest".into(),
+            source_definition_digest
+                .strip_prefix("sha256:")
+                .unwrap_or(source_definition_digest)
+                .to_owned(),
+        );
+        target
+            .parameters
+            .insert("source_type_encoding".into(), encoding.clone());
+    }
+    if let Some(evidence) = &mapping.source_representation_evidence {
+        target.parameters.insert(
+            "source_representation_type_identity".into(),
+            evidence.source_type_identity.clone(),
+        );
+        target.parameters.insert(
+            "source_representation_protocol".into(),
+            evidence.protocol.clone(),
+        );
+        target.parameters.insert(
+            "source_representation_format".into(),
+            match evidence.format {
+                crate::SourceRepresentationFormat::Text => "text",
+                crate::SourceRepresentationFormat::Binary => "binary",
+            }
+            .into(),
+        );
+        target.parameters.insert(
+            "source_representation_type_metadata_json".into(),
+            serde_json::to_string(&evidence.type_metadata)
+                .expect("source representation metadata must serialize"),
+        );
+        target.parameters.insert(
+            "source_representation_type_metadata_digest".into(),
+            crate::stable_digest(&evidence.type_metadata),
+        );
+        target.parameters.insert(
+            "source_representation_context_metadata_keys_json".into(),
+            serde_json::to_string(&evidence.allowed_context_metadata_keys)
+                .expect("source representation context metadata policy must serialize"),
+        );
+        target.parameters.insert(
+            "source_representation_context_metadata_keys_digest".into(),
+            crate::stable_digest(&evidence.allowed_context_metadata_keys),
+        );
+    }
+    match target.parameters.get("conversion_kind").map(String::as_str) {
+        Some("source_representation") => {
+            target.parameters.insert(
+                "representation_outcome".into(),
+                "SOURCE_REPRESENTATION_PRESERVED".into(),
+            );
+            target.parameters.insert(
+                "source_type_identity_policy".into(),
+                "retain_and_bind_to_definition_digest".into(),
+            );
+            target
+                .parameters
+                .insert("target_capacity_bytes".into(), "4294967295".into());
+        }
+        Some("logical_value_json" | "recursive") => {
+            target.parameters.insert(
+                "representation_outcome".into(),
+                "CHANGE_EVENT_LOGICAL_VALUE_ROUNDTRIP".into(),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn representation_loss(
+    target: &TargetRepresentation,
+    qualification: QualificationLevel,
+    key_like: bool,
+) -> LossAssessment {
+    match target
+        .parameters
+        .get("conversion_kind")
+        .map(String::as_str)
+    {
+        Some("logical_value_json" | "recursive") => LossAssessment {
+            value: false,
+            comparison: true,
+            ordering: true,
+            constraints: true,
+            explanation: "the tagged ChangeEvent LogicalValue is recoverable from the JSON carrier, but source-native comparison, ordering, and constraints do not carry over".into(),
+        },
+        Some("source_representation") => LossAssessment {
+            value: true,
+            comparison: true,
+            ordering: true,
+            constraints: true,
+            explanation: "the exact source protocol envelope and type evidence are preserved; this does not recover the source value or its native comparison, ordering, or constraints".into(),
+        },
+        _ => LossAssessment::for_qualification(qualification, key_like),
+    }
+}
+
 fn build_field_plan(
     input: &FieldCompatibilityInput<'_>,
     candidate: &TargetTypeCandidate,
@@ -5716,6 +6148,11 @@ fn build_field_plan(
         &planning_parameters,
     );
     let mut target = target;
+    bind_source_representation_evidence(
+        &mut target,
+        &input.source_field,
+        &input.source_type_mapping,
+    );
     if target.parameters.get("conversion_kind").map(String::as_str) == Some("text") {
         target.parameters.insert(
             "source_collation".into(),
@@ -5734,6 +6171,11 @@ fn build_field_plan(
                 .unwrap_or_else(|| "none".into()),
         );
     }
+    let loss = representation_loss(
+        &target,
+        candidate.qualification,
+        is_key_like(&input.source_field),
+    );
     let mut plan = ColumnConversionPlan {
         format: COMPATIBILITY_FORMAT.to_owned(),
         route_id: input.options.route_id.clone(),
@@ -5759,10 +6201,7 @@ fn build_field_plan(
         qualification: candidate.qualification,
         risk: candidate.risk,
         risk_code: candidate.risk_code.clone(),
-        loss: LossAssessment::for_qualification(
-            candidate.qualification,
-            is_key_like(&input.source_field),
-        ),
+        loss,
         examples: vec![ConversionExample {
             source: input.source_field.logical_type.family_name().into(),
             target: input.target_field.native_type.clone(),
@@ -6193,6 +6632,38 @@ fn validate_explicit_parameters(
             }
             Ok(())
         }
+        Some("logical_value_json") => {
+            if !matches!(destination.logical_type, LogicalType::Json { .. })
+                || target
+                    .parameters
+                    .get("logical_value_schema")
+                    .map(String::as_str)
+                    != Some("change_event.logical_value.v0_3")
+            {
+                return Err(
+                    "tagged LogicalValue storage requires the versioned JSON carrier".into(),
+                );
+            }
+            Ok(())
+        }
+        Some("source_representation") => {
+            if !matches!(source.logical_type, LogicalType::Raw { .. })
+                || !matches!(destination.logical_type, LogicalType::Binary { .. })
+                || !destination.native_type.eq_ignore_ascii_case("longblob")
+                || target.native_type != "longblob"
+                || target
+                    .parameters
+                    .get("source_representation_codec")
+                    .map(String::as_str)
+                    != Some("source_representation_envelope_json_v1")
+            {
+                return Err(
+                    "Source Representation Envelope storage requires a pre-created MySQL LONGBLOB"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
         Some("text") => {
             let LogicalType::Text { charset, .. } = &source.logical_type else {
                 return Err("text conversion requires a text source logical type".into());
@@ -6558,6 +7029,7 @@ fn explicit_template_matches_binding(
     input_source: &FieldDefinition,
     input_target: &FieldDefinition,
     selected_rule: Option<&RuleReference>,
+    has_source_representation_evidence: bool,
 ) -> bool {
     if !is_explicit_template(capability) {
         return true;
@@ -6613,6 +7085,17 @@ fn explicit_template_matches_binding(
                 && matches!(input_target.logical_type, LogicalType::Json { .. })
                 && (selected_rule.is_none()
                     || selected_rule.is_some_and(|rule| rule.id == capability.rule.id))
+        }
+        Some("logical_value_json") => {
+            matches!(input_target.logical_type, LogicalType::Json { .. })
+                && selected_rule.is_some_and(|rule| rule.id == capability.rule.id)
+        }
+        Some("source_representation") => {
+            has_source_representation_evidence
+                && matches!(input_source.logical_type, LogicalType::Raw { .. })
+                && matches!(input_target.logical_type, LogicalType::Binary { .. })
+                && input_target.native_type.eq_ignore_ascii_case("longblob")
+                && selected_rule.is_some_and(|rule| rule.id == capability.rule.id)
         }
         _ => false,
     }
@@ -6840,6 +7323,20 @@ fn capability_matches_source(capability: &CapabilityEntry, source: &LogicalType)
             },
             source,
         ) if source_type == "*" && format == "recursive" => recursive_type_kind(source).is_some(),
+        (
+            LogicalType::Opaque {
+                source_type,
+                format,
+            },
+            LogicalType::Raw { .. },
+        ) if source_type == "*" && format == "source_representation" => true,
+        (
+            LogicalType::Opaque {
+                source_type,
+                format,
+            },
+            _,
+        ) if source_type == "*" && format == "logical_value" => true,
         _ => false,
     }
 }
@@ -6966,6 +7463,11 @@ fn build_plan(
         &planning_parameters,
     );
     let mut target = target;
+    bind_source_representation_evidence(
+        &mut target,
+        &input.source_field,
+        &input.source_type_mapping,
+    );
     if target.parameters.get("conversion_kind").map(String::as_str) == Some("text") {
         target.parameters.insert(
             "source_collation".into(),
@@ -6984,6 +7486,11 @@ fn build_plan(
                 .unwrap_or_else(|| "none".into()),
         );
     }
+    let loss = representation_loss(
+        &target,
+        candidate.qualification,
+        is_key_like(&input.source_field),
+    );
     let mut plan = ColumnConversionPlan {
         format: COMPATIBILITY_FORMAT.to_owned(),
         route_id: input.options.route_id.clone(),
@@ -7009,10 +7516,7 @@ fn build_plan(
         qualification: candidate.qualification,
         risk: candidate.risk,
         risk_code: candidate.risk_code.clone(),
-        loss: LossAssessment::for_qualification(
-            candidate.qualification,
-            is_key_like(&input.source_field),
-        ),
+        loss,
         examples: vec![ConversionExample {
             source: input.source_field.logical_type.family_name().into(),
             target: input.target_field.native_type.clone(),

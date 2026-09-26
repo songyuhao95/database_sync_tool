@@ -887,6 +887,48 @@
       ]
     },
     {
+      "id": "mysql_5_7.representation_carriers",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["postgresql_15"],
+      "databases": ["mysql_5_7"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "mysql_sink_representation_carriers",
+        "mysql_5_7_live_representation_readback_and_checkpoint", "--", "--ignored", "--exact",
+        "--nocapture", "--test-threads=1"
+      ],
+      "required_env": ["CDC_MYSQL_WRITER_PASSWORD"]
+    },
+    {
+      "id": "mysql_8_0.representation_carriers",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["postgresql_15"],
+      "databases": ["mysql_8_0"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "mysql_sink_representation_carriers",
+        "mysql_8_0_live_representation_readback_and_checkpoint", "--", "--ignored", "--exact",
+        "--nocapture", "--test-threads=1"
+      ],
+      "required_env": ["CDC_MYSQL_WRITER_PASSWORD"]
+    },
+    {
+      "id": "mysql_8_4.representation_carriers",
+      "mode": "Live",
+      "category": "sink",
+      "source_fixtures": ["postgresql_15"],
+      "databases": ["mysql_8_4"],
+      "stages": ["Sql"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "mysql_sink_representation_carriers",
+        "mysql_8_4_live_representation_readback_and_checkpoint", "--", "--ignored", "--exact",
+        "--nocapture", "--test-threads=1"
+      ],
+      "required_env": ["CDC_MYSQL_WRITER_PASSWORD"]
+    },
+    {
       "id": "postgresql_15.web_sink",
       "mode": "Live",
       "category": "route_smoke",

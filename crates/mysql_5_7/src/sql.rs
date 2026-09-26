@@ -171,12 +171,27 @@ struct PlannedStatement {
     params: Vec<Value>,
     probe: Option<PreparedQuery>,
     operation: Operation,
+    verification: Vec<ReadbackCheck>,
 }
 
 #[derive(Debug, Clone)]
 struct PreparedQuery {
     sql: String,
     params: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ReadbackCheck {
+    query: PreparedQuery,
+    column: String,
+    expected: ReadbackExpected,
+}
+
+#[derive(Debug, Clone)]
+enum ReadbackExpected {
+    SqlNull,
+    LogicalValue(LogicalValue),
+    SourceRepresentationEnvelope(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +264,7 @@ pub fn sql(validated: &ValidatedTransaction) -> io::Result<SqlTransaction> {
             params,
             probe,
             operation: change.operation,
+            verification: Vec::new(),
         });
     }
     Ok(SqlTransaction {
@@ -317,6 +333,7 @@ fn planned_sql(
             params,
             probe,
             operation: change.operation,
+            verification: readback_checks(change, plans)?,
         });
     }
     Ok(SqlTransaction {
@@ -823,8 +840,170 @@ pub(crate) fn execute_statements(
                 "unexpected affected row count {affected}; transaction rolled back"
             )));
         }
+        for check in &statement.verification {
+            verify_readback(tx, check)?;
+        }
     }
     Ok(())
+}
+
+fn readback_checks(
+    change: &RowChange,
+    plans: &[ColumnConversionPlan],
+) -> io::Result<Vec<ReadbackCheck>> {
+    if change.operation == Operation::Delete {
+        return Ok(Vec::new());
+    }
+    let after = change
+        .after
+        .as_deref()
+        .ok_or_else(|| capability_failure("write is missing its after image"))?;
+    let before = change.before.as_deref().unwrap_or_default();
+    let mut checks = Vec::new();
+    for column in after {
+        let Some(plan) = column_plan(&change.schema, &change.table, column, plans) else {
+            continue;
+        };
+        let kind = plan
+            .target
+            .parameters
+            .get("conversion_kind")
+            .map(String::as_str);
+        if !matches!(
+            kind,
+            Some("recursive" | "logical_value_json" | "source_representation")
+        ) {
+            continue;
+        }
+        let expected = match &column.datum {
+            Datum::Null => ReadbackExpected::SqlNull,
+            Datum::Value(value) if matches!(kind, Some("recursive" | "logical_value_json")) => {
+                change_event::validate_value_against_plan(plan, value).map_err(io::Error::other)?;
+                ReadbackExpected::LogicalValue(value.clone())
+            }
+            Datum::SourceRepresentationEnvelope(envelope)
+                if kind == Some("source_representation") =>
+            {
+                change_event::validate_source_representation_envelope_against_plan(plan, envelope)
+                    .map_err(io::Error::other)?;
+                ReadbackExpected::SourceRepresentationEnvelope(
+                    serde_json::to_vec(envelope).map_err(io::Error::other)?,
+                )
+            }
+            Datum::Unchanged | Datum::Unavailable => continue,
+            _ => {
+                return Err(capability_failure(format!(
+                    "carrier plan does not match the presence state for column {}",
+                    column.name
+                )));
+            }
+        };
+        let locator = after
+            .iter()
+            .filter(|key| key.primary_key_ordinal.is_some())
+            .map(|key| {
+                if matches!(&key.datum, Datum::Unchanged | Datum::Unavailable) {
+                    before
+                        .iter()
+                        .find(|prior| {
+                            prior.primary_key_ordinal == key.primary_key_ordinal
+                                && prior.name == key.name
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            capability_failure(
+                                "readback verification cannot resolve an unchanged row locator",
+                            )
+                        })
+                } else {
+                    Ok(key.clone())
+                }
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let (predicates, params) =
+            key_predicates_with_plans(&change.schema, &change.table, &locator, plans)?;
+        let query = PreparedQuery {
+            sql: format!(
+                "SELECT {} FROM {} WHERE {predicates} LIMIT 2 FOR UPDATE",
+                quote_identifier(&column.name),
+                qualified_table(&change.schema, &change.table),
+            ),
+            params,
+        };
+        checks.push(ReadbackCheck {
+            query,
+            column: column.name.clone(),
+            expected,
+        });
+    }
+    Ok(checks)
+}
+
+fn verify_readback(
+    tx: &mut mysql_driver::Transaction<'_>,
+    check: &ReadbackCheck,
+) -> io::Result<()> {
+    let rows: Vec<Value> = tx
+        .exec(&check.query.sql, check.query.params.clone())
+        .map_err(io::Error::other)?;
+    if rows.len() != 1 {
+        return Err(capability_failure(format!(
+            "carrier readback for column {} matched {} rows; transaction rolled back",
+            check.column,
+            rows.len()
+        )));
+    }
+    let actual = rows.into_iter().next().expect("one readback row");
+    match (&check.expected, actual) {
+        (ReadbackExpected::SqlNull, Value::NULL) => Ok(()),
+        (ReadbackExpected::SqlNull, _) => Err(capability_failure(format!(
+            "carrier readback for column {} was not SQL NULL; transaction rolled back",
+            check.column
+        ))),
+        (ReadbackExpected::LogicalValue(expected), Value::Bytes(bytes)) => {
+            let recovered: LogicalValue = serde_json::from_slice(&bytes).map_err(|_| {
+                capability_failure(format!(
+                    "carrier readback for column {} is not a valid LogicalValue; transaction rolled back",
+                    check.column
+                ))
+            })?;
+            if &recovered == expected {
+                Ok(())
+            } else {
+                Err(capability_failure(format!(
+                    "carrier readback for column {} changed the LogicalValue; transaction rolled back",
+                    check.column
+                )))
+            }
+        }
+        (ReadbackExpected::SourceRepresentationEnvelope(expected), Value::Bytes(actual)) => {
+            let recovered: change_event::SourceRepresentationEnvelope =
+                serde_json::from_slice(&actual).map_err(|_| {
+                    capability_failure(format!(
+                        "carrier readback for column {} is not a valid source envelope; transaction rolled back",
+                        check.column
+                    ))
+                })?;
+            recovered.validate().map_err(|_| {
+                capability_failure(format!(
+                    "carrier readback for column {} failed envelope integrity validation; transaction rolled back",
+                    check.column
+                ))
+            })?;
+            if actual == *expected {
+                Ok(())
+            } else {
+                Err(capability_failure(format!(
+                    "carrier readback for column {} changed the source envelope; transaction rolled back",
+                    check.column
+                )))
+            }
+        }
+        (_, _) => Err(capability_failure(format!(
+            "carrier readback for column {} returned an unexpected SQL type; transaction rolled back",
+            check.column
+        ))),
+    }
 }
 
 impl SqlRenderer {
@@ -1100,15 +1279,32 @@ fn bind_datum_with_plan(
                     .parameters
                     .get("conversion_kind")
                     .map(String::as_str)
-                    == Some("recursive") =>
+                    .is_some_and(|kind| matches!(kind, "recursive" | "logical_value_json")) =>
             {
+                change_event::validate_value_against_plan(plan, value).map_err(io::Error::other)?;
                 Ok(Value::Bytes(logical_value_json(value)?.into_bytes()))
             }
             _ => bind_logical_value(value),
         },
-        Datum::SourceRepresentationEnvelope(_) => Err(capability_failure(
-            "MySQL Sink has no qualified carrier plan for source representation envelopes",
-        )),
+        Datum::SourceRepresentationEnvelope(envelope) => match plan {
+            Some(plan)
+                if plan
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("source_representation") =>
+            {
+                change_event::validate_source_representation_envelope_against_plan(plan, envelope)
+                    .map_err(io::Error::other)?;
+                Ok(Value::Bytes(
+                    serde_json::to_vec(envelope).map_err(io::Error::other)?,
+                ))
+            }
+            _ => Err(capability_failure(
+                "MySQL Sink has no qualified carrier plan for source representation envelopes",
+            )),
+        },
     }
 }
 
@@ -1192,24 +1388,20 @@ fn ensure_supported_image_with_plans(
         return Err(capability_failure("row has no primary key"));
     }
     for column in image.iter().filter(|column| !column.generated) {
-        if let Datum::Value(value) = &column.datum {
-            if let Some(plan) = column_plan(&change.schema, &change.table, column, plans)
-                && (plan
-                    .target
-                    .parameters
-                    .get("conversion_kind")
-                    .map(String::as_str)
-                    == Some("recursive")
-                    || plan
-                        .target
-                        .parameters
-                        .get("conversion_kind")
-                        .map(String::as_str)
-                        == Some("spatial"))
-            {
-                bind_column_with_plan(change, column, plans)?;
-                continue;
-            }
+        let plan = column_plan(&change.schema, &change.table, column, plans);
+        let kind = plan.and_then(|plan| {
+            plan.target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str)
+        });
+        if matches!(
+            kind,
+            Some("recursive" | "logical_value_json" | "source_representation" | "spatial")
+        ) || matches!(&column.datum, Datum::SourceRepresentationEnvelope(_))
+        {
+            bind_column_with_plan(change, column, plans)?;
+        } else if let Datum::Value(value) = &column.datum {
             ensure_source_value_type(&column.native_type, value, column.primary_key_ordinal)?;
             bind_logical_value(value)
                 .map_err(|error| capability_failure(format!("column {}: {error}", column.name)))?;

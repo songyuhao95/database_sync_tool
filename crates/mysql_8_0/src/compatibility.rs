@@ -288,6 +288,8 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
     add_structured_json(&mut capabilities);
     add_spatial(&mut capabilities);
     add_recursive_json_value_carrier(&mut capabilities);
+    add_logical_value_json_carrier(&mut capabilities);
+    add_source_representation_carrier(&mut capabilities);
     add_enum_set(&mut capabilities, false);
     add_enum_set(&mut capabilities, true);
     add_exact(
@@ -621,6 +623,72 @@ fn add_recursive_json_value_carrier(capabilities: &mut Vec<CapabilityEntry>) {
         target,
         supported_operations: operations(),
         supported_presence: presence(),
+        rule,
+    });
+}
+
+fn add_logical_value_json_carrier(capabilities: &mut Vec<CapabilityEntry>) {
+    let code = "mysql80.explicit.logical_value_json_carrier".to_owned();
+    let mut target = TargetRepresentation::new("json");
+    target
+        .parameters
+        .insert("conversion_kind".into(), "logical_value_json".into());
+    target.parameters.insert(
+        "logical_value_schema".into(),
+        "change_event.logical_value.v0_3".into(),
+    );
+    target
+        .parameters
+        .insert("value_strategy".into(), "tagged_json_v0_3".into());
+    let logical = LogicalType::Opaque {
+        source_type: "*".into(),
+        format: "logical_value".into(),
+    };
+    let rule = explicit_rule(&code, logical.clone(), target.clone(), Vec::new());
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        supported_operations: operations(),
+        supported_presence: vec![
+            PresenceState::Value,
+            PresenceState::Null,
+            PresenceState::Unchanged,
+        ],
+        rule,
+    });
+}
+
+fn add_source_representation_carrier(capabilities: &mut Vec<CapabilityEntry>) {
+    let code = "mysql80.explicit.source_representation.longblob".to_owned();
+    let mut target = TargetRepresentation::new("longblob");
+    target
+        .parameters
+        .insert("conversion_kind".into(), "source_representation".into());
+    target.parameters.insert(
+        "source_representation_codec".into(),
+        "source_representation_envelope_json_v1".into(),
+    );
+    target
+        .parameters
+        .insert("target_storage".into(), "mysql_longblob".into());
+    let logical = LogicalType::Opaque {
+        source_type: "*".into(),
+        format: "source_representation".into(),
+    };
+    let presence = vec![
+        PresenceState::SourceRepresentation,
+        PresenceState::Null,
+        PresenceState::Unchanged,
+    ];
+    let mut rule = explicit_rule(&code, logical.clone(), target.clone(), Vec::new());
+    rule.supported_presence = presence.clone();
+    capabilities.push(CapabilityEntry {
+        code,
+        source_logical_type: logical,
+        target,
+        supported_operations: operations(),
+        supported_presence: presence,
         rule,
     });
 }

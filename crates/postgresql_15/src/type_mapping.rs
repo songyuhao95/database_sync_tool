@@ -8,10 +8,15 @@
 
 use change_event::{
     ConnectorIdentity, DuplicateKeyPolicy, JsonProfile, LengthUnit, LogicalField, LogicalType,
-    ServerBuildIdentity, SourceTypeMapping,
+    ServerBuildIdentity, SourceRepresentationFormat, SourceRepresentationTypeEvidence,
+    SourceTypeMapping,
 };
 use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 pub const MAPPING_VERSION: &str = "postgresql-15.source-type-mapping.v3";
 pub const MAPPING_VERSION_16: &str = "postgresql-16.source-type-mapping.v3";
@@ -616,6 +621,7 @@ pub fn source_type_mapping_with_catalog_for_version(
     catalog: &SourceTypeCatalog,
 ) -> Result<SourceTypeMapping, SourceTypeMappingError> {
     ensure_supported_version(version)?;
+    let source_native_type = native_type.trim().to_owned();
     let native_type = normalize(native_type, version)?;
     let logical_type = logical_type_with_catalog(&native_type, catalog, version)?;
     logical_type
@@ -646,6 +652,8 @@ pub fn source_type_mapping_with_catalog_for_version(
         &logical_type,
         &catalog.digest(),
     );
+    let source_representation_evidence =
+        source_representation_evidence(&source_native_type, &logical_type, catalog, version)?;
     Ok(SourceTypeMapping {
         connector: ConnectorIdentity::new("postgresql", version),
         native_type,
@@ -656,7 +664,85 @@ pub fn source_type_mapping_with_catalog_for_version(
         source_definition_fingerprint,
         source_build: None,
         environment_fingerprint: None,
+        source_representation_evidence,
     })
+}
+
+fn source_representation_evidence(
+    source_native_type: &str,
+    logical_type: &LogicalType,
+    catalog: &SourceTypeCatalog,
+    version: &str,
+) -> Result<Option<SourceRepresentationTypeEvidence>, SourceTypeMappingError> {
+    let LogicalType::Raw {
+        native_type,
+        source_definition_digest,
+        ..
+    } = logical_type
+    else {
+        return Ok(None);
+    };
+    let definition = find_definition(native_type, catalog, version)?;
+    let expected_digest = definition_digest(definition, version)?;
+    if source_definition_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(source_definition_digest)
+        != expected_digest
+    {
+        return Err(SourceTypeMappingError::invalid(
+            version,
+            "opaque mapping and catalog type definition have different digests",
+        ));
+    }
+    let closure = catalog
+        .definition_closure(definition.oid)
+        .map_err(|message| SourceTypeMappingError::invalid(version, message))?;
+    let closure_json = serde_json::to_string(&closure)
+        .expect("PostgreSQL source type definition closure must serialize");
+    let root_json = serde_json::to_string(definition)
+        .expect("PostgreSQL source type definition must serialize");
+    let catalog_digest = catalog.evidence_digest();
+    let type_metadata = BTreeMap::from([
+        ("column_oid".into(), definition.oid.to_string()),
+        ("native_type".into(), source_native_type.to_owned()),
+        ("type_schema".into(), definition.schema.clone()),
+        ("type_name".into(), definition.name.clone()),
+        ("type_definition".into(), root_json),
+        (
+            "type_definition_digest".into(),
+            format!("sha256:{}", definition.definition_digest),
+        ),
+        ("type_definition_closure".into(), closure_json),
+        (
+            "type_definition_closure_digest".into(),
+            format!("sha256:{}", closure.digest()),
+        ),
+        ("source_catalog_digest".into(), catalog_digest),
+        ("text_output_profile".into(), "pgoutput-v1/text/UTF8".into()),
+        ("session.datestyle".into(), "ISO, YMD".into()),
+        ("session.intervalstyle".into(), "iso_8601".into()),
+        ("session.timezone".into(), "UTC".into()),
+        ("session.bytea_output".into(), "hex".into()),
+        ("session.extra_float_digits".into(), "3".into()),
+        ("session.search_path".into(), "pg_catalog".into()),
+    ]);
+    Ok(Some(SourceRepresentationTypeEvidence {
+        source_type_identity: format!(
+            "postgresql.pg_type.v1:{}:{}.{}",
+            definition.oid, definition.schema, definition.name
+        ),
+        protocol: "pgoutput.v1".into(),
+        format: SourceRepresentationFormat::Text,
+        type_metadata,
+        allowed_context_metadata_keys: BTreeSet::from([
+            "relation_oid".into(),
+            "relation_schema".into(),
+            "relation_name".into(),
+            "column_name".into(),
+            "type_modifier".into(),
+            "environment.lc_monetary".into(),
+        ]),
+    }))
 }
 
 /// Bind a mapping to the exact server and semantic session that qualified it.
@@ -2028,14 +2114,53 @@ mod tests {
 
         let mut unavailable = catalog.clone();
         unavailable.extensions[0].available = false;
+        let unavailable_mapping =
+            source_type_mapping_with_catalog("public.geometry", &unavailable).unwrap();
         assert!(matches!(
-            source_type_mapping_with_catalog("public.geometry", &unavailable)
-                .unwrap()
-                .logical_type,
+            unavailable_mapping.logical_type,
             LogicalType::Raw { ref codec_identity, .. }
                 if codec_identity == "postgresql.pgoutput.text-envelope.v1"
         ));
+        let representation = unavailable_mapping
+            .source_representation_evidence
+            .expect("Raw mapping binds source representation identity and metadata");
+        assert_eq!(
+            representation.source_type_identity,
+            "postgresql.pg_type.v1:9001:public.geometry"
+        );
+        assert_eq!(representation.protocol, "pgoutput.v1");
+        assert_eq!(representation.format, SourceRepresentationFormat::Text);
+        assert_eq!(representation.type_metadata["column_oid"], "9001");
+        assert_eq!(
+            representation.type_metadata["native_type"],
+            "public.geometry"
+        );
+        assert_eq!(representation.type_metadata["type_name"], "geometry");
+        assert_eq!(
+            representation.type_metadata["text_output_profile"],
+            "pgoutput-v1/text/UTF8"
+        );
+        assert_eq!(
+            representation.allowed_context_metadata_keys,
+            BTreeSet::from([
+                "relation_oid".into(),
+                "relation_schema".into(),
+                "relation_name".into(),
+                "column_name".into(),
+                "type_modifier".into(),
+                "environment.lc_monetary".into(),
+            ])
+        );
         assert!(!has_semantic_codec(&unavailable, 9_001));
+        let unqualified_mapping =
+            source_type_mapping_with_catalog("geometry", &unavailable).unwrap();
+        assert_eq!(
+            unqualified_mapping
+                .source_representation_evidence
+                .expect("unqualified column declaration still binds its source catalog type")
+                .type_metadata["native_type"],
+            "geometry"
+        );
 
         let mut target_blocked = catalog.clone();
         target_blocked.extensions[0].target_compatible = Some(false);
