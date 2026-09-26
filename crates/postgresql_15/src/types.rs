@@ -1,7 +1,6 @@
 use crate::{Result, invalid};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use change_event::{JsonEntry, JsonValue as J, LogicalValue as V};
-use chrono::{Datelike, Timelike};
+use change_event::{JsonEntry, JsonValue as J, LogicalValue as V, TemporalInfinityKind};
 
 pub(crate) fn supported(oid: u32) -> bool {
     matches!(
@@ -24,7 +23,9 @@ pub(crate) fn supported(oid: u32) -> bool {
             | 1082
             | 1083
             | 1114
+            | 1186
             | 1184
+            | 1266
             | 1560
             | 1562
             | 1700
@@ -32,7 +33,12 @@ pub(crate) fn supported(oid: u32) -> bool {
             | 3802
     )
 }
+#[cfg(test)]
 pub(crate) fn decode(oid: u32, bytes: &[u8]) -> Result<V> {
+    decode_for_version("15", oid, bytes)
+}
+
+fn decode_for_version(version: &str, oid: u32, bytes: &[u8]) -> Result<V> {
     let text = std::str::from_utf8(bytes)?;
     Ok(match oid {
         16 => V::Boolean {
@@ -91,38 +97,52 @@ pub(crate) fn decode(oid: u32, bytes: &[u8]) -> Result<V> {
             }
         }
         1082 => {
-            let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")?;
-            V::Date {
-                year: date.year(),
-                month: date.month() as u8,
-                day: date.day() as u8,
+            if let Some(value) = temporal_infinity(text, TemporalInfinityKind::Date) {
+                value
+            } else {
+                let (year, month, day) = postgres_date(text)?;
+                V::Date { year, month, day }
             }
         }
         1083 => local_time(text)?,
         1114 => {
-            let d = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")?;
-            V::LocalDatetime {
-                year: d.year(),
-                month: d.month() as u8,
-                day: d.day() as u8,
-                hour: d.hour() as u8,
-                minute: d.minute() as u8,
-                second: d.second() as u8,
-                microsecond: d.nanosecond() / 1000,
+            if let Some(value) = temporal_infinity(text, TemporalInfinityKind::LocalDatetime) {
+                value
+            } else {
+                let (year, month, day, hour, minute, second, microsecond) =
+                    postgres_datetime(text)?;
+                V::LocalDatetime {
+                    year,
+                    month,
+                    day,
+                    hour,
+                    minute,
+                    second,
+                    microsecond,
+                }
             }
         }
         1184 => {
-            let s = if text.ends_with("+00") {
-                format!("{text}:00")
+            if let Some(value) = temporal_infinity(text, TemporalInfinityKind::Instant) {
+                value
             } else {
-                text.into()
-            };
-            let d = chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f%:z")?;
-            V::Instant {
-                unix_seconds: d.timestamp().to_string(),
-                nanoseconds: d.timestamp_subsec_nanos(),
+                let (unix_seconds, nanoseconds) = postgres_instant(text)?;
+                V::Instant {
+                    unix_seconds: unix_seconds.to_string(),
+                    nanoseconds,
+                }
             }
         }
+        1186 => {
+            if version_major(version) >= 17
+                && let Some(value) = temporal_infinity(text, TemporalInfinityKind::CalendarInterval)
+            {
+                value
+            } else {
+                calendar_interval(text)?
+            }
+        }
+        1266 => offset_time(text)?,
         142 => V::Xml {
             bytes_base64url: URL_SAFE_NO_PAD.encode(bytes),
             text: Some(text.into()),
@@ -155,16 +175,405 @@ pub(crate) fn decode_column_for_version(
         }
         return Ok(V::Enum { label });
     }
-    decode(oid, bytes)
+    decode_for_version(version, oid, bytes)
+}
+
+fn version_major(version: &str) -> u16 {
+    version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u16>().ok())
+        .unwrap_or_default()
+}
+
+fn temporal_infinity(text: &str, kind: TemporalInfinityKind) -> Option<V> {
+    match text {
+        "infinity" => Some(V::TemporalInfinity {
+            kind,
+            negative: false,
+        }),
+        "-infinity" => Some(V::TemporalInfinity {
+            kind,
+            negative: true,
+        }),
+        _ => None,
+    }
+}
+
+fn postgres_date(text: &str) -> Result<(i32, u8, u8)> {
+    let (date, bc) = strip_era(text);
+    let fields = date.split('-').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err(invalid("invalid PostgreSQL date"));
+    }
+    let display_year = fields[0].parse::<i32>()?;
+    if display_year <= 0 {
+        return Err(invalid("invalid PostgreSQL date year"));
+    }
+    let year = if bc {
+        1_i64 - i64::from(display_year)
+    } else {
+        i64::from(display_year)
+    };
+    let year = i32::try_from(year)?;
+    let month = fields[1].parse::<u8>()?;
+    let day = fields[2].parse::<u8>()?;
+    validate_postgres_date(year, month, day)?;
+    Ok((year, month, day))
+}
+
+fn strip_era(text: &str) -> (&str, bool) {
+    if let Some(value) = text.strip_suffix(" BC") {
+        (value, true)
+    } else if let Some(value) = text.strip_suffix(" AD") {
+        (value, false)
+    } else {
+        (text, false)
+    }
+}
+
+fn validate_postgres_date(year: i32, month: u8, day: u8) -> Result<()> {
+    if !(-4_712..=5_874_897).contains(&year) {
+        return Err(invalid(
+            "PostgreSQL date year is outside the supported range",
+        ));
+    }
+    let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if day == 0 || day > days {
+        return Err(invalid("invalid PostgreSQL calendar date"));
+    }
+    Ok(())
+}
+
+fn postgres_datetime(text: &str) -> Result<(i32, u8, u8, u8, u8, u8, u32)> {
+    let (datetime, bc) = strip_era(text);
+    let (date_text, time_text) = datetime
+        .split_once(' ')
+        .ok_or_else(|| invalid("invalid PostgreSQL timestamp"))?;
+    let (year, month, day) = postgres_date_with_era(date_text, bc)?;
+    validate_postgres_timestamp_year(year)?;
+    let (hour, minute, second, microsecond) = clock_time(time_text)?;
+    Ok((year, month, day, hour, minute, second, microsecond))
+}
+
+fn postgres_date_with_era(text: &str, bc: bool) -> Result<(i32, u8, u8)> {
+    if bc {
+        postgres_date(&format!("{text} BC"))
+    } else {
+        postgres_date(text)
+    }
+}
+
+fn postgres_instant(text: &str) -> Result<(i64, u32)> {
+    let (datetime, bc) = strip_era(text);
+    let (date_text, time_zone_text) = datetime
+        .split_once(' ')
+        .ok_or_else(|| invalid("invalid PostgreSQL timestamp with time zone"))?;
+    let (year, month, day) = postgres_date_with_era(date_text, bc)?;
+    validate_postgres_timestamp_year(year)?;
+    let (time_text, offset_text) = split_time_zone(time_zone_text)?;
+    let (hour, minute, second, microsecond) = clock_time(time_text)?;
+    let offset_seconds = postgres_offset_seconds(offset_text)?;
+    let day_number = days_from_civil(year, month, day);
+    let seconds = day_number
+        .checked_mul(86_400)
+        .and_then(|value| value.checked_add(i64::from(hour) * 3_600))
+        .and_then(|value| value.checked_add(i64::from(minute) * 60))
+        .and_then(|value| value.checked_add(i64::from(second)))
+        .and_then(|value| value.checked_sub(i64::from(offset_seconds)))
+        .ok_or_else(|| invalid("PostgreSQL timestamp is outside the supported range"))?;
+    Ok((seconds, microsecond * 1_000))
+}
+
+fn validate_postgres_timestamp_year(year: i32) -> Result<()> {
+    if !(-4_712..=294_276).contains(&year) {
+        return Err(invalid(
+            "PostgreSQL timestamp year is outside the supported range",
+        ));
+    }
+    Ok(())
+}
+
+fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = if year >= 0 {
+        year / 400
+    } else {
+        (year - 399) / 400
+    };
+    let year_of_era = year - era * 400;
+    let adjusted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn clock_time(text: &str) -> Result<(u8, u8, u8, u32)> {
+    let fields = text.split(':').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err(invalid("invalid PostgreSQL time"));
+    }
+    let hour = fields[0].parse::<u8>()?;
+    let minute = fields[1].parse::<u8>()?;
+    let (second_text, fraction) = fields[2]
+        .split_once('.')
+        .map_or((fields[2], None), |(s, f)| (s, Some(f)));
+    let second = second_text.parse::<u8>()?;
+    let microsecond = match fraction {
+        None => 0,
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 6
+                && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let digits = format!("{value:0<6}");
+            digits.parse::<u32>()?
+        }
+        Some(_) => return Err(invalid("PostgreSQL time precision exceeds microseconds")),
+    };
+    if hour > 24
+        || minute >= 60
+        || second >= 60
+        || (hour == 24 && (minute != 0 || second != 0 || microsecond != 0))
+    {
+        return Err(invalid("invalid PostgreSQL time fields"));
+    }
+    Ok((hour, minute, second, microsecond))
+}
+
+fn split_time_zone(text: &str) -> Result<(&str, &str)> {
+    let Some((index, _)) = text
+        .char_indices()
+        .rfind(|(index, character)| *index > 0 && matches!(character, '+' | '-'))
+    else {
+        return Err(invalid("PostgreSQL time zone offset is missing"));
+    };
+    Ok(text.split_at(index))
+}
+
+fn postgres_offset_seconds(text: &str) -> Result<i32> {
+    let (sign, value) = match text.as_bytes().first() {
+        Some(b'+') => (1_i32, &text[1..]),
+        Some(b'-') => (-1_i32, &text[1..]),
+        _ => return Err(invalid("invalid PostgreSQL UTC offset")),
+    };
+    let parts = if value.contains(':') {
+        value.split(':').collect::<Vec<_>>()
+    } else {
+        match value.len() {
+            1 | 2 => vec![value],
+            3 | 4 => vec![&value[..value.len() - 2], &value[value.len() - 2..]],
+            5 | 6 => vec![
+                &value[..value.len() - 4],
+                &value[value.len() - 4..value.len() - 2],
+                &value[value.len() - 2..],
+            ],
+            _ => return Err(invalid("invalid PostgreSQL UTC offset")),
+        }
+    };
+    if parts.is_empty() || parts.len() > 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(invalid("invalid PostgreSQL UTC offset"));
+    }
+    let hour = parts[0].parse::<i32>()?;
+    let minute = parts.get(1).map_or(Ok(0), |part| part.parse::<i32>())?;
+    let second = parts.get(2).map_or(Ok(0), |part| part.parse::<i32>())?;
+    if !(0..=15).contains(&hour) || !(0..60).contains(&minute) || !(0..60).contains(&second) {
+        return Err(invalid(
+            "PostgreSQL UTC offset is outside the supported range",
+        ));
+    }
+    let magnitude = hour * 3_600 + minute * 60 + second;
+    Ok(sign * magnitude)
+}
+
+fn offset_time(text: &str) -> Result<V> {
+    let (time_text, offset_text) = split_time_zone(text)?;
+    let (hour, minute, second, microsecond) = clock_time(time_text)?;
+    Ok(V::OffsetTime {
+        hour,
+        minute,
+        second,
+        microsecond,
+        offset_seconds: postgres_offset_seconds(offset_text)?,
+    })
+}
+
+fn calendar_interval(text: &str) -> Result<V> {
+    let (global_sign, body) = if let Some(body) = text.strip_prefix("-P") {
+        (-1_i64, body)
+    } else if let Some(body) = text.strip_prefix("+P") {
+        (1_i64, body)
+    } else if let Some(body) = text.strip_prefix('P') {
+        (1_i64, body)
+    } else {
+        return Err(invalid("PostgreSQL interval is not in ISO 8601 form"));
+    };
+    let bytes = body.as_bytes();
+    let mut index = 0;
+    let mut in_time = false;
+    let mut months = 0_i64;
+    let mut days = 0_i64;
+    let mut microseconds = 0_i64;
+    let mut saw_component = false;
+    while index < bytes.len() {
+        if bytes[index] == b'T' && !in_time {
+            in_time = true;
+            index += 1;
+            continue;
+        }
+        let start = index;
+        if matches!(bytes[index], b'+' | b'-') {
+            index += 1;
+        }
+        let mut saw_digit = false;
+        let mut saw_dot = false;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'0'..=b'9' => {
+                    saw_digit = true;
+                    index += 1;
+                }
+                b'.' if !saw_dot => {
+                    saw_dot = true;
+                    index += 1;
+                }
+                _ => break,
+            }
+        }
+        if !saw_digit || index >= bytes.len() {
+            return Err(invalid("invalid PostgreSQL ISO interval component"));
+        }
+        let quantity = &body[start..index];
+        let unit = bytes[index] as char;
+        index += 1;
+        saw_component = true;
+        let factor = match (in_time, unit) {
+            (false, 'Y') => {
+                months = months
+                    .checked_add(
+                        parse_interval_integer(quantity)?
+                            .checked_mul(12)
+                            .ok_or_else(|| invalid("PostgreSQL interval month field overflow"))?,
+                    )
+                    .ok_or_else(|| invalid("PostgreSQL interval month field overflow"))?;
+                continue;
+            }
+            (false, 'M') => {
+                months = months
+                    .checked_add(parse_interval_integer(quantity)?)
+                    .ok_or_else(|| invalid("PostgreSQL interval month field overflow"))?;
+                continue;
+            }
+            (false, 'W') => {
+                days = days
+                    .checked_add(
+                        parse_interval_integer(quantity)?
+                            .checked_mul(7)
+                            .ok_or_else(|| invalid("PostgreSQL interval day field overflow"))?,
+                    )
+                    .ok_or_else(|| invalid("PostgreSQL interval day field overflow"))?;
+                continue;
+            }
+            (false, 'D') => {
+                days = days
+                    .checked_add(parse_interval_integer(quantity)?)
+                    .ok_or_else(|| invalid("PostgreSQL interval day field overflow"))?;
+                continue;
+            }
+            (true, 'H') => 3_600_000_000_i64,
+            (true, 'M') => 60_000_000_i64,
+            (true, 'S') => 1_000_000_i64,
+            _ => return Err(invalid("unsupported PostgreSQL ISO interval unit")),
+        };
+        let component = parse_interval_scaled(quantity, factor)?
+            .checked_mul(global_sign)
+            .ok_or_else(|| invalid("PostgreSQL interval time field overflow"))?;
+        microseconds = microseconds
+            .checked_add(component)
+            .ok_or_else(|| invalid("PostgreSQL interval time field overflow"))?;
+    }
+    if !saw_component {
+        return Err(invalid("empty PostgreSQL ISO interval"));
+    }
+    months = months
+        .checked_mul(global_sign)
+        .ok_or_else(|| invalid("PostgreSQL interval month field overflow"))?;
+    days = days
+        .checked_mul(global_sign)
+        .ok_or_else(|| invalid("PostgreSQL interval day field overflow"))?;
+    Ok(V::CalendarInterval {
+        months: i32::try_from(months)?,
+        days: i32::try_from(days)?,
+        microseconds,
+    })
+}
+
+fn parse_interval_integer(quantity: &str) -> Result<i64> {
+    if quantity.contains('.') {
+        return Err(invalid("fractional PostgreSQL interval date unit"));
+    }
+    Ok(quantity.parse::<i64>()?)
+}
+
+fn parse_interval_scaled(quantity: &str, factor: i64) -> Result<i64> {
+    let (negative, quantity) = if let Some(value) = quantity.strip_prefix('-') {
+        (true, value)
+    } else if let Some(value) = quantity.strip_prefix('+') {
+        (false, value)
+    } else {
+        (false, quantity)
+    };
+    let (integer, fraction) = quantity
+        .split_once('.')
+        .map_or((quantity, None), |(integer, fraction)| {
+            (integer, Some(fraction))
+        });
+    if integer.is_empty() || !integer.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid("invalid PostgreSQL interval quantity"));
+    }
+    let integer = i128::from(integer.parse::<i64>()?);
+    let mut magnitude = integer
+        .checked_mul(i128::from(factor))
+        .ok_or_else(|| invalid("PostgreSQL interval time field overflow"))?;
+    if let Some(fraction) = fraction {
+        if fraction.is_empty()
+            || fraction.len() > 18
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(invalid("invalid PostgreSQL interval fraction"));
+        }
+        let denominator = 10_i128.pow(u32::try_from(fraction.len())?);
+        let numerator = i128::from(fraction.parse::<i64>()?);
+        let scaled = numerator
+            .checked_mul(i128::from(factor))
+            .ok_or_else(|| invalid("PostgreSQL interval time field overflow"))?;
+        if scaled % denominator != 0 {
+            return Err(invalid(
+                "PostgreSQL interval fraction exceeds microsecond precision",
+            ));
+        }
+        magnitude = magnitude
+            .checked_add(scaled / denominator)
+            .ok_or_else(|| invalid("PostgreSQL interval time field overflow"))?;
+    }
+    let signed = if negative { -magnitude } else { magnitude };
+    i64::try_from(signed).map_err(Into::into)
 }
 
 fn local_time(text: &str) -> Result<V> {
-    let time = chrono::NaiveTime::parse_from_str(text, "%H:%M:%S%.f")?;
+    let (hour, minute, second, microsecond) = clock_time(text)?;
     Ok(V::LocalTime {
-        hour: time.hour() as u8,
-        minute: time.minute() as u8,
-        second: time.second() as u8,
-        microsecond: time.nanosecond() / 1000,
+        hour,
+        minute,
+        second,
+        microsecond,
     })
 }
 
@@ -214,7 +623,6 @@ fn network(oid: u32, text: &str) -> Result<V> {
         prefix_length,
     })
 }
-
 fn decimal(text: &str) -> Result<(String, i32)> {
     match text.to_ascii_lowercase().as_str() {
         "nan" => return Ok(("NaN".into(), 0)),
@@ -307,6 +715,55 @@ mod tests {
         ));
         assert!(decode(114, b"{").is_err());
         assert!(decode(1184, b"2026-09-13 12:13:14.123456+00").is_ok());
+        assert!(matches!(
+            decode(1082, b"0001-01-01 BC").unwrap(),
+            V::Date {
+                year: 0,
+                month: 1,
+                day: 1
+            }
+        ));
+        assert!(matches!(
+            decode(1082, b"0001-02-29 BC").unwrap(),
+            V::Date {
+                year: 0,
+                month: 2,
+                day: 29
+            }
+        ));
+        assert!(matches!(
+            decode(1082, b"5874897-12-31").unwrap(),
+            V::Date {
+                year: 5_874_897,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(1114, b"0001-01-01 12:13:14.123456 BC").unwrap(),
+            V::LocalDatetime {
+                year: 0,
+                microsecond: 123456,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(1184, b"infinity").unwrap(),
+            V::TemporalInfinity {
+                kind: TemporalInfinityKind::Instant,
+                negative: false
+            }
+        ));
+        assert!(matches!(
+            decode(1082, b"-infinity").unwrap(),
+            V::TemporalInfinity {
+                kind: TemporalInfinityKind::Date,
+                negative: true
+            }
+        ));
+        assert!(matches!(
+            decode(1114, b"294276-12-31 23:59:59.999999").unwrap(),
+            V::LocalDatetime { year: 294_276, .. }
+        ));
         assert_eq!(decimal("1e-4").unwrap(), ("1".into(), 4));
         assert_eq!(decimal("1e4").unwrap(), ("1".into(), -4));
         assert_eq!(
@@ -329,6 +786,59 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            decode(1266, b"04:05:06.123456+07:30:15").unwrap(),
+            V::OffsetTime {
+                hour: 4,
+                microsecond: 123456,
+                offset_seconds: 27_015,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(1266, b"24:00:00-15:59").unwrap(),
+            V::OffsetTime {
+                hour: 24,
+                offset_seconds: -57_540,
+                ..
+            }
+        ));
+        assert!(decode(1266, b"24:00:00.000001+00").is_err());
+        assert!(matches!(
+            decode(1186, b"P-1Y-2M3DT-4H-5M-6.123456S").unwrap(),
+            V::CalendarInterval {
+                months: -14,
+                days: 3,
+                microseconds: -14_706_123_456,
+            }
+        ));
+        assert!(matches!(
+            decode(1186, b"PT0S").unwrap(),
+            V::CalendarInterval {
+                months: 0,
+                days: 0,
+                microseconds: 0
+            }
+        ));
+        assert!(decode(1186, b"infinity").is_err());
+        assert!(matches!(
+            decode_column_for_version("17", 1186, "interval", b"infinity").unwrap(),
+            V::TemporalInfinity {
+                kind: TemporalInfinityKind::CalendarInterval,
+                negative: false
+            }
+        ));
+        assert!(matches!(
+            decode_column_for_version("17.0", 1186, "interval", b"-infinity").unwrap(),
+            V::TemporalInfinity {
+                kind: TemporalInfinityKind::CalendarInterval,
+                negative: true
+            }
+        ));
+        assert!(decode_column_for_version("16", 1186, "interval", b"infinity").is_err());
+        assert!(decode(1186, b"PT1.1234567S").is_err());
+        assert!(supported(1186));
+        assert!(supported(1266));
         assert!(matches!(
             decode(1560, b"101").unwrap(),
             V::BitString { bit_length: 3, .. }

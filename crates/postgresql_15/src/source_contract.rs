@@ -175,6 +175,9 @@ fn validate_native_type_for_version(
             | "date"
             | "time"
             | "time without time zone"
+            | "time with time zone"
+            | "timetz"
+            | "interval"
             | "inet"
             | "cidr"
             | "macaddr"
@@ -189,6 +192,8 @@ fn validate_native_type_for_version(
         || valid_parameterized_timestamp(&native)
         || valid_parameterized_time(&native)
         || valid_parameterized_bit(&native)
+        || (native.starts_with("interval")
+            && crate::type_mapping::validate_native_type_for_version(version, native_type).is_ok())
         || (native.starts_with("enum(")
             && crate::type_mapping::validate_native_type_for_version(version, native_type).is_ok());
     ensure(supported, "unsupported PostgreSQL native type")
@@ -285,7 +290,10 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str
                 native == "timestamp with time zone"
                     || valid_parameterized_timestamp(&native) && native.ends_with("with time zone")
             }
-            change_event::TemporalInfinityKind::CalendarInterval => native.starts_with("interval"),
+            change_event::TemporalInfinityKind::CalendarInterval => {
+                version.parse::<u16>().is_ok_and(|major| major >= 17)
+                    && native.starts_with("interval")
+            }
         },
         LogicalValue::LocalTime { .. } => {
             native == "time"
@@ -408,7 +416,7 @@ fn ensure(condition: bool, message: &str) -> Result<(), SourceContractError> {
 
 #[cfg(test)]
 mod tests {
-    use super::logical_matches_native;
+    use super::{logical_matches_native, validate_native_type_for_version};
     use change_event::{LogicalValue, ServerBuildIdentity};
 
     #[test]
@@ -474,5 +482,57 @@ mod tests {
                 "bounded numeric: {unscaled}"
             );
         }
+    }
+
+    #[test]
+    fn source_contract_accepts_new_temporal_native_types() {
+        for native_type in [
+            "interval",
+            "interval day to second(3)",
+            "time with time zone",
+            "timetz",
+            "time(3) with time zone",
+        ] {
+            assert!(
+                validate_native_type_for_version("15", native_type).is_ok(),
+                "{native_type}"
+            );
+        }
+        assert!(validate_native_type_for_version("15", "interval nonsense").is_err());
+        assert!(logical_matches_native(
+            &LogicalValue::CalendarInterval {
+                months: 1,
+                days: -2,
+                microseconds: 3,
+            },
+            "interval day to second(3)",
+            "15"
+        ));
+        assert!(logical_matches_native(
+            &LogicalValue::OffsetTime {
+                hour: 1,
+                minute: 2,
+                second: 3,
+                microsecond: 0,
+                offset_seconds: 4,
+            },
+            "timetz",
+            "15"
+        ));
+        let interval_infinity = LogicalValue::TemporalInfinity {
+            kind: change_event::TemporalInfinityKind::CalendarInterval,
+            negative: false,
+        };
+        assert!(!logical_matches_native(
+            &interval_infinity,
+            "interval",
+            "15"
+        ));
+        assert!(!logical_matches_native(
+            &interval_infinity,
+            "interval",
+            "16"
+        ));
+        assert!(logical_matches_native(&interval_infinity, "interval", "17"));
     }
 }

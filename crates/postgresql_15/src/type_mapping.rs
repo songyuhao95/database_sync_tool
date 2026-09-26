@@ -631,10 +631,11 @@ fn logical_type_from_builtin(
         "cidr" => Ok(LogicalType::network("inet", true)),
         "macaddr" | "macaddr8" => Ok(LogicalType::network(native_type, false)),
         "xml" => Ok(LogicalType::xml()),
-        "interval" => Ok(LogicalType::calendar_interval(6)),
+        "interval" => interval(native_type, version),
         "numeric" | "decimal" => numeric(native_type, version),
         "money" => Err(SourceTypeMappingError::unsupported(version, native_type)),
         _ if native_type.starts_with("time(") => time(native_type, version),
+        _ if native_type.starts_with("interval") => interval(native_type, version),
         _ if native_type.starts_with("numeric(") => numeric(native_type, version),
         _ if native_type.starts_with("decimal(") => numeric(native_type, version),
         _ if native_type.starts_with("bit(") => {
@@ -1101,7 +1102,14 @@ fn numeric(native_type: &str, version: &str) -> Result<LogicalType, SourceTypeMa
         .split_once('(')
         .and_then(|(_, value)| value.strip_suffix(')'))
     else {
-        return Ok(LogicalType::decimal_unbounded());
+        return if matches!(native_type, "numeric" | "decimal") {
+            Ok(LogicalType::decimal_unbounded())
+        } else {
+            Err(SourceTypeMappingError::invalid(
+                version,
+                "numeric declaration parameters are malformed",
+            ))
+        };
     };
     let mut parameters = parameters.split(',');
     let precision = parameters
@@ -1225,6 +1233,76 @@ fn time(native_type: &str, version: &str) -> Result<LogicalType, SourceTypeMappi
     })
 }
 
+fn interval(native_type: &str, version: &str) -> Result<LogicalType, SourceTypeMappingError> {
+    let Some(mut remainder) = native_type.strip_prefix("interval") else {
+        return Err(SourceTypeMappingError::unsupported(version, native_type));
+    };
+    let mut precision = 6;
+    let mut has_explicit_precision = false;
+    if remainder.starts_with('(') {
+        let Some(close) = remainder.find(')') else {
+            return Err(SourceTypeMappingError::invalid(
+                version,
+                "interval precision is malformed",
+            ));
+        };
+        precision = remainder[1..close].parse::<u8>().map_err(|_| {
+            SourceTypeMappingError::invalid(version, "interval precision is invalid")
+        })?;
+        has_explicit_precision = true;
+        remainder = &remainder[close + 1..];
+        if !remainder.trim().is_empty() {
+            return Err(SourceTypeMappingError::invalid(
+                version,
+                "interval leading precision cannot be combined with a field qualifier",
+            ));
+        }
+    } else if let Some(open) = remainder.rfind('(')
+        && let Some(precision_text) = remainder[open + 1..].strip_suffix(')')
+    {
+        precision = precision_text.parse::<u8>().map_err(|_| {
+            SourceTypeMappingError::invalid(version, "interval precision is invalid")
+        })?;
+        has_explicit_precision = true;
+        remainder = &remainder[..open];
+    }
+    if precision > 6 {
+        return Err(SourceTypeMappingError::invalid(
+            version,
+            "interval precision is outside PostgreSQL limits",
+        ));
+    }
+    let qualifier = remainder.trim();
+    if !matches!(
+        qualifier,
+        "" | "year"
+            | "month"
+            | "day"
+            | "hour"
+            | "minute"
+            | "second"
+            | "year to month"
+            | "day to hour"
+            | "day to minute"
+            | "day to second"
+            | "hour to minute"
+            | "hour to second"
+            | "minute to second"
+    ) {
+        return Err(SourceTypeMappingError::invalid(
+            version,
+            "interval field qualifier is invalid",
+        ));
+    }
+    if has_explicit_precision && !qualifier.is_empty() && !qualifier.ends_with("second") {
+        return Err(SourceTypeMappingError::invalid(
+            version,
+            "interval precision requires a qualifier ending in SECOND",
+        ));
+    }
+    Ok(LogicalType::calendar_interval(precision))
+}
+
 fn timestamp(native_type: &str, version: &str) -> Result<LogicalType, SourceTypeMappingError> {
     let (prefix, zone) = if native_type.ends_with(" without time zone") {
         ("timestamp", " without time zone")
@@ -1326,6 +1404,12 @@ mod tests {
             LogicalType::decimal_unbounded()
         );
         assert_eq!(
+            source_type_mapping("decimal").unwrap().logical_type,
+            LogicalType::decimal_unbounded()
+        );
+        assert!(source_type_mapping("numeric(").is_err());
+        assert!(source_type_mapping("decimal(12,3").is_err());
+        assert_eq!(
             source_type_mapping("time with time zone")
                 .unwrap()
                 .logical_type,
@@ -1341,6 +1425,16 @@ mod tests {
             source_type_mapping("interval").unwrap().logical_type,
             LogicalType::calendar_interval(6)
         );
+        assert!(source_type_mapping("interval(3) day to second").is_err());
+        assert_eq!(
+            source_type_mapping("interval day to second(2)")
+                .unwrap()
+                .logical_type,
+            LogicalType::calendar_interval(2)
+        );
+        assert!(source_type_mapping("interval day to second(7)").is_err());
+        assert!(source_type_mapping("interval year(3)").is_err());
+        assert!(source_type_mapping("interval(3) year to month").is_err());
     }
 
     #[test]

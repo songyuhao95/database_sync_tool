@@ -270,6 +270,24 @@ fn postgres_source_contract_maps_supported_native_types() {
             },
         ),
         (
+            "interval day to second(3)",
+            LogicalValue::CalendarInterval {
+                months: 1,
+                days: -2,
+                microseconds: 3,
+            },
+        ),
+        (
+            "timetz",
+            LogicalValue::OffsetTime {
+                hour: 1,
+                minute: 2,
+                second: 3,
+                microsecond: 0,
+                offset_seconds: 4,
+            },
+        ),
+        (
             "jsonb",
             LogicalValue::Json {
                 value: JsonValue::Object(vec![JsonEntry {
@@ -296,4 +314,23 @@ fn postgres_source_contract_maps_supported_native_types() {
             .collect(),
     );
     postgresql_15::validate_change_event(tx).unwrap();
+}
+
+#[test]
+fn postgres_interval_infinity_obeys_server_version_at_transaction_boundary() {
+    for (version, expected) in [("15.19", false), ("16.10", false), ("17.0", true)] {
+        let mut tx = transaction();
+        tx.source.version = version.into();
+        let column = &mut tx.changes[0].after.as_mut().unwrap()[1];
+        column.native_type = "interval".into();
+        column.datum = Datum::Value(LogicalValue::TemporalInfinity {
+            kind: change_event::TemporalInfinityKind::CalendarInterval,
+            negative: false,
+        });
+        assert_eq!(
+            postgresql_15::validate_change_event(tx).is_ok(),
+            expected,
+            "PostgreSQL {version}"
+        );
+    }
 }

@@ -204,6 +204,7 @@ pub async fn replication_for_version(config: Config, expected_major: u16) -> Res
     for setting in [
         "SET client_encoding='UTF8'",
         "SET DateStyle='ISO, YMD'",
+        "SET IntervalStyle='iso_8601'",
         "SET TimeZone='UTC'",
         "SET bytea_output='hex'",
         "SET extra_float_digits=3",
