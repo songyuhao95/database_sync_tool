@@ -1883,6 +1883,9 @@ pub fn validate_value_against_plan(
             "the saved plan does not reject implicit rounding",
         ));
     }
+    if range_kind != Some("decimal") && validate_decimal_special_value(plan, value)? {
+        return Ok(());
+    }
     match range_kind {
         Some("integer") => validate_integer_plan_value(plan, value),
         Some("decimal") => validate_decimal_plan_value(plan, value),
@@ -1941,6 +1944,42 @@ pub fn validate_value_against_plan(
             },
         },
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_decimal_special_value(
+    plan: &ColumnConversionPlan,
+    value: &LogicalValue,
+) -> Result<bool, TargetCapabilityFailure> {
+    let LogicalValue::Decimal { unscaled, scale } = value else {
+        return Ok(false);
+    };
+    let special_value = match unscaled.as_str() {
+        "NaN" => "NaN",
+        "Infinity" => "Infinity",
+        "-Infinity" => "-Infinity",
+        _ => return Ok(false),
+    };
+    if special_value == "NaN" && *scale != 0 {
+        return Err(plan_failure(
+            plan,
+            "target_capability.decimal_invalid",
+            "NaN must use scale zero",
+        ));
+    }
+    if plan
+        .target
+        .parameters
+        .get("decimal_special_values")
+        .is_some_and(|values| values.split(',').any(|value| value.trim() == special_value))
+    {
+        return Ok(true);
+    }
+    Err(plan_failure(
+        plan,
+        "target_capability.decimal_special_value_unsupported",
+        format!("the selected target representation does not support Decimal {special_value}"),
+    ))
 }
 
 /// Validate a presence state against the same fixed plan.  `Unchanged` is a
@@ -2905,7 +2944,8 @@ fn validate_decimal_plan_value(
             "Decimal source precision and scale are invalid",
         ));
     }
-    if *scale != source_scale && !(source_scale < 0 && *scale == 0) {
+    let is_nan = unscaled == "NaN";
+    if *scale != source_scale && !(source_scale < 0 && *scale == 0) && !is_nan {
         return Err(plan_failure(
             plan,
             "target_capability.decimal_scale_mismatch",
@@ -2961,6 +3001,9 @@ fn validate_decimal_plan_value(
             "target_capability.decimal_range_invalid",
             "Decimal target precision and scale are invalid",
         ));
+    }
+    if validate_decimal_special_value(plan, value)? {
+        return Ok(());
     }
     let Some(digits) = decimal_digits(unscaled) else {
         return Err(plan_failure(

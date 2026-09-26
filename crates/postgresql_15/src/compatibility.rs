@@ -69,10 +69,14 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
 
     for precision in 1..=1000 {
         for scale in 0..=precision.min(30) {
-            add_exact(
+            let mut target = TargetRepresentation::new(format!("numeric({precision},{scale})"));
+            target
+                .parameters
+                .insert("decimal_special_values".into(), "NaN".into());
+            add_exact_with_target(
                 &mut capabilities,
                 LogicalType::decimal(precision, i32::from(scale)),
-                format!("numeric({precision},{scale})"),
+                target,
                 format!("decimal.{precision}.{scale}"),
             );
         }
@@ -816,6 +820,9 @@ fn add_range_checked_decimal(
     target
         .parameters
         .insert("range_kind".into(), "decimal".into());
+    target
+        .parameters
+        .insert("decimal_special_values".into(), "NaN".into());
     target
         .parameters
         .insert("target_precision".into(), target_precision.to_string());

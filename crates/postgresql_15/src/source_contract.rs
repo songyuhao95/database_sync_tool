@@ -409,10 +409,51 @@ fn ensure(condition: bool, message: &str) -> Result<(), SourceContractError> {
 #[cfg(test)]
 mod tests {
     use super::logical_matches_native;
-    use change_event::LogicalValue;
+    use change_event::{LogicalValue, ServerBuildIdentity};
 
     #[test]
     fn numeric_specials_follow_postgresql_typmod_rules() {
+        let manifest = crate::target_capability_manifest(ServerBuildIdentity::new(
+            "PostgreSQL",
+            "community",
+            "17.0",
+            "test-build",
+        ));
+        let decimal_capabilities: Vec<_> = manifest
+            .capabilities
+            .iter()
+            .filter(|entry| {
+                entry
+                    .target
+                    .parameters
+                    .get("range_kind")
+                    .map(String::as_str)
+                    == Some("decimal")
+            })
+            .collect();
+        assert!(!decimal_capabilities.is_empty());
+        assert!(decimal_capabilities.iter().all(|entry| {
+            entry
+                .target
+                .parameters
+                .get("decimal_special_values")
+                .map(String::as_str)
+                == Some("NaN")
+        }));
+        let exact_decimal_capabilities: Vec<_> = manifest
+            .capabilities
+            .iter()
+            .filter(|entry| entry.code.starts_with("postgresql15.exact.decimal."))
+            .collect();
+        assert!(!exact_decimal_capabilities.is_empty());
+        assert!(exact_decimal_capabilities.iter().all(|entry| {
+            entry
+                .target
+                .parameters
+                .get("decimal_special_values")
+                .map(String::as_str)
+                == Some("NaN")
+        }));
         for (unscaled, expected_unconstrained, expected_bounded) in [
             ("NaN", true, true),
             ("Infinity", true, false),

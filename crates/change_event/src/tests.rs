@@ -1208,6 +1208,123 @@ fn compatibility_plan_is_structured_serializable_and_reproducible() {
     );
 }
 
+fn decimal_range_plan(source_scale: i32, target_supports_nan: bool) -> ColumnConversionPlan {
+    let mut target = TargetRepresentation::new("numeric(10,2)");
+    target.parameters = BTreeMap::from([
+        ("range_kind".into(), "decimal".into()),
+        ("range_check".into(), "strict".into()),
+        ("rounding_mode".into(), "reject".into()),
+        ("source_precision".into(), "10".into()),
+        ("source_scale".into(), source_scale.to_string()),
+        ("target_precision".into(), "10".into()),
+        ("target_scale".into(), "2".into()),
+        ("target_integer_digits".into(), "8".into()),
+    ]);
+    if target_supports_nan {
+        target
+            .parameters
+            .insert("decimal_special_values".into(), "NaN".into());
+    }
+    ColumnConversionPlan {
+        format: COMPATIBILITY_FORMAT.into(),
+        route_id: "decimal-range-test".into(),
+        configuration_revision: "1".into(),
+        source_field: DefinitionReference::new("source-column", "source-schema"),
+        target_field: DefinitionReference::new("target-column", "target-schema"),
+        source_connector: ConnectorIdentity::new("postgresql", "17"),
+        sink_connector: ConnectorIdentity::new("postgresql", "17"),
+        source_build: None,
+        target_build: None,
+        source_mapping_id: "test.numeric".into(),
+        source_mapping_version: "1".into(),
+        target,
+        rule: RuleReference {
+            id: "test.decimal-range".into(),
+            version: "1".into(),
+        },
+        rule_digest: String::new(),
+        capability_code: "test.decimal-range".into(),
+        capability_manifest_digest: String::new(),
+        target_probe_digest: None,
+        qualification: QualificationLevel::RangeChecked,
+        risk: RiskLevel::Medium,
+        risk_code: None,
+        loss: LossAssessment::default(),
+        examples: Vec::new(),
+        locator_impact: LocatorImpact::NotUsed,
+        confirmation: PlanConfirmationState::NotRequired,
+        parameters: BTreeMap::new(),
+        failure_policy: FailurePolicy::Reject,
+        input_digest: String::new(),
+        plan_digest: String::new(),
+    }
+}
+
+fn exact_decimal_plan(target_supports_nan: bool) -> ColumnConversionPlan {
+    let mut plan = decimal_range_plan(0, target_supports_nan);
+    plan.target.parameters.clear();
+    if target_supports_nan {
+        plan.target
+            .parameters
+            .insert("decimal_special_values".into(), "NaN".into());
+    }
+    plan.qualification = QualificationLevel::Exact;
+    plan
+}
+
+#[test]
+fn decimal_plans_obey_target_special_value_capabilities() {
+    let nan = LogicalValue::Decimal {
+        unscaled: "NaN".into(),
+        scale: 0,
+    };
+    assert!(validate_value_against_plan(&decimal_range_plan(2, true), &nan).is_ok());
+    assert_eq!(
+        validate_value_against_plan(&decimal_range_plan(2, false), &nan)
+            .unwrap_err()
+            .code,
+        "target_capability.decimal_special_value_unsupported"
+    );
+    assert!(
+        validate_value_against_plan(
+            &decimal_range_plan(0, true),
+            &LogicalValue::Decimal {
+                unscaled: "Infinity".into(),
+                scale: 0,
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        validate_value_against_plan(
+            &decimal_range_plan(2, true),
+            &LogicalValue::Decimal {
+                unscaled: "NaN".into(),
+                scale: 1,
+            },
+        )
+        .is_err()
+    );
+
+    assert!(validate_value_against_plan(&exact_decimal_plan(true), &nan).is_ok());
+    assert_eq!(
+        validate_value_against_plan(&exact_decimal_plan(false), &nan)
+            .unwrap_err()
+            .code,
+        "target_capability.decimal_special_value_unsupported"
+    );
+    assert!(
+        validate_value_against_plan(
+            &exact_decimal_plan(true),
+            &LogicalValue::Decimal {
+                unscaled: "Infinity".into(),
+                scale: 0,
+            },
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn compatibility_requires_parameters_and_exact_risk_confirmation() {
     let mut raw = insert_transaction();
