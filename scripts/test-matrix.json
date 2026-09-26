@@ -108,6 +108,19 @@
       ]
     },
     {
+      "id": "mysql_5_7.all_types_capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": ["mysql_5_7"],
+      "stages": ["Read", "ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "connector_capture",
+        "mysql_5_7::live_all_mysql_type_capture", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": ["CDC_MYSQL_READER_PASSWORD", "CDC_MYSQL_WRITER_PASSWORD"]
+    },
+    {
       "id": "mysql_5_7.apply",
       "mode": "Live",
       "category": "sink",
@@ -215,6 +228,19 @@
       ]
     },
     {
+      "id": "mysql_8_0.all_types_capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": ["mysql_8_0"],
+      "stages": ["Read", "ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "connector_capture",
+        "mysql_8_0::live_all_mysql_type_capture", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": ["CDC_MYSQL_READER_PASSWORD", "CDC_MYSQL_WRITER_PASSWORD"]
+    },
+    {
       "id": "mysql_8_0.apply",
       "mode": "Live",
       "category": "sink",
@@ -320,6 +346,19 @@
         "CDC_MYSQL_READER_PASSWORD",
         "CDC_MYSQL_WRITER_PASSWORD"
       ]
+    },
+    {
+      "id": "mysql_8_4.all_types_capture",
+      "mode": "Live",
+      "category": "source",
+      "databases": ["mysql_8_4"],
+      "stages": ["Read", "ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "cdc-binlog-tail", "--test", "connector_capture",
+        "mysql_8_4::live_all_mysql_type_capture", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": ["CDC_MYSQL_READER_PASSWORD", "CDC_MYSQL_WRITER_PASSWORD"]
     },
     {
       "id": "mysql_8_4.apply",

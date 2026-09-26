@@ -170,7 +170,9 @@ pub fn decode_spatial_value(
     }
     let wkb = &bytes[4..];
     let (geometry_type, dimensions) = spatial_wire_header(wkb)?;
-    if !geometry_type.eq_ignore_ascii_case(subtype) || dimensions != *expected_dimensions {
+    if (subtype != "*" && !geometry_type.eq_ignore_ascii_case(subtype))
+        || (*expected_dimensions != 0 && dimensions != *expected_dimensions)
+    {
         return Err("MySQL spatial WKB header differs from the column declaration".to_owned());
     }
     Ok(LogicalValue::Spatial {
@@ -406,34 +408,21 @@ fn logical_type(
     let has_unsigned = declaration
         .modifiers
         .iter()
-        .any(|value| value == "unsigned");
+        .any(|value| matches!(value.as_str(), "unsigned" | "zerofill"));
     let base = declaration.base.as_str();
     match base {
-        "tinyint" => Ok(LogicalType::integer(!has_unsigned, 8)),
-        "smallint" => Ok(LogicalType::integer(!has_unsigned, 16)),
-        "mediumint" => Ok(LogicalType::integer(!has_unsigned, 24)),
-        "int" | "integer" => Ok(LogicalType::integer(!has_unsigned, 32)),
-        "bigint" => Ok(LogicalType::integer(!has_unsigned, 64)),
-        "decimal" | "numeric" => {
-            if has_unsigned {
-                return Err(SourceTypeMappingError::unsupported(base));
-            }
-            let precision = parse_u16(&declaration.arguments[0], "precision")?;
-            let scale = parse_u16(&declaration.arguments[1], "scale")?;
+        "tinyint" | "int1" | "bool" | "boolean" => Ok(LogicalType::integer(!has_unsigned, 8)),
+        "smallint" | "int2" => Ok(LogicalType::integer(!has_unsigned, 16)),
+        "mediumint" | "int3" => Ok(LogicalType::integer(!has_unsigned, 24)),
+        "int" | "integer" | "int4" => Ok(LogicalType::integer(!has_unsigned, 32)),
+        "bigint" | "int8" => Ok(LogicalType::integer(!has_unsigned, 64)),
+        "decimal" | "numeric" | "dec" | "fixed" => {
+            let (precision, scale) = decimal_parameters(declaration)?;
             Ok(LogicalType::decimal(precision, i32::from(scale)))
         }
-        "float" => {
-            if declaration
-                .modifiers
-                .iter()
-                .any(|value| value == "unsigned")
-            {
-                return Err(SourceTypeMappingError::unsupported("float unsigned"));
-            }
-            Ok(LogicalType::float(float_bits(declaration)?))
-        }
+        "float" => Ok(LogicalType::float(float_bits(declaration)?)),
         "double" | "real" => {
-            reject_modifiers(declaration, &[])?;
+            reject_modifiers(declaration, &["precision", "unsigned", "zerofill"])?;
             Ok(LogicalType::float(64))
         }
         "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => {
@@ -482,9 +471,18 @@ fn logical_type(
         }),
         "year" => Ok(LogicalType::year()),
         "json" => Ok(LogicalType::json()),
+        "geometry" => {
+            let (_, srid, _) = spatial_shape(declaration)?;
+            Ok(LogicalType::spatial("*", srid, 0))
+        }
         "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon"
-        | "geometrycollection" => {
+        | "geometrycollection" | "geomcollection" => {
             let (subtype, srid, dimensions) = spatial_shape(declaration)?;
+            let subtype = if subtype == "geomcollection" {
+                "geometrycollection".to_owned()
+            } else {
+                subtype
+            };
             Ok(LogicalType::spatial(subtype, srid, dimensions))
         }
         "enum" => Ok(LogicalType::Enum {
@@ -500,52 +498,52 @@ fn logical_type(
 fn validate_shape(declaration: &NativeDeclaration) -> Result<(), SourceTypeMappingError> {
     let base = declaration.base.as_str();
     match base {
-        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => {
+        "tinyint" | "int1" | "bool" | "boolean" | "smallint" | "int2" | "mediumint" | "int3"
+        | "int" | "integer" | "int4" | "bigint" | "int8" => {
             if declaration.arguments.len() > 1 {
                 return Err(SourceTypeMappingError::invalid(format!(
                     "{base} accepts at most one display-width argument"
                 )));
             }
-            reject_modifiers(declaration, &["unsigned"])
+            reject_modifiers(declaration, &["unsigned", "zerofill"])
         }
-        "decimal" | "numeric" => {
-            if declaration.arguments.len() != 2 {
-                return Err(SourceTypeMappingError::invalid(
-                    "DECIMAL requires precision and scale",
-                ));
-            }
-            let precision = parse_u16(&declaration.arguments[0], "precision")?;
-            let scale = parse_u16(&declaration.arguments[1], "scale")?;
+        "decimal" | "numeric" | "dec" | "fixed" => {
+            let (precision, scale) = decimal_parameters(declaration)?;
             if !(1..=65).contains(&precision) || scale > 30 || scale > precision {
                 return Err(SourceTypeMappingError::invalid(
                     "DECIMAL precision/scale is outside MySQL 5.7 limits",
                 ));
             }
-            reject_modifiers(declaration, &[])
+            reject_modifiers(declaration, &["unsigned", "zerofill"])
         }
         "float" => {
-            if declaration.arguments.len() > 1 {
+            if declaration.arguments.len() > 2 {
                 return Err(SourceTypeMappingError::invalid(
-                    "FLOAT accepts at most one precision argument",
+                    "FLOAT accepts either a binary precision or M,D arguments",
                 ));
             }
-            if let Some(precision) = declaration.arguments.first() {
-                let precision = parse_u16(precision, "FLOAT precision")?;
+            if declaration.arguments.len() == 1 {
+                let precision = parse_u16(&declaration.arguments[0], "FLOAT precision")?;
                 if precision > 53 {
                     return Err(SourceTypeMappingError::invalid(
                         "FLOAT precision is outside MySQL 5.7 limits",
                     ));
                 }
+            } else if declaration.arguments.len() == 2 {
+                validate_approximate_parameters(declaration)?;
             }
-            reject_modifiers(declaration, &[])
+            reject_modifiers(declaration, &["unsigned", "zerofill"])
         }
         "double" | "real" => {
-            if !declaration.arguments.is_empty() {
+            if declaration.arguments.len() > 2 {
                 return Err(SourceTypeMappingError::invalid(
-                    "DOUBLE/REAL does not accept a precision argument here",
+                    "DOUBLE/REAL accepts at most M,D arguments",
                 ));
             }
-            reject_modifiers(declaration, &[])
+            if !declaration.arguments.is_empty() {
+                validate_approximate_parameters(declaration)?;
+            }
+            reject_modifiers(declaration, &["precision", "unsigned", "zerofill"])
         }
         "char" => {
             if declaration.arguments.len() > 1 {
@@ -656,8 +654,8 @@ fn validate_shape(declaration: &NativeDeclaration) -> Result<(), SourceTypeMappi
             }
             reject_modifiers(declaration, &[])
         }
-        "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon"
-        | "geometrycollection" => {
+        "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring"
+        | "multipolygon" | "geometrycollection" | "geomcollection" => {
             if !declaration.arguments.is_empty() {
                 return Err(SourceTypeMappingError::invalid(format!(
                     "{base} does not accept arguments"
@@ -750,6 +748,40 @@ fn parse_u16(value: &str, label: &str) -> Result<u16, SourceTypeMappingError> {
         .map_err(|_| SourceTypeMappingError::invalid(format!("invalid {label}: {value:?}")))
 }
 
+fn decimal_parameters(
+    declaration: &NativeDeclaration,
+) -> Result<(u16, u16), SourceTypeMappingError> {
+    match declaration.arguments.as_slice() {
+        [] => Ok((10, 0)),
+        [precision] => Ok((parse_u16(precision, "precision")?, 0)),
+        [precision, scale] => Ok((
+            parse_u16(precision, "precision")?,
+            parse_u16(scale, "scale")?,
+        )),
+        _ => Err(SourceTypeMappingError::invalid(
+            "DECIMAL accepts at most precision and scale",
+        )),
+    }
+}
+
+fn validate_approximate_parameters(
+    declaration: &NativeDeclaration,
+) -> Result<(), SourceTypeMappingError> {
+    let [precision, scale] = declaration.arguments.as_slice() else {
+        return Err(SourceTypeMappingError::invalid(
+            "approximate numeric M,D syntax requires both arguments",
+        ));
+    };
+    let precision = parse_u16(precision, "precision")?;
+    let scale = parse_u16(scale, "scale")?;
+    if precision == 0 || precision > 255 || scale > 30 || scale > precision {
+        return Err(SourceTypeMappingError::invalid(
+            "approximate numeric precision/scale is outside MySQL limits",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_u64(value: &str, label: &str) -> Result<u64, SourceTypeMappingError> {
     value
         .parse()
@@ -760,8 +792,11 @@ fn float_bits(declaration: &NativeDeclaration) -> Result<u8, SourceTypeMappingEr
     let Some(precision) = declaration.arguments.first() else {
         return Ok(32);
     };
+    if declaration.arguments.len() == 2 {
+        return Ok(32);
+    }
     let precision = parse_u16(precision, "FLOAT precision")?;
-    Ok(if precision <= 24 { 32 } else { 64 })
+    Ok(if precision <= 23 { 32 } else { 64 })
 }
 
 fn text_length(declaration: &NativeDeclaration) -> Result<Option<u64>, SourceTypeMappingError> {
@@ -875,6 +910,37 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legal_mysql_numeric_declaration_forms_without_losing_value_width() {
+        let cases = [
+            ("decimal", LogicalType::decimal(10, 0)),
+            ("decimal(9)", LogicalType::decimal(9, 0)),
+            (
+                "decimal(20,6) unsigned zerofill",
+                LogicalType::decimal(20, 6),
+            ),
+            ("numeric(12,3)", LogicalType::decimal(12, 3)),
+            ("float(10,2)", LogicalType::float(32)),
+            ("float(24)", LogicalType::float(64)),
+            ("float(25)", LogicalType::float(64)),
+            ("float unsigned zerofill", LogicalType::float(32)),
+            ("double(12,2) unsigned", LogicalType::float(64)),
+            ("double precision", LogicalType::float(64)),
+            ("real", LogicalType::float(64)),
+            ("int(5) zerofill", LogicalType::integer(false, 32)),
+        ];
+
+        for (native, expected) in cases {
+            assert_eq!(
+                source_type_mapping(native, None, None)
+                    .unwrap_or_else(|error| panic!("{native}: {error}"))
+                    .logical_type,
+                expected,
+                "{native}"
+            );
+        }
+    }
+
+    #[test]
     fn tinyint_one_is_integer_not_boolean() {
         assert_eq!(
             source_type_mapping("tinyint(1)", None, None)
@@ -918,14 +984,19 @@ mod tests {
     #[test]
     fn unsupported_or_out_of_range_types_fail_closed() {
         assert_eq!(
-            source_type_mapping("geometry", Some("utf8mb4"), None)
+            source_type_mapping("geometryf", None, None)
                 .unwrap_err()
                 .code(),
             "mysql57.source_type.unsupported"
         );
         assert!(source_type_mapping("decimal(66,0)", None, None).is_err());
         assert!(source_type_mapping("datetime(7)", None, None).is_err());
-        assert!(source_type_mapping("decimal(10,2) unsigned", None, None).is_err());
+        assert_eq!(
+            source_type_mapping("decimal(10,2) unsigned", None, None)
+                .unwrap()
+                .logical_type,
+            LogicalType::decimal(10, 2)
+        );
         assert_eq!(
             source_type_mapping("bit(8)", None, None)
                 .unwrap()
@@ -969,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_declared_spatial_subtypes_and_rejects_unbounded_geometry() {
+    fn maps_declared_spatial_subtypes_and_generic_geometry() {
         assert_eq!(
             source_type_mapping("POINT SRID 4326", None, None)
                 .unwrap()
@@ -992,9 +1063,15 @@ mod tests {
         );
         assert_eq!(
             source_type_mapping("geometry", None, None)
-                .unwrap_err()
-                .code(),
-            "mysql57.source_type.unsupported"
+                .unwrap()
+                .logical_type,
+            LogicalType::spatial("*", None, 0)
+        );
+        assert_eq!(
+            source_type_mapping("geometry srid 4326", None, None)
+                .unwrap()
+                .logical_type,
+            LogicalType::spatial("*", Some(4326), 0)
         );
     }
 }

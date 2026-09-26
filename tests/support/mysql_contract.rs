@@ -96,6 +96,165 @@ impl Drop for TestTable {
         }
     }
 }
+
+pub struct GenericGeometryTable {
+    pub conn: Conn,
+    pub name: String,
+    cleaned: bool,
+}
+
+impl GenericGeometryTable {
+    pub fn create(port: u16) -> Self {
+        let mut conn = connection(port, false);
+        let tag = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("cdc_geometry_{}_{tag}", std::process::id());
+        conn.query_drop("CREATE DATABASE IF NOT EXISTS CDC_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci").unwrap();
+        conn.query_drop(format!(
+            "CREATE TABLE CDC_test.{name} (
+                id BIGINT NOT NULL PRIMARY KEY,
+                shape GEOMETRY NOT NULL
+            ) ENGINE=InnoDB"
+        ))
+        .unwrap();
+        Self {
+            conn,
+            name,
+            cleaned: false,
+        }
+    }
+
+    pub fn cleanup(&mut self) {
+        self.conn
+            .query_drop(format!("DROP TABLE CDC_test.{}", self.name))
+            .expect("clean up generic geometry test table");
+        self.cleaned = true;
+    }
+}
+
+impl Drop for GenericGeometryTable {
+    fn drop(&mut self) {
+        if !self.cleaned
+            && let Err(error) = self
+                .conn
+                .query_drop(format!("DROP TABLE CDC_test.{}", self.name))
+        {
+            eprintln!("cleanup failed for CDC_test.{}: {error}", self.name);
+        }
+    }
+}
+
+pub struct AllMysqlTypesTable {
+    pub conn: Conn,
+    pub name: String,
+    cleaned: bool,
+}
+
+impl AllMysqlTypesTable {
+    pub fn create(port: u16) -> Self {
+        let mut conn = connection(port, false);
+        let tag = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("cdc_all_types_{}_{tag}", std::process::id());
+        conn.query_drop("CREATE DATABASE IF NOT EXISTS CDC_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            .unwrap();
+        conn.query_drop(format!(
+            "CREATE TABLE CDC_test.{name} (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                tiny_signed TINYINT,
+                tiny_unsigned TINYINT UNSIGNED,
+                small_signed SMALLINT,
+                small_unsigned SMALLINT UNSIGNED,
+                medium_signed MEDIUMINT,
+                medium_unsigned MEDIUMINT UNSIGNED,
+                int_signed INT,
+                int_unsigned INT UNSIGNED,
+                big_signed BIGINT,
+                big_unsigned BIGINT UNSIGNED,
+                decimal_default DECIMAL,
+                decimal_precision DECIMAL(10),
+                decimal_scaled DECIMAL(30,6),
+                decimal_unsigned DECIMAL(12,2) UNSIGNED,
+                numeric_alias NUMERIC(12,3),
+                float_plain FLOAT,
+                float_precision FLOAT(23),
+                float_precision_boundary FLOAT(24),
+                float_scaled FLOAT(7,4),
+                double_plain DOUBLE,
+                double_precision DOUBLE PRECISION(12,2),
+                bit_one BIT,
+                bit_wide BIT(64),
+                date_value DATE,
+                datetime_value DATETIME(6),
+                timestamp_value TIMESTAMP(6),
+                time_value TIME(6),
+                year_value YEAR,
+                char_value CHAR(255),
+                varchar_value VARCHAR(255),
+                tinytext_value TINYTEXT,
+                text_value TEXT,
+                mediumtext_value MEDIUMTEXT,
+                longtext_value LONGTEXT,
+                binary_value BINARY(4),
+                varbinary_value VARBINARY(32),
+                tinyblob_value TINYBLOB,
+                blob_value BLOB,
+                mediumblob_value MEDIUMBLOB,
+                longblob_value LONGBLOB,
+                enum_value ENUM('alpha','beta','gamma'),
+                set_value SET('a','b','c'),
+                json_value JSON,
+                geometry_value GEOMETRY,
+                point_value POINT,
+                linestring_value LINESTRING,
+                polygon_value POLYGON,
+                multipoint_value MULTIPOINT,
+                multilinestring_value MULTILINESTRING,
+                multipolygon_value MULTIPOLYGON,
+                geometrycollection_value GEOMETRYCOLLECTION,
+                null_marker VARCHAR(32) NULL,
+                decimal_max_precision DECIMAL(65,30),
+                float_negative_zero FLOAT,
+                double_negative_zero DOUBLE,
+                date_zero DATE,
+                datetime_zero DATETIME(6),
+                timestamp_zero TIMESTAMP(6) NULL DEFAULT NULL,
+                latin1_value CHAR(2) CHARACTER SET latin1 COLLATE latin1_bin,
+                binary_padding BINARY(4)
+            ) ENGINE=InnoDB"
+        ))
+        .unwrap();
+        Self {
+            conn,
+            name,
+            cleaned: false,
+        }
+    }
+
+    pub fn cleanup(&mut self) {
+        self.conn
+            .query_drop(format!("DROP TABLE CDC_test.{}", self.name))
+            .expect("clean up all-types test table");
+        self.cleaned = true;
+    }
+}
+
+impl Drop for AllMysqlTypesTable {
+    fn drop(&mut self) {
+        if !self.cleaned
+            && let Err(error) = self
+                .conn
+                .query_drop(format!("DROP TABLE CDC_test.{}", self.name))
+        {
+            eprintln!("cleanup failed for CDC_test.{}: {error}", self.name);
+        }
+    }
+}
+
 pub fn cursor(position: u32) -> SourceCursor {
     cursor_with_file("mysql-bin.000001", position)
 }

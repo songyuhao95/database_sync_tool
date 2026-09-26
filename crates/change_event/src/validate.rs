@@ -343,7 +343,12 @@ pub(crate) fn image(row: &[ColumnDatum], operation: Operation, is_before: bool) 
             _ => {}
         }
         if let Datum::Value(v) = &column.datum {
-            logical_value(v)?;
+            logical_value(v).map_err(|error| {
+                ChangeEventValidationError(format!(
+                    "column {:?} declared as {:?}: {error}",
+                    column.name, column.native_type
+                ))
+            })?;
         } else if let Datum::SourceRepresentationEnvelope(envelope) = &column.datum {
             envelope.validate().map_err(|error| {
                 ChangeEventValidationError(format!("{}: {error}", error.code()))

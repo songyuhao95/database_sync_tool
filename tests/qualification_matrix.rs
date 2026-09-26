@@ -417,33 +417,65 @@ fn representative_value(logical_type: &LogicalType) -> Option<LogicalValue> {
             source_definition_digest,
             encoding,
         } => LogicalValue::Raw {
-            carrier: RawValueCarrier::new(
+            carrier: qualified_fixture_raw_carrier(
                 codec_identity.clone(),
                 native_type.clone(),
                 source_definition_digest.clone(),
                 encoding.clone(),
-                "AA",
-                None::<String>,
-            ),
+            )?,
         },
         LogicalType::Opaque {
             source_type,
             format,
         } => LogicalValue::Raw {
-            carrier: RawValueCarrier::new(
+            carrier: qualified_fixture_raw_carrier(
                 "opaque-fixture-v1",
                 source_type.clone(),
-                "opaque-fixture-definition",
+                stable_digest(&("opaque-fixture-definition", source_type, format)),
                 format.clone(),
-                "AA",
-                None::<String>,
-            ),
+            )?,
         },
         LogicalType::InvalidTemporal { kind } => LogicalValue::InvalidTemporal {
             kind: kind.clone(),
             raw: "0000-00-00".into(),
         },
     })
+}
+
+fn qualified_fixture_raw_carrier(
+    codec_identity: impl Into<String>,
+    native_type: impl Into<String>,
+    source_definition_digest: impl Into<String>,
+    encoding: impl Into<String>,
+) -> Option<RawValueCarrier> {
+    let codec_identity = codec_identity.into();
+    let native_type = native_type.into();
+    let source_definition_digest = source_definition_digest.into();
+    let encoding = encoding.into();
+    let context = SourceRepresentationContext {
+        connector: ConnectorIdentity::new("qualification-fixture", "1"),
+        server_build: ServerBuildIdentity::new("qualification-fixture", "offline", "1", "fixture"),
+        source_type_identity: native_type.clone(),
+        source_type_definition_digest: source_definition_digest.clone(),
+        protocol: "offline-fixture-v1".into(),
+        format: SourceRepresentationFormat::Binary,
+        type_metadata: std::collections::BTreeMap::new(),
+        source_cursor: SourceCursor {
+            format: "offline-fixture-cursor-v1".into(),
+            value: "fixture:1".into(),
+            display: "fixture:1".into(),
+        },
+    };
+    RawValueCarrier::new(
+        codec_identity,
+        native_type,
+        source_definition_digest,
+        encoding,
+        "AA",
+        None::<String>,
+    )
+    .with_source_context(context, true)
+    .ok()
 }
 
 fn zero_date_fixture_evidence() -> Value {

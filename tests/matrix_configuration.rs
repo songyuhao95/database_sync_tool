@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 #[test]
@@ -109,7 +111,24 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "source")
             .count(),
-        6
+        9
+    );
+    let all_mysql_type_capture_suites: BTreeSet<_> = suites
+        .iter()
+        .filter(|suite| {
+            suite["id"]
+                .as_str()
+                .is_some_and(|id| id.ends_with(".all_types_capture"))
+        })
+        .map(|suite| suite["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        all_mysql_type_capture_suites,
+        BTreeSet::from([
+            "mysql_5_7.all_types_capture",
+            "mysql_8_0.all_types_capture",
+            "mysql_8_4.all_types_capture",
+        ])
     );
     assert_eq!(
         suites

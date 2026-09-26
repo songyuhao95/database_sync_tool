@@ -463,22 +463,7 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
         }
     }
     match value {
-        Value::Int(value) => {
-            let bits = integer_bits(&info.data_type);
-            let unsigned = info.native_type.to_ascii_lowercase().contains("unsigned");
-            // 5.7 TABLE_MAP omits signedness; the driver interprets integer bytes as signed.
-            let text = if unsigned {
-                let mask = u64::MAX >> (64 - bits);
-                ((*value as u64) & mask).to_string()
-            } else {
-                value.to_string()
-            };
-            Ok(LogicalValue::Integer {
-                signed: !unsigned,
-                bits,
-                value: text,
-            })
-        }
+        Value::Int(value) => Ok(decode_integer(*value, info)),
         Value::UInt(value) => Ok(LogicalValue::Integer {
             signed: false,
             bits: integer_bits(&info.data_type),
@@ -548,6 +533,12 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
             if data_type == "timestamp" {
                 let text = String::from_utf8(bytes.clone())
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if text == "0" || text == "0.000000" {
+                    return Ok(LogicalValue::InvalidTemporal {
+                        kind: "mysql.timestamp".to_owned(),
+                        raw: "0000-00-00 00:00:00.000000".to_owned(),
+                    });
+                }
                 return timestamp(&text);
             }
             if data_type == "year" {
@@ -569,10 +560,27 @@ pub(crate) fn decode_mysql_value(value: &Value, info: &ColumnInfo) -> io::Result
                     } else {
                         BitPadding::Zero
                     },
-                    bit_order: BitOrder::MsbFirst,
+                    bit_order: BitOrder::LsbFirst,
                 });
             }
             if is_binary_type(&data_type) {
+                let mut bytes = bytes.clone();
+                if data_type == "binary" {
+                    let width = native_binary_width(&info.native_type)?;
+                    if bytes.len() > width {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "BINARY value has {} bytes but its declaration allows {width}",
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                    // MySQL row events encode the supplied byte string. The
+                    // fixed-width zero padding is part of the column value and
+                    // must be restored from the TABLE_MAP/catalog definition.
+                    bytes.resize(width, 0);
+                }
                 return Ok(LogicalValue::Binary {
                     bytes_base64url: URL_SAFE_NO_PAD.encode(bytes),
                 });
@@ -608,6 +616,16 @@ fn parse_decimal(text: &str) -> io::Result<LogicalValue> {
         scale: i32::try_from(fraction.len())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     })
+}
+
+fn native_binary_width(native_type: &str) -> io::Result<usize> {
+    native_type
+        .split_once('(')
+        .and_then(|(_, tail)| tail.split_once(')').map(|(width, _)| width))
+        .map(str::trim)
+        .unwrap_or("1")
+        .parse::<usize>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -785,6 +803,25 @@ fn integer_bits(data_type: &str) -> u8 {
         "mediumint" => 24,
         "int" | "integer" => 32,
         _ => 64,
+    }
+}
+
+fn decode_integer(value: i64, info: &ColumnInfo) -> LogicalValue {
+    let bits = integer_bits(&info.data_type);
+    let unsigned = info.native_type.to_ascii_lowercase().contains("unsigned");
+    let mask = u64::MAX >> (64 - bits);
+    let raw = (value as u64) & mask;
+    let text = if unsigned {
+        raw.to_string()
+    } else if raw & (1_u64 << (bits - 1)) != 0 {
+        (i128::from(raw) - (1_i128 << bits)).to_string()
+    } else {
+        raw.to_string()
+    };
+    LogicalValue::Integer {
+        signed: !unsigned,
+        bits,
+        value: text,
     }
 }
 
@@ -970,6 +1007,25 @@ mod tests {
             decode_mysql_value(&Value::Date(0, 0, 0, 0, 0, 0, 0), &info).unwrap(),
             LogicalValue::InvalidTemporal { kind, raw }
                 if kind == "mysql.datetime" && raw == "0000-00-00 00:00:00.000000"
+        ));
+    }
+
+    #[test]
+    fn fixed_binary_values_restore_mysql_zero_padding() {
+        let info = ColumnInfo {
+            name: "payload".into(),
+            native_type: "binary(4)".into(),
+            data_type: "binary".into(),
+            charset: None,
+            collation: None,
+            generated: false,
+            primary_key_ordinal: None,
+        };
+        let value = decode_mysql_value(&Value::Bytes(vec![1]), &info).unwrap();
+        assert!(matches!(
+            value,
+            LogicalValue::Binary { bytes_base64url }
+                if URL_SAFE_NO_PAD.decode(&bytes_base64url).unwrap() == [1, 0, 0, 0]
         ));
     }
 

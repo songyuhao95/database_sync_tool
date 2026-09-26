@@ -27,6 +27,9 @@ pub fn source_type_mapping(
 ) -> Result<SourceTypeMapping, String> {
     let mut mapping = mysql_5_7::source_type_mapping(native_type, charset, collation)
         .map_err(|error| error.to_string())?;
+    if mysql_80_float24_is_single_precision(native_type) {
+        mapping.logical_type = LogicalType::float(32);
+    }
     mapping.connector = ConnectorIdentity::new(CONNECTOR_KIND, CONNECTOR_VERSION);
     mapping.mapping_id = mapping.mapping_id.strip_prefix("mysql57.").map_or_else(
         || "mysql80.source-type.unknown".to_owned(),
@@ -35,6 +38,16 @@ pub fn source_type_mapping(
     mapping.mapping_version = "mysql-8.0.source-type-mapping.v1".to_owned();
     mapping.evidence_digest = Some(mapping_evidence_digest(&mapping));
     Ok(mapping)
+}
+
+fn mysql_80_float24_is_single_precision(native_type: &str) -> bool {
+    let declaration = native_type.trim().to_ascii_lowercase();
+    declaration
+        .strip_prefix("float(")
+        .and_then(|value| value.split_once(')'))
+        .is_some_and(|(parameters, _)| {
+            !parameters.contains(',') && parameters.trim().parse::<u16>().ok() == Some(24)
+        })
 }
 
 fn mapping_evidence_digest(mapping: &SourceTypeMapping) -> String {

@@ -1071,9 +1071,9 @@ impl LogicalType {
                     ..
                 },
             ) => {
-                subtype.eq_ignore_ascii_case(geometry_type)
-                    && srid == value_srid
-                    && dimensions == value_dimensions
+                (subtype == "*" || subtype.eq_ignore_ascii_case(geometry_type))
+                    && (srid.is_none() || srid == value_srid)
+                    && (*dimensions == 0 || dimensions == value_dimensions)
             }
             (
                 Self::InvalidTemporal { kind },
@@ -2264,7 +2264,7 @@ fn validate_spatial_plan_value(
             "the spatial plan must declare geometry type",
         )
     })?;
-    if !geometry_type.eq_ignore_ascii_case(expected_geometry) {
+    if expected_geometry != "*" && !geometry_type.eq_ignore_ascii_case(expected_geometry) {
         return Err(plan_failure(
             plan,
             "target_capability.spatial_geometry_type_mismatch",
@@ -2272,6 +2272,7 @@ fn validate_spatial_plan_value(
         ));
     }
     if let Some(source_geometry) = plan_parameter(plan, "source_geometry_type")
+        && source_geometry != "*"
         && !geometry_type.eq_ignore_ascii_case(source_geometry)
     {
         return Err(plan_failure(
@@ -2296,7 +2297,7 @@ fn validate_spatial_plan_value(
                 "the saved spatial dimensions are invalid",
             )
         })?;
-    if *dimensions != expected_dimensions {
+    if expected_dimensions != 0 && *dimensions != expected_dimensions {
         return Err(plan_failure(
             plan,
             "target_capability.spatial_dimensions_mismatch",
@@ -2304,6 +2305,7 @@ fn validate_spatial_plan_value(
         ));
     }
     if let Some(source_dimensions) = plan_parameter(plan, "source_dimensions")
+        && source_dimensions != "0"
         && source_dimensions != dimensions.to_string()
     {
         return Err(plan_failure(
@@ -2343,7 +2345,7 @@ fn validate_spatial_plan_value(
             "the spatial plan must declare CRS identity",
         )
     })?;
-    if expected_crs == "unknown" || crs.as_deref() != Some(expected_crs) {
+    if expected_crs != "unknown" && crs.as_deref() != Some(expected_crs) {
         return Err(plan_failure(
             plan,
             "target_capability.spatial_crs_mismatch",
@@ -2351,7 +2353,8 @@ fn validate_spatial_plan_value(
         ));
     }
     if let Some(source_crs) = plan_parameter(plan, "source_crs")
-        && (source_crs == "unknown" || crs.as_deref() != Some(source_crs))
+        && source_crs != "unknown"
+        && crs.as_deref() != Some(source_crs)
     {
         return Err(plan_failure(
             plan,
@@ -2445,8 +2448,8 @@ fn validate_spatial_wire(
         _ => "unknown",
     };
     if actual_geometry == "unknown"
-        || !actual_geometry.eq_ignore_ascii_case(geometry_type)
-        || actual_dimensions != dimensions
+        || (geometry_type != "*" && !actual_geometry.eq_ignore_ascii_case(geometry_type))
+        || (dimensions != 0 && actual_dimensions != dimensions)
     {
         return Err(plan_failure(
             plan,

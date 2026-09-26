@@ -109,14 +109,14 @@ pub fn validate_source(
                 "MySQL capture requires a primary key Row Locator",
             )?;
             for column in image {
-                validate_column(column)?;
+                validate_column(column, expected)?;
             }
         }
     }
     Ok(())
 }
 
-fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
+fn validate_column(column: &ColumnDatum, version: MysqlVersion) -> Result<(), SourceContractError> {
     let Datum::Value(value) = &column.datum else {
         return Ok(());
     };
@@ -125,22 +125,23 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
     let valid = match value {
         LogicalValue::Integer { signed, bits, .. } => {
             let expected_bits = match base {
-                "tinyint" => 8,
-                "smallint" => 16,
-                "mediumint" => 24,
-                "int" | "integer" => 32,
-                "bigint" => 64,
+                "tinyint" | "int1" | "bool" | "boolean" => 8,
+                "smallint" | "int2" => 16,
+                "mediumint" | "int3" => 24,
+                "int" | "integer" | "int4" => 32,
+                "bigint" | "int8" => 64,
                 _ => 0,
             };
-            expected_bits == *bits && *signed == !native.contains(" unsigned")
+            expected_bits == *bits
+                && *signed == !(native.contains(" unsigned") || native.contains(" zerofill"))
         }
         LogicalValue::Decimal { unscaled, scale } => {
             !matches!(unscaled.as_str(), "NaN" | "Infinity" | "-Infinity")
-                && matches!(base, "decimal" | "numeric")
+                && matches!(base, "decimal" | "numeric" | "dec" | "fixed")
                 && decimal_scale(&native)
                     .is_none_or(|declared| i32::try_from(declared).ok() == Some(*scale))
         }
-        LogicalValue::Float { bits, .. } => float_bits(&native) == Some(*bits),
+        LogicalValue::Float { bits, .. } => float_bits(&native, version) == Some(*bits),
         LogicalValue::Text { charset, .. } => {
             matches!(
                 base,
@@ -197,8 +198,8 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
             dimensions,
             ..
         } => {
-            matches!(
-                base,
+            let known_subtype = matches!(
+                geometry_type.to_ascii_lowercase().as_str(),
                 "point"
                     | "linestring"
                     | "polygon"
@@ -206,7 +207,12 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
                     | "multilinestring"
                     | "multipolygon"
                     | "geometrycollection"
-            ) && base.eq_ignore_ascii_case(geometry_type)
+            );
+            known_subtype
+                && (base == "geometry"
+                    || base.eq_ignore_ascii_case(geometry_type)
+                    || (base == "geomcollection"
+                        && geometry_type.eq_ignore_ascii_case("geometrycollection")))
                 && (2..=4).contains(dimensions)
         }
         LogicalValue::Array { .. }
@@ -230,7 +236,13 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
                 && !raw.trim().is_empty()
         }
     };
-    ensure(valid, "MySQL native type does not match LogicalValue")
+    if !valid {
+        return Err(SourceContractError::new(format!(
+            "MySQL column {:?} declared as {:?} does not match its captured LogicalValue",
+            column.name, column.native_type
+        )));
+    }
+    Ok(())
 }
 
 fn decimal_scale(native: &str) -> Option<usize> {
@@ -258,15 +270,26 @@ fn binary_length_matches(native: &str, base: &str, length: usize) -> bool {
     }
 }
 
-fn float_bits(native: &str) -> Option<u8> {
+fn float_bits(native: &str, version: MysqlVersion) -> Option<u8> {
     let base = native.split(['(', ' ', '\t']).next().unwrap_or_default();
     match base {
         "float" => {
-            let precision = native
+            let double_threshold = match version {
+                MysqlVersion::V57 | MysqlVersion::V84 => 24,
+                MysqlVersion::V80 => 25,
+            };
+            let Some(parameters) = native
                 .strip_prefix("float(")
                 .and_then(|value| value.split_once(')'))
-                .and_then(|(value, _)| value.trim().parse::<u16>().ok());
-            Some(if precision.is_some_and(|value| value > 24) {
+                .map(|(parameters, _)| parameters.trim())
+            else {
+                return Some(32);
+            };
+            if parameters.contains(',') {
+                return Some(32);
+            }
+            let precision = parameters.parse::<u16>().ok()?;
+            Some(if precision >= double_threshold {
                 64
             } else {
                 32
@@ -324,7 +347,7 @@ fn ensure(condition: bool, message: &str) -> Result<(), SourceContractError> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_column;
+    use super::{MysqlVersion, validate_column};
     use change_event::{ColumnDatum, Datum, LogicalValue};
 
     fn decimal_column(unscaled: &str) -> ColumnDatum {
@@ -344,10 +367,10 @@ mod tests {
 
     #[test]
     fn mysql_decimal_contract_rejects_non_finite_decimal_values() {
-        assert!(validate_column(&decimal_column("123")).is_ok());
+        assert!(validate_column(&decimal_column("123"), MysqlVersion::V57).is_ok());
         for special in ["NaN", "Infinity", "-Infinity"] {
             assert!(
-                validate_column(&decimal_column(special)).is_err(),
+                validate_column(&decimal_column(special), MysqlVersion::V57).is_err(),
                 "MySQL DECIMAL cannot represent {special}"
             );
         }
