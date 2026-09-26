@@ -685,6 +685,54 @@
       ]
     },
     {
+      "id": "postgresql_15.builtins",
+      "mode": "Live",
+      "category": "source",
+      "databases": ["postgresql_15"],
+      "stages": ["Read", "ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_15", "--test", "live_builtin_capture",
+        "postgresql15_all_builtin_types_capture", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_HOST", "PG_CDC_PORT", "PG_CDC_ADMIN_USER", "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER", "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_16.builtins",
+      "mode": "Live",
+      "category": "source",
+      "databases": ["postgresql_16"],
+      "stages": ["Read", "ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_15", "--test", "live_builtin_capture",
+        "postgresql16_all_builtin_types_capture", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST", "PG_CDC16_PORT", "PG_CDC16_ADMIN_USER", "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER", "PG_CDC16_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_17.builtins",
+      "mode": "Live",
+      "category": "source",
+      "databases": ["postgresql_17"],
+      "stages": ["Read", "ChangeEvent"],
+      "args": [
+        "test", "--locked", "-p", "postgresql_15", "--test", "live_builtin_capture",
+        "postgresql17_all_builtin_types_capture", "--", "--ignored", "--exact", "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST", "PG_CDC17_PORT", "PG_CDC17_ADMIN_USER", "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER", "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
       "id": "postgresql_16.apply",
       "mode": "Live",
       "category": "sink",

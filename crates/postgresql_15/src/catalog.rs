@@ -7,6 +7,12 @@ pub(crate) struct Column {
     pub oid: u32,
     pub modifier: i32,
     pub native_type: String,
+    pub type_schema: String,
+    pub type_name: String,
+    pub type_definition_digest: String,
+    pub type_definition_evidence: String,
+    pub representation_only: bool,
+    pub representation_capture_allowed: bool,
     pub key: Option<usize>,
 }
 #[derive(Clone, Debug)]
@@ -18,11 +24,15 @@ pub(crate) struct Table {
     pub source_type_catalog_digest: String,
     pub columns: Vec<Column>,
 }
+pub(crate) struct LoadedCatalog {
+    pub tables: HashMap<u32, Table>,
+    pub type_names: HashMap<u32, (String, String)>,
+}
 pub(crate) async fn load(
     conn: &mut PgConnection,
     publication: &str,
     version: u16,
-) -> Result<HashMap<u32, Table>> {
+) -> Result<LoadedCatalog> {
     let publication_info=sqlx::query("SELECT pubinsert,pubupdate,pubdelete,pubtruncate,pubviaroot FROM pg_publication WHERE pubname=$1")
         .bind(publication).fetch_optional(&mut *conn).await?.ok_or_else(||invalid("publication does not exist; prepare it with the table owner/admin"))?;
     for flag in ["pubinsert", "pubupdate", "pubdelete", "pubtruncate"] {
@@ -64,13 +74,24 @@ pub(crate) async fn load(
         for column in column_rows {
             let oid = u32::try_from(column.try_get::<i64, _>("type_oid")?)?;
             let native_type: String = column.try_get("native_type")?;
+            let definition = type_catalog
+                .types
+                .iter()
+                .find(|definition| definition.oid == oid)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{schema}.{name}: catalog is missing type OID {oid}"
+                    ))
+                })?;
             crate::type_mapping::source_type_mapping_with_catalog_for_version(
                 &version.to_string(),
                 &native_type,
                 &type_catalog,
             )
             .map_err(|error| invalid(format!("{schema}.{name}: {error}")))?;
-            if !(types::supported(oid) || native_type.to_ascii_lowercase().starts_with("enum("))
+            let is_enum = native_type.to_ascii_lowercase().starts_with("enum(");
+            let representation_capture_allowed = definition.schema == "pg_catalog";
+            if !(types::supported(oid) || is_enum || representation_capture_allowed)
                 || !column.try_get::<String, _>("generated")?.is_empty()
             {
                 return Err(invalid(format!(
@@ -82,6 +103,12 @@ pub(crate) async fn load(
                 oid,
                 modifier: column.try_get("atttypmod")?,
                 native_type,
+                type_schema: definition.schema.clone(),
+                type_name: definition.name.clone(),
+                type_definition_digest: definition.definition_digest.clone(),
+                type_definition_evidence: serde_json::to_string(definition)?,
+                representation_only: !types::supported(oid) && !is_enum,
+                representation_capture_allowed,
                 key: column
                     .try_get::<Option<i32>, _>("key_ordinal")?
                     .map(usize::try_from)
@@ -108,7 +135,12 @@ pub(crate) async fn load(
             },
         );
     }
-    Ok(tables)
+    let type_names = type_catalog
+        .types
+        .into_iter()
+        .map(|definition| (definition.oid, (definition.schema, definition.name)))
+        .collect();
+    Ok(LoadedCatalog { tables, type_names })
 }
 
 /// Read the recursive PostgreSQL type directory once per capture activation.

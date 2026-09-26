@@ -441,16 +441,21 @@ pub fn source_type_mapping_with_catalog_for_version(
     logical_type
         .validate()
         .map_err(|error| SourceTypeMappingError::invalid(version, error.to_string()))?;
-    let source_definition_fingerprint = if array_declaration(&native_type).is_some()
-        || base_name(&native_type).eq_ignore_ascii_case("enum")
-        || logical_type_from_builtin(&native_type, version)?.is_some()
-    {
-        None
-    } else {
-        Some(definition_digest(
+    let source_definition_fingerprint = match &logical_type {
+        LogicalType::Raw {
+            source_definition_digest,
+            ..
+        } => Some(source_definition_digest.clone()),
+        _ if array_declaration(&native_type).is_some()
+            || base_name(&native_type).eq_ignore_ascii_case("enum")
+            || logical_type_from_builtin(&native_type, version)?.is_some() =>
+        {
+            None
+        }
+        _ => Some(definition_digest(
             find_definition(&native_type, catalog, version)?,
             version,
-        )?)
+        )?),
     };
     let base = base_name(&native_type).to_ascii_lowercase();
     let mapping_version = mapping_version(version);
@@ -572,6 +577,14 @@ fn logical_type_with_catalog(
                 native_type,
             ));
         }
+        if let Some(definition) = builtin_array_definition(element, catalog) {
+            return Ok(LogicalType::raw(
+                "postgresql.pgoutput.text-envelope.v1",
+                format!("{}.{}", definition.schema, definition.name),
+                definition_digest(definition, version)?,
+                "UTF-8",
+            ));
+        }
         let mut logical = logical_type_with_catalog(element, catalog, version)?;
         for _ in 0..dimensions {
             logical = LogicalType::Array {
@@ -593,6 +606,103 @@ fn logical_type_with_catalog(
     logical_type_from_definition(definition, catalog, version, &mut stack)
 }
 
+fn builtin_array_definition<'a>(
+    element_native_type: &str,
+    catalog: &'a SourceTypeCatalog,
+) -> Option<&'a SourceTypeDefinition> {
+    let element_name = builtin_catalog_name(element_native_type)?;
+    let element_oid = catalog
+        .types
+        .iter()
+        .find(|definition| definition.schema == "pg_catalog" && definition.name == element_name)?
+        .oid;
+    catalog.types.iter().find(|definition| {
+        definition.schema == "pg_catalog"
+            && matches!(
+                definition.kind,
+                SourceTypeDefinitionKind::Array { element_oid: known } if known == element_oid
+            )
+    })
+}
+
+fn builtin_catalog_name(native_type: &str) -> Option<&'static str> {
+    Some(match native_type.trim().to_ascii_lowercase().as_str() {
+        "boolean" | "bool" => "bool",
+        "smallint" | "int2" => "int2",
+        "integer" | "int" | "int4" => "int4",
+        "bigint" | "int8" => "int8",
+        "real" | "float4" => "float4",
+        "double precision" | "float8" => "float8",
+        "numeric" | "decimal" => "numeric",
+        "text" => "text",
+        "character varying" | "varchar" => "varchar",
+        "character" | "char" | "bpchar" => "bpchar",
+        "\"char\"" => "char",
+        "name" => "name",
+        "bytea" => "bytea",
+        "bit" | "\"bit\"" => "bit",
+        "bit varying" | "varbit" => "varbit",
+        "date" => "date",
+        "time" | "time without time zone" => "time",
+        "time with time zone" | "timetz" => "timetz",
+        "timestamp" | "timestamp without time zone" => "timestamp",
+        "timestamp with time zone" | "timestamptz" => "timestamptz",
+        "interval" => "interval",
+        "uuid" => "uuid",
+        "json" => "json",
+        "jsonb" => "jsonb",
+        "xml" => "xml",
+        "money" => "money",
+        "point" => "point",
+        "line" => "line",
+        "lseg" => "lseg",
+        "box" => "box",
+        "path" => "path",
+        "polygon" => "polygon",
+        "circle" => "circle",
+        "cidr" => "cidr",
+        "inet" => "inet",
+        "macaddr" => "macaddr",
+        "macaddr8" => "macaddr8",
+        "tsvector" => "tsvector",
+        "tsquery" => "tsquery",
+        "oid" => "oid",
+        "oidvector" => "oidvector",
+        "int2vector" => "int2vector",
+        "tid" => "tid",
+        "xid" => "xid",
+        "xid8" => "xid8",
+        "cid" => "cid",
+        "pg_lsn" => "pg_lsn",
+        "pg_snapshot" => "pg_snapshot",
+        "txid_snapshot" => "txid_snapshot",
+        "regproc" => "regproc",
+        "regprocedure" => "regprocedure",
+        "regoper" => "regoper",
+        "regoperator" => "regoperator",
+        "regclass" => "regclass",
+        "regtype" => "regtype",
+        "regconfig" => "regconfig",
+        "regdictionary" => "regdictionary",
+        "regnamespace" => "regnamespace",
+        "regrole" => "regrole",
+        "regcollation" => "regcollation",
+        "int4range" => "int4range",
+        "int8range" => "int8range",
+        "numrange" => "numrange",
+        "tsrange" => "tsrange",
+        "tstzrange" => "tstzrange",
+        "daterange" => "daterange",
+        "int4multirange" => "int4multirange",
+        "int8multirange" => "int8multirange",
+        "nummultirange" => "nummultirange",
+        "tsmultirange" => "tsmultirange",
+        "tstzmultirange" => "tstzmultirange",
+        "datemultirange" => "datemultirange",
+        _ => return None,
+    })
+}
+
 fn logical_type_from_builtin(
     native_type: &str,
     version: &str,
@@ -603,14 +713,17 @@ fn logical_type_from_builtin(
         "integer" | "int" => Ok(LogicalType::integer(true, 32)),
         "bigint" => Ok(LogicalType::integer(true, 64)),
         "oid" | "xid" | "cid" => Ok(LogicalType::integer(false, 32)),
+        "xid8" => Ok(LogicalType::integer(false, 64)),
         "real" => Ok(LogicalType::float(32)),
         "double precision" => Ok(LogicalType::float(64)),
-        "text" | "character" | "char" | "character varying" | "varchar" => Ok(LogicalType::Text {
-            charset: "UTF8".into(),
-            max_length: None,
-            length_unit: LengthUnit::Characters,
-            collation: None,
-        }),
+        "text" | "character" | "char" | "\"char\"" | "name" | "character varying" | "varchar" => {
+            Ok(LogicalType::Text {
+                charset: "UTF8".into(),
+                max_length: None,
+                length_unit: LengthUnit::Characters,
+                collation: None,
+            })
+        }
         "bytea" => Ok(LogicalType::binary(None)),
         "bit" => Ok(LogicalType::bit_string(1)),
         "date" => Ok(LogicalType::date()),
@@ -633,7 +746,10 @@ fn logical_type_from_builtin(
         "xml" => Ok(LogicalType::xml()),
         "interval" => interval(native_type, version),
         "numeric" | "decimal" => numeric(native_type, version),
-        "money" => Err(SourceTypeMappingError::unsupported(version, native_type)),
+        // `money` formatting depends on lc_monetary. Until a semantic money
+        // codec is qualified, the catalog-backed mapping uses the explicit
+        // pgoutput text representation path below.
+        "money" => return Ok(None),
         _ if native_type.starts_with("time(") => time(native_type, version),
         _ if native_type.starts_with("interval") => interval(native_type, version),
         _ if native_type.starts_with("numeric(") => numeric(native_type, version),
@@ -716,39 +832,6 @@ fn logical_type_from_builtin(
         "int2" => Ok(LogicalType::integer(true, 16)),
         "int4" => Ok(LogicalType::integer(true, 32)),
         "int8" => Ok(LogicalType::integer(true, 64)),
-        "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => {
-            Ok(LogicalType::spatial(native_type, None, 2))
-        }
-        "int4range" => Ok(LogicalType::Range {
-            element: Box::new(LogicalType::integer(true, 32)),
-        }),
-        "int8range" => Ok(LogicalType::Range {
-            element: Box::new(LogicalType::integer(true, 64)),
-        }),
-        "daterange" => Ok(LogicalType::Range {
-            element: Box::new(LogicalType::date()),
-        }),
-        "tsrange" => Ok(LogicalType::Range {
-            element: Box::new(LogicalType::local_datetime(6)),
-        }),
-        "tstzrange" => Ok(LogicalType::Range {
-            element: Box::new(LogicalType::instant(6)),
-        }),
-        "int4multirange" => Ok(LogicalType::MultiRange {
-            element: Box::new(LogicalType::integer(true, 32)),
-        }),
-        "int8multirange" => Ok(LogicalType::MultiRange {
-            element: Box::new(LogicalType::integer(true, 64)),
-        }),
-        "datemultirange" => Ok(LogicalType::MultiRange {
-            element: Box::new(LogicalType::date()),
-        }),
-        "tsmultirange" => Ok(LogicalType::MultiRange {
-            element: Box::new(LogicalType::local_datetime(6)),
-        }),
-        "tstzmultirange" => Ok(LogicalType::MultiRange {
-            element: Box::new(LogicalType::instant(6)),
-        }),
         _ => return Ok(None),
     }?;
     Ok(Some(logical))
@@ -853,8 +936,18 @@ fn logical_type_from_definition(
     stack.push(definition.oid);
     let result = match &definition.kind {
         SourceTypeDefinitionKind::Builtin { native_type } => {
-            logical_type_from_builtin(native_type, version)?
-                .ok_or_else(|| SourceTypeMappingError::unsupported(version, native_type))
+            if let Some(logical_type) = logical_type_from_builtin(native_type, version)? {
+                Ok(logical_type)
+            } else if definition.schema == "pg_catalog" {
+                Ok(LogicalType::raw(
+                    "postgresql.pgoutput.text-envelope.v1",
+                    format!("{}.{}", definition.schema, definition.name),
+                    definition_digest(definition, version)?,
+                    "UTF-8",
+                ))
+            } else {
+                Err(SourceTypeMappingError::unsupported(version, native_type))
+            }
         }
         SourceTypeDefinitionKind::Enum { labels } => {
             validate_enum_labels(labels, version)?;
@@ -900,6 +993,24 @@ fn logical_type_from_definition(
             Ok(LogicalType::Struct {
                 fields: logical_fields,
             })
+        }
+        SourceTypeDefinitionKind::Array { element_oid } if definition.schema == "pg_catalog" => {
+            Ok(LogicalType::raw(
+                "postgresql.pgoutput.text-envelope.v1",
+                format!("{}.{}", definition.schema, definition.name),
+                definition_digest(definition, version)?,
+                "UTF-8",
+            ))
+        }
+        SourceTypeDefinitionKind::Range { .. } | SourceTypeDefinitionKind::MultiRange { .. }
+            if definition.schema == "pg_catalog" =>
+        {
+            Ok(LogicalType::raw(
+                "postgresql.pgoutput.text-envelope.v1",
+                format!("{}.{}", definition.schema, definition.name),
+                definition_digest(definition, version)?,
+                "UTF-8",
+            ))
         }
         SourceTypeDefinitionKind::Array { element_oid } => {
             let element = definition_by_oid(*element_oid, catalog, version)?;

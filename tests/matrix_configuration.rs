@@ -111,8 +111,45 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "source")
             .count(),
-        9
+        12
     );
+    let postgres_builtin_capture_suites: BTreeSet<_> = suites
+        .iter()
+        .filter(|suite| {
+            suite["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("postgresql_") && id.ends_with(".builtins"))
+        })
+        .map(|suite| suite["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        postgres_builtin_capture_suites,
+        BTreeSet::from([
+            "postgresql_15.builtins",
+            "postgresql_16.builtins",
+            "postgresql_17.builtins",
+        ])
+    );
+    for suite in suites.iter().filter(|suite| {
+        suite["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("postgresql_") && id.ends_with(".builtins"))
+    }) {
+        assert_eq!(suite["mode"], "Live");
+        assert_eq!(suite["category"], "source");
+        assert!(
+            suite["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|argument| argument == "live_builtin_capture")
+        );
+        assert!(suite["args"].as_array().unwrap().iter().any(|argument| {
+            argument
+                .as_str()
+                .is_some_and(|argument| argument.ends_with("_all_builtin_types_capture"))
+        }));
+    }
     let all_mysql_type_capture_suites: BTreeSet<_> = suites
         .iter()
         .filter(|suite| {

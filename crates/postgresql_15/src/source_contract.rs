@@ -6,7 +6,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{
     ColumnDatum, Datum, LogicalValue, Operation, SourceContractError, SourceCursor,
-    ValidatedTransaction,
+    SourceRepresentationFormat, ValidatedTransaction,
 };
 
 pub(crate) fn validate(transaction: &ValidatedTransaction) -> Result<(), SourceContractError> {
@@ -123,12 +123,28 @@ fn validate_image(
             "generated PostgreSQL columns are unsupported",
         )?;
         validate_presence(change.operation, is_before, column)?;
-        validate_native_type_for_version(version, &column.native_type)?;
-        if let Datum::Value(value) = &column.datum {
-            ensure(
-                logical_matches_native(value, &column.native_type, version),
-                "PostgreSQL native/logical type mismatch",
-            )?;
+        match &column.datum {
+            Datum::SourceRepresentationEnvelope(envelope) => {
+                validate_representation(
+                    change,
+                    column,
+                    envelope,
+                    &change.source_cursor,
+                    oid,
+                    digest,
+                    version,
+                )?;
+            }
+            Datum::Value(value) => {
+                validate_native_type_for_version(version, &column.native_type)?;
+                if !logical_matches_native(value, &column.native_type, version) {
+                    return Err(SourceContractError::new(format!(
+                        "PostgreSQL column '{}' declared as '{}' does not match its logical value type",
+                        column.name, column.native_type
+                    )));
+                }
+            }
+            _ => validate_native_type_for_version(version, &column.native_type)?,
         }
     }
     Ok(())
@@ -183,11 +199,57 @@ fn validate_native_type_for_version(
             | "macaddr"
             | "macaddr8"
             | "xml"
+            | "name"
+            | "\"char\""
+            | "money"
+            | "point"
+            | "line"
+            | "lseg"
+            | "box"
+            | "path"
+            | "polygon"
+            | "circle"
+            | "tsvector"
+            | "tsquery"
+            | "oidvector"
+            | "int2vector"
+            | "tid"
+            | "oid"
+            | "xid"
+            | "xid8"
+            | "cid"
+            | "pg_lsn"
+            | "pg_snapshot"
+            | "txid_snapshot"
+            | "regproc"
+            | "regprocedure"
+            | "regoper"
+            | "regoperator"
+            | "regclass"
+            | "regtype"
+            | "regconfig"
+            | "regdictionary"
+            | "regnamespace"
+            | "regrole"
+            | "regcollation"
+            | "int4range"
+            | "int8range"
+            | "numrange"
+            | "tsrange"
+            | "tstzrange"
+            | "daterange"
+            | "int4multirange"
+            | "int8multirange"
+            | "nummultirange"
+            | "tsmultirange"
+            | "tstzmultirange"
+            | "datemultirange"
             | "jsonb"
             | "json"
             | "timestamp without time zone"
             | "timestamp with time zone"
-    ) || valid_character(&native)
+    ) || native.ends_with("[]")
+        || valid_character(&native)
         || valid_parameterized_numeric(&native)
         || valid_parameterized_timestamp(&native)
         || valid_parameterized_time(&native)
@@ -197,6 +259,79 @@ fn validate_native_type_for_version(
         || (native.starts_with("enum(")
             && crate::type_mapping::validate_native_type_for_version(version, native_type).is_ok());
     ensure(supported, "unsupported PostgreSQL native type")
+}
+
+fn validate_representation(
+    change: &change_event::RowChange,
+    column: &ColumnDatum,
+    envelope: &change_event::SourceRepresentationEnvelope,
+    cursor: &SourceCursor,
+    relation_oid: &str,
+    catalog_digest: Option<&str>,
+    version: &str,
+) -> Result<(), SourceContractError> {
+    let context = &envelope.context;
+    let metadata = &context.type_metadata;
+    let type_oid = metadata
+        .get("column_oid")
+        .and_then(|value| value.parse::<u32>().ok());
+    let type_schema = metadata.get("type_schema").map(String::as_str);
+    let type_name = metadata.get("type_name").map(String::as_str);
+    let expected_identity = type_oid
+        .zip(type_schema.zip(type_name))
+        .map(|(oid, (schema, name))| format!("postgresql.pg_type.v1:{oid}:{schema}.{name}"));
+    let definition = metadata
+        .get("type_definition")
+        .and_then(|definition| serde_json::from_str::<serde_json::Value>(definition).ok());
+    let definition_digest_matches = definition
+        .as_ref()
+        .and_then(|definition| definition.get("definition_digest"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|digest| format!("sha256:{digest}") == context.source_type_definition_digest);
+    let definition_identity_matches = definition.as_ref().is_some_and(|definition| {
+        definition.get("oid").and_then(serde_json::Value::as_u64) == type_oid.map(u64::from)
+            && definition.get("schema").and_then(serde_json::Value::as_str) == type_schema
+            && definition.get("name").and_then(serde_json::Value::as_str) == type_name
+    });
+    ensure(
+        context.connector.kind == "postgresql"
+            && context.connector.version == version
+            && context.server_build.product == "postgresql"
+            && context
+                .server_build
+                .version
+                .starts_with(&format!("{version}."))
+            && context.protocol == "pgoutput.v1"
+            && context.format == SourceRepresentationFormat::Text
+            && envelope.encoding == "UTF-8"
+            && context.source_cursor == *cursor
+            && metadata.get("relation_oid").map(String::as_str) == Some(relation_oid)
+            && metadata.get("relation_schema").map(String::as_str) == Some(change.schema.as_str())
+            && metadata.get("relation_name").map(String::as_str) == Some(change.table.as_str())
+            && metadata.get("column_name").map(String::as_str) == Some(column.name.as_str())
+            && type_schema == Some("pg_catalog")
+            && type_oid.is_some_and(|oid| oid > 0)
+            && metadata
+                .get("type_modifier")
+                .is_some_and(|modifier| modifier.parse::<i32>().is_ok())
+            && metadata.get("native_type").map(String::as_str) == Some(column.native_type.as_str())
+            && metadata.get("type_definition_digest").map(String::as_str)
+                == Some(context.source_type_definition_digest.as_str())
+            && metadata.get("source_catalog_digest").is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            && metadata.get("source_catalog_digest").map(String::as_str) == catalog_digest
+            && metadata.get("text_output_profile").map(String::as_str)
+                == Some("pgoutput-v1/text/UTF8")
+            && metadata.get("session.search_path").map(String::as_str) == Some("pg_catalog")
+            && metadata
+                .get("environment.lc_monetary")
+                .is_some_and(|locale| !locale.is_empty())
+            && definition_digest_matches
+            && definition_identity_matches
+            && expected_identity.as_deref() == Some(context.source_type_identity.as_str()),
+        "PostgreSQL source representation context does not match its checked built-in column",
+    )
 }
 
 fn valid_character(native: &str) -> bool {
@@ -263,6 +398,16 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str
             bits: 64,
             ..
         } => native == "bigint",
+        LogicalValue::Integer {
+            signed: false,
+            bits: 32,
+            ..
+        } => matches!(native.as_str(), "oid" | "xid" | "cid"),
+        LogicalValue::Integer {
+            signed: false,
+            bits: 64,
+            ..
+        } => native == "xid8",
         LogicalValue::Decimal { unscaled, .. } => {
             if !valid_parameterized_numeric(&native) {
                 false
@@ -275,7 +420,11 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str
         LogicalValue::Float { bits: 32, .. } => native == "real",
         LogicalValue::Float { bits: 64, .. } => native == "double precision",
         LogicalValue::Text { charset, .. } => {
-            charset == "UTF8" && (native == "text" || valid_character(&native))
+            charset == "UTF8"
+                && (native == "text"
+                    || native == "name"
+                    || native == "\"char\""
+                    || valid_character(&native))
         }
         LogicalValue::Binary { .. } => native == "bytea",
         LogicalValue::Date { .. } => native == "date",

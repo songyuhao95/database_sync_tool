@@ -1,6 +1,6 @@
 use crate::{Result, catalog, decoder::Decoder, invalid};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use change_event::{Source, ValidatedTransaction};
+use change_event::{ServerBuildIdentity, Source, ValidatedTransaction};
 use pg_walstream::{
     CancellationToken, LogicalReplicationParser, PgReplicationConnection, ReplicationSlotOptions,
     SlotType,
@@ -118,7 +118,7 @@ pub async fn replication_for_version(config: Config, expected_major: u16) -> Res
     sqlx::query("SET statement_timeout = '10s'")
         .execute(&mut sql)
         .await?;
-    let settings=sqlx::query("SELECT current_setting('server_version_num')::integer AS version,current_setting('wal_level') AS wal_level,current_setting('server_encoding') AS encoding,(SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid")
+    let settings=sqlx::query("SELECT current_setting('server_version_num')::integer AS version,current_setting('server_version') AS version_text,version() AS build,current_setting('wal_level') AS wal_level,current_setting('server_encoding') AS encoding,current_setting('lc_monetary') AS lc_monetary,(SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid")
         .fetch_one(&mut sql).await?;
     let version: i32 = settings.try_get("version")?;
     if version / 10000 != i32::from(expected_major)
@@ -129,7 +129,7 @@ pub async fn replication_for_version(config: Config, expected_major: u16) -> Res
             "requires PostgreSQL 15, 16, or 17, wal_level=logical and UTF8 database encoding",
         ));
     }
-    let tables = catalog::load(&mut sql, &config.publication, expected_major).await?;
+    let loaded_catalog = catalog::load(&mut sql, &config.publication, expected_major).await?;
     let slot=sqlx::query("SELECT database,plugin,slot_type,active,temporary,wal_status,confirmed_flush_lsn::text AS confirmed FROM pg_replication_slots WHERE slot_name=$1")
         .bind(&config.slot).fetch_optional(&mut sql).await?;
     if config.create_slot && slot.is_some() {
@@ -195,6 +195,12 @@ pub async fn replication_for_version(config: Config, expected_major: u16) -> Res
             URL_SAFE_NO_PAD.encode(config.database.as_bytes())
         ),
     };
+    let server_build = ServerBuildIdentity::new(
+        "postgresql",
+        "community",
+        settings.try_get::<String, _>("version_text")?,
+        settings.try_get::<String, _>("build")?,
+    );
     if let Some(expected) = &config.expected_source_id
         && expected != &source.id
     {
@@ -208,6 +214,7 @@ pub async fn replication_for_version(config: Config, expected_major: u16) -> Res
         "SET TimeZone='UTC'",
         "SET bytea_output='hex'",
         "SET extra_float_digits=3",
+        "SET search_path='pg_catalog'",
         "SET row_security=off",
     ] {
         connection.exec(setting)?;
@@ -258,8 +265,11 @@ pub async fn replication_for_version(config: Config, expected_major: u16) -> Res
         parser: LogicalReplicationParser::with_protocol_version(1),
         decoder: Decoder::new(
             source,
+            server_build,
+            settings.try_get::<String, _>("lc_monetary")?,
             config.database,
-            tables,
+            loaded_catalog.tables,
+            loaded_catalog.type_names,
             config.max_transaction_bytes,
         ),
         start,

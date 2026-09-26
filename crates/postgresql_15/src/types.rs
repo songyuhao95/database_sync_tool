@@ -6,9 +6,14 @@ pub(crate) fn supported(oid: u32) -> bool {
     matches!(
         oid,
         16 | 17
+            | 18
+            | 19
             | 20
             | 21
             | 23
+            | 26
+            | 28
+            | 29
             | 25
             | 114
             | 142
@@ -31,6 +36,7 @@ pub(crate) fn supported(oid: u32) -> bool {
             | 1700
             | 2950
             | 3802
+            | 5069
     )
 }
 #[cfg(test)]
@@ -48,7 +54,7 @@ fn decode_for_version(version: &str, oid: u32, bytes: &[u8]) -> Result<V> {
                 _ => return Err(invalid("invalid PostgreSQL boolean")),
             },
         },
-        20 | 21 | 23 => {
+        20 | 21 | 23 | 26 | 28 | 29 => {
             let value = text.parse::<i64>()?;
             let bits = match oid {
                 20 => 64,
@@ -56,11 +62,16 @@ fn decode_for_version(version: &str, oid: u32, bytes: &[u8]) -> Result<V> {
                 _ => 32,
             };
             V::Integer {
-                signed: true,
+                signed: matches!(oid, 20 | 21 | 23),
                 bits,
                 value: value.to_string(),
             }
         }
+        5069 => V::Integer {
+            signed: false,
+            bits: 64,
+            value: text.parse::<u64>()?.to_string(),
+        },
         1700 => {
             let (unscaled, scale) = decimal(text)?;
             V::Decimal { unscaled, scale }
@@ -73,7 +84,7 @@ fn decode_for_version(version: &str, oid: u32, bytes: &[u8]) -> Result<V> {
             bits: 64,
             ieee754_hex: format!("{:016x}", text.parse::<f64>()?.to_bits()),
         },
-        25 | 1042 | 1043 => V::Text {
+        18 | 19 | 25 | 1042 | 1043 => V::Text {
             charset: "UTF8".into(),
             bytes_base64url: URL_SAFE_NO_PAD.encode(bytes),
             text: Some(text.into()),
@@ -591,7 +602,11 @@ fn bit_string(text: &str) -> Result<V> {
     Ok(V::BitString {
         bytes_base64url: URL_SAFE_NO_PAD.encode(bytes),
         bit_length,
-        padding: change_event::BitPadding::Zero,
+        padding: if bit_length.is_multiple_of(8) {
+            change_event::BitPadding::None
+        } else {
+            change_event::BitPadding::Zero
+        },
         bit_order: change_event::BitOrder::MsbFirst,
     })
 }
@@ -612,8 +627,8 @@ fn network(oid: u32, text: &str) -> Result<V> {
         return Err(invalid("invalid PostgreSQL network value"));
     }
     let family = match oid {
-        774 => "macaddr",
-        829 => "macaddr8",
+        774 => "macaddr8",
+        829 => "macaddr",
         _ if address.contains(':') => "ipv6",
         _ => "ipv4",
     };
@@ -840,8 +855,32 @@ mod tests {
         assert!(supported(1186));
         assert!(supported(1266));
         assert!(matches!(
+            decode(26, b"4294967295").unwrap(),
+            V::Integer { signed: false, bits: 32, value } if value == "4294967295"
+        ));
+        assert!(matches!(
+            decode(5069, b"18446744073709551615").unwrap(),
+            V::Integer { signed: false, bits: 64, value } if value == "18446744073709551615"
+        ));
+        assert!(matches!(
+            decode(829, b"08:00:2b:01:02:03").unwrap(),
+            V::Network { family, .. } if family == "macaddr"
+        ));
+        assert!(matches!(
+            decode(774, b"08:00:2b:01:02:03:04:05").unwrap(),
+            V::Network { family, .. } if family == "macaddr8"
+        ));
+        assert!(matches!(
             decode(1560, b"101").unwrap(),
             V::BitString { bit_length: 3, .. }
+        ));
+        assert!(matches!(
+            decode(1560, b"10100000").unwrap(),
+            V::BitString {
+                bit_length: 8,
+                padding: change_event::BitPadding::None,
+                ..
+            }
         ));
         assert!(matches!(
             decode(869, b"127.0.0.1/32").unwrap(),
