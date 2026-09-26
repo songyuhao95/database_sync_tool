@@ -258,7 +258,15 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str
             bits: 64,
             ..
         } => native == "bigint",
-        LogicalValue::Decimal { .. } => valid_parameterized_numeric(&native),
+        LogicalValue::Decimal { unscaled, .. } => {
+            if !valid_parameterized_numeric(&native) {
+                false
+            } else if matches!(unscaled.as_str(), "Infinity" | "-Infinity") {
+                matches!(native.as_str(), "numeric" | "decimal")
+            } else {
+                true
+            }
+        }
         LogicalValue::Float { bits: 32, .. } => native == "real",
         LogicalValue::Float { bits: 64, .. } => native == "double precision",
         LogicalValue::Text { charset, .. } => {
@@ -396,4 +404,34 @@ fn ensure(condition: bool, message: &str) -> Result<(), SourceContractError> {
     condition
         .then_some(())
         .ok_or_else(|| SourceContractError::new(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logical_matches_native;
+    use change_event::LogicalValue;
+
+    #[test]
+    fn numeric_specials_follow_postgresql_typmod_rules() {
+        for (unscaled, expected_unconstrained, expected_bounded) in [
+            ("NaN", true, true),
+            ("Infinity", true, false),
+            ("-Infinity", true, false),
+        ] {
+            let value = LogicalValue::Decimal {
+                unscaled: unscaled.into(),
+                scale: 0,
+            };
+            assert_eq!(
+                logical_matches_native(&value, "numeric", "17"),
+                expected_unconstrained,
+                "unconstrained numeric: {unscaled}"
+            );
+            assert_eq!(
+                logical_matches_native(&value, "numeric(10,0)", "17"),
+                expected_bounded,
+                "bounded numeric: {unscaled}"
+            );
+        }
+    }
 }

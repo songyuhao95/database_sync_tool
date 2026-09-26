@@ -340,6 +340,10 @@ pub enum SourceRepresentationFormat {
 pub struct SourceRepresentationContext {
     pub connector: crate::ConnectorIdentity,
     pub server_build: crate::ServerBuildIdentity,
+    /// Connector-owned opaque identity; it may encode physical IDs/modifiers
+    /// and need not equal the display form in RawValueCarrier.native_type.
+    /// The connector must derive this identity and its digest from one source
+    /// type definition.
     pub source_type_identity: String,
     pub source_type_definition_digest: String,
     pub protocol: String,
@@ -586,6 +590,9 @@ impl RawValueCarrier {
         reversible: bool,
     ) -> Result<Self, RawValueCarrierError> {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        if self.source_definition_digest != context.source_type_definition_digest {
+            return Err(RawValueCarrierError::SourceDefinitionDigestMismatch);
+        }
         let bytes = URL_SAFE_NO_PAD
             .decode(&self.raw_bytes_base64url)
             .map_err(|_| RawValueCarrierError::InvalidBytes)?;
@@ -623,6 +630,9 @@ impl RawValueCarrier {
                 context
                     .validate()
                     .map_err(|_| RawValueCarrierError::InvalidEvidence)?;
+                if self.source_definition_digest != context.source_type_definition_digest {
+                    return Err(RawValueCarrierError::SourceDefinitionDigestMismatch);
+                }
                 if u64::try_from(bytes.len()).ok() != Some(length) {
                     return Err(RawValueCarrierError::PayloadLengthMismatch);
                 }
@@ -661,6 +671,7 @@ pub enum RawValueCarrierError {
     MissingEvidence { field: &'static str },
     InvalidBytes,
     InvalidEvidence,
+    SourceDefinitionDigestMismatch,
     PayloadLengthMismatch,
     PayloadDigestMismatch,
 }
@@ -671,6 +682,9 @@ impl RawValueCarrierError {
             Self::MissingEvidence { .. } => "raw_value_carrier.missing_evidence",
             Self::InvalidBytes => "raw_value_carrier.invalid_bytes",
             Self::InvalidEvidence => "raw_value_carrier.invalid_evidence",
+            Self::SourceDefinitionDigestMismatch => {
+                "raw_value_carrier.source_definition_digest_mismatch"
+            }
             Self::PayloadLengthMismatch => "raw_value_carrier.payload_length_mismatch",
             Self::PayloadDigestMismatch => "raw_value_carrier.payload_digest_mismatch",
         }
@@ -689,6 +703,9 @@ impl std::fmt::Display for RawValueCarrierError {
             Self::InvalidEvidence => {
                 formatter.write_str("raw value carrier evidence is incomplete or invalid")
             }
+            Self::SourceDefinitionDigestMismatch => formatter.write_str(
+                "raw value carrier type definition digest does not match its source context",
+            ),
             Self::PayloadLengthMismatch => {
                 formatter.write_str("raw value carrier payload length does not match")
             }

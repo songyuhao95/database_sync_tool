@@ -6,8 +6,8 @@
 //! descriptions for one already-existing source/target field binding.
 
 use crate::{
-    BitOrder, BitPadding, ChangeTransaction, Datum, JsonValue, LogicalValue, Operation, RowChange,
-    SpatialFormat, TargetCapabilityFailure, ValidatedTransaction,
+    BitOrder, BitPadding, ChangeTransaction, Datum, JsonValue, LogicalValue, Operation,
+    RawValueCarrier, RowChange, SpatialFormat, TargetCapabilityFailure, ValidatedTransaction,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -899,7 +899,10 @@ impl LogicalType {
                 },
             ) => {
                 let digits = unscaled.strip_prefix('-').unwrap_or(unscaled);
-                if matches!(unscaled.as_str(), "NaN" | "Infinity" | "-Infinity") {
+                if unscaled == "NaN" {
+                    return *value_scale == 0;
+                }
+                if matches!(unscaled.as_str(), "Infinity" | "-Infinity") {
                     return false;
                 }
                 let scale_matches = *scale == *value_scale || (*scale < 0 && *value_scale == 0);
@@ -1151,14 +1154,29 @@ impl LogicalType {
                     && native_type == &carrier.native_type
                     && source_definition_digest == &carrier.source_definition_digest
                     && encoding == &carrier.encoding
-                    && carrier.reversible != Some(false)
+                    && raw_carrier_is_reversible(carrier)
             }
-            (Self::Opaque { .. }, LogicalValue::Raw { carrier }) => {
-                carrier.reversible != Some(false)
+            (
+                Self::Opaque {
+                    source_type,
+                    format,
+                },
+                LogicalValue::Raw { carrier },
+            ) => {
+                source_type == &carrier.native_type
+                    && format == &carrier.encoding
+                    && raw_carrier_is_reversible(carrier)
             }
             _ => false,
         }
     }
+}
+
+fn raw_carrier_is_reversible(carrier: &RawValueCarrier) -> bool {
+    carrier.reversible == Some(true)
+        && carrier.source_context.as_deref().is_some_and(|context| {
+            context.source_type_definition_digest == carrier.source_definition_digest
+        })
 }
 
 fn fractional_microseconds_match(microseconds: u32, precision: u8) -> bool {

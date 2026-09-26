@@ -1,6 +1,9 @@
 use super::*;
 use std::collections::BTreeMap;
 
+const SOURCE_TYPE_DEFINITION_DIGEST: &str =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 fn cursor(display: &str) -> SourceCursor {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let (file, position) = display.rsplit_once(':').unwrap();
@@ -199,6 +202,30 @@ fn raw_value_carrier_requires_stable_source_evidence() {
         carrier.reversible.is_none(),
         "legacy carrier must not imply value recovery"
     );
+    let legacy_value = LogicalValue::Raw {
+        carrier: carrier.clone(),
+    };
+    assert!(
+        legacy_value.validate().is_ok(),
+        "legacy JSON remains readable"
+    );
+    assert!(
+        !LogicalType::raw(
+            "postgresql.hstore.v1",
+            "hstore",
+            "sha256:definition-1",
+            "binary",
+        )
+        .matches_value(&legacy_value),
+        "legacy carrier without recoverability evidence cannot qualify as a complete value"
+    );
+    assert!(
+        !LogicalType::Opaque {
+            source_type: "hstore".into(),
+            format: "binary".into(),
+        }
+        .matches_value(&legacy_value)
+    );
     assert_eq!(carrier.raw_bytes().unwrap(), [0, 255, 1]);
     let encoded = serde_json::to_vec(&carrier).unwrap();
     let decoded: RawValueCarrier = serde_json::from_slice(&encoded).unwrap();
@@ -212,12 +239,12 @@ fn raw_value_carrier_requires_stable_source_evidence() {
     let evidenced = RawValueCarrier::new(
         "postgresql.hstore.v1",
         "hstore",
-        "sha256:definition-1",
+        SOURCE_TYPE_DEFINITION_DIGEST,
         "binary",
         URL_SAFE_NO_PAD.encode([0, 255, 1]),
         None::<String>,
     )
-    .with_source_context(representation_context(postgresql_cursor()), false)
+    .with_source_context(hstore_representation_context(postgresql_cursor()), false)
     .expect("payload evidence should be recorded");
     evidenced
         .validate()
@@ -237,6 +264,75 @@ fn raw_value_carrier_requires_stable_source_evidence() {
         corrupted.validate().unwrap_err().code(),
         "raw_value_carrier.payload_digest_mismatch"
     );
+
+    let reversible = RawValueCarrier::new(
+        "postgresql.hstore.v1",
+        "hstore",
+        SOURCE_TYPE_DEFINITION_DIGEST,
+        "binary",
+        URL_SAFE_NO_PAD.encode([0, 255, 1]),
+        Some("\"a\"=>\"b\""),
+    )
+    .with_source_context(hstore_representation_context(postgresql_cursor()), true)
+    .expect("recoverability evidence should be recorded");
+    let reversible_value = LogicalValue::Raw {
+        carrier: reversible,
+    };
+    assert!(reversible_value.validate().is_ok());
+    assert!(
+        LogicalType::raw(
+            "postgresql.hstore.v1",
+            "hstore",
+            SOURCE_TYPE_DEFINITION_DIGEST,
+            "binary",
+        )
+        .matches_value(&reversible_value)
+    );
+    assert!(
+        LogicalType::Opaque {
+            source_type: "hstore".into(),
+            format: "binary".into(),
+        }
+        .matches_value(&reversible_value)
+    );
+    assert!(
+        !LogicalType::Opaque {
+            source_type: "jsonb".into(),
+            format: "binary".into(),
+        }
+        .matches_value(&reversible_value)
+    );
+    assert!(
+        !LogicalType::Opaque {
+            source_type: "hstore".into(),
+            format: "text".into(),
+        }
+        .matches_value(&reversible_value)
+    );
+
+    let mut mismatched_fingerprint = match &reversible_value {
+        LogicalValue::Raw { carrier } => carrier.clone(),
+        _ => unreachable!(),
+    };
+    mismatched_fingerprint.source_definition_digest = "sha256:bbbb".into();
+    assert_eq!(
+        mismatched_fingerprint.validate().unwrap_err().code(),
+        "raw_value_carrier.source_definition_digest_mismatch"
+    );
+    assert_eq!(
+        RawValueCarrier::new(
+            "postgresql.hstore.v1",
+            "hstore",
+            "sha256:definition-1",
+            "binary",
+            URL_SAFE_NO_PAD.encode([0, 255, 1]),
+            None::<String>,
+        )
+        .with_source_context(hstore_representation_context(postgresql_cursor()), true)
+        .unwrap_err()
+        .code(),
+        "raw_value_carrier.source_definition_digest_mismatch"
+    );
 }
 
 fn representation_context(cursor: SourceCursor) -> SourceRepresentationContext {
@@ -244,7 +340,7 @@ fn representation_context(cursor: SourceCursor) -> SourceRepresentationContext {
         connector: ConnectorIdentity::new("postgresql", "17"),
         server_build: ServerBuildIdentity::new("PostgreSQL", "community", "17.0", "17.0-build-1"),
         source_type_identity: "pg_catalog.numeric/1700/typmod:-1".into(),
-        source_type_definition_digest: format!("sha256:{}", "a".repeat(64)),
+        source_type_definition_digest: SOURCE_TYPE_DEFINITION_DIGEST.into(),
         protocol: "pgoutput-v1".into(),
         format: SourceRepresentationFormat::Binary,
         type_metadata: BTreeMap::from([
@@ -253,6 +349,13 @@ fn representation_context(cursor: SourceCursor) -> SourceRepresentationContext {
         ]),
         source_cursor: cursor,
     }
+}
+
+fn hstore_representation_context(cursor: SourceCursor) -> SourceRepresentationContext {
+    let mut context = representation_context(cursor);
+    context.source_type_identity = "pg_catalog.hstore".into();
+    context.type_metadata = BTreeMap::from([("oid".into(), "12345".into())]);
+    context
 }
 
 #[test]
@@ -332,7 +435,13 @@ fn exact_numeric_values_preserve_unbounded_precision_signed_scale_and_specials()
             scale: 0,
         })
     );
-    for special in ["NaN", "Infinity", "-Infinity"] {
+    assert!(
+        LogicalType::decimal(10, 0).matches_value(&LogicalValue::Decimal {
+            unscaled: "NaN".into(),
+            scale: 0,
+        })
+    );
+    for special in ["Infinity", "-Infinity"] {
         assert!(
             !LogicalType::decimal(10, 0).matches_value(&LogicalValue::Decimal {
                 unscaled: special.into(),

@@ -134,8 +134,9 @@ fn validate_column(column: &ColumnDatum) -> Result<(), SourceContractError> {
             };
             expected_bits == *bits && *signed == !native.contains(" unsigned")
         }
-        LogicalValue::Decimal { scale, .. } => {
-            matches!(base, "decimal" | "numeric")
+        LogicalValue::Decimal { unscaled, scale } => {
+            !matches!(unscaled.as_str(), "NaN" | "Infinity" | "-Infinity")
+                && matches!(base, "decimal" | "numeric")
                 && decimal_scale(&native)
                     .is_none_or(|declared| i32::try_from(declared).ok() == Some(*scale))
         }
@@ -319,4 +320,36 @@ fn ensure(condition: bool, message: &str) -> Result<(), SourceContractError> {
     condition
         .then_some(())
         .ok_or_else(|| SourceContractError::new(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_column;
+    use change_event::{ColumnDatum, Datum, LogicalValue};
+
+    fn decimal_column(unscaled: &str) -> ColumnDatum {
+        ColumnDatum {
+            ordinal: 0,
+            name: "amount".into(),
+            native_type: "decimal(10,0)".into(),
+            primary_key_ordinal: None,
+            generated: false,
+            collation: None,
+            datum: Datum::Value(LogicalValue::Decimal {
+                unscaled: unscaled.into(),
+                scale: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn mysql_decimal_contract_rejects_non_finite_decimal_values() {
+        assert!(validate_column(&decimal_column("123")).is_ok());
+        for special in ["NaN", "Infinity", "-Infinity"] {
+            assert!(
+                validate_column(&decimal_column(special)).is_err(),
+                "MySQL DECIMAL cannot represent {special}"
+            );
+        }
+    }
 }

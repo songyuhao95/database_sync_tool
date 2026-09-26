@@ -263,8 +263,12 @@ A lossless database-independent representation of one captured column value, inc
 _Avoid_: JSON value, stringified value
 
 **Source Representation Envelope**:
-A Datum alternative to Logical Value that records the exact text or binary payload emitted by a Source's change protocol, source connector/build, source type definition identity and digest, protocol format, type metadata, payload length and digest, and Source Cursor. It states whether semantic recovery is reversible; it does not by itself prove the original database value can be reconstructed.
+A Datum alternative to Logical Value that records the exact text or binary payload emitted by a Source's change protocol, source connector/build, source type definition identity and digest, protocol format, type metadata, payload length and digest, and Source Cursor. Its integrity proves byte preservation only; it makes no claim that the original database value can be reconstructed.
 _Avoid_: Logical Value, raw database value
+
+**Raw Value Carrier**:
+An encoded representation associated with a native type when no portable Logical Value exists. It counts as complete only when a qualified reversible codec and its matching source type definition are explicit; absent or false recoverability evidence is insufficient.
+_Avoid_: Source Representation Envelope, value-complete bytes
 
 **Representation-only Preservation**:
 The capture, transfer, storage, and read-back of a Source Representation Envelope without asserting recovery of the source-native value or its behavior at a Sink.
