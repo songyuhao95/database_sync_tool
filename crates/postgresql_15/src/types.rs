@@ -1,6 +1,10 @@
+use crate::type_mapping::{SourceTypeCatalog, SourceTypeDefinitionKind};
 use crate::{Result, invalid};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use change_event::{JsonEntry, JsonValue as J, LogicalValue as V, TemporalInfinityKind};
+use change_event::{
+    JsonEntry, JsonValue as J, LogicalValue as V, MapEntry, SpatialFormat, StructuredField,
+    TemporalInfinityKind,
+};
 
 pub(crate) fn supported(oid: u32) -> bool {
     matches!(
@@ -187,6 +191,727 @@ pub(crate) fn decode_column_for_version(
         return Ok(V::Enum { label });
     }
     decode_for_version(version, oid, bytes)
+}
+
+pub(crate) fn decode_catalog_column_for_version(
+    version: &str,
+    catalog: &SourceTypeCatalog,
+    oid: u32,
+    native_type: &str,
+    bytes: &[u8],
+) -> Result<V> {
+    decode_catalog_value(version, catalog, oid, native_type, bytes, 0)
+}
+
+fn decode_catalog_value(
+    version: &str,
+    catalog: &SourceTypeCatalog,
+    oid: u32,
+    native_type: &str,
+    bytes: &[u8],
+    depth: usize,
+) -> Result<V> {
+    if depth > 64 {
+        return Err(invalid(
+            "PostgreSQL recursive value exceeds the 64-level limit",
+        ));
+    }
+    let definition = catalog
+        .types
+        .iter()
+        .find(|definition| definition.oid == oid)
+        .ok_or_else(|| invalid(format!("PostgreSQL type catalog is missing OID {oid}")))?;
+    match &definition.kind {
+        SourceTypeDefinitionKind::Builtin { .. } => {
+            decode_column_for_version(version, oid, native_type, bytes)
+        }
+        SourceTypeDefinitionKind::Enum { labels } => {
+            let label = std::str::from_utf8(bytes)?.to_owned();
+            if !labels.iter().any(|known| known == &label) {
+                return Err(invalid(format!(
+                    "PostgreSQL enum {}.{} contains an undeclared label",
+                    definition.schema, definition.name
+                )));
+            }
+            Ok(V::Enum { label })
+        }
+        SourceTypeDefinitionKind::Domain { base_oid, .. } => {
+            let base = catalog
+                .types
+                .iter()
+                .find(|item| item.oid == *base_oid)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "PostgreSQL domain {}.{} has a missing base type",
+                        definition.schema, definition.name
+                    ))
+                })?;
+            let value =
+                decode_catalog_value(version, catalog, *base_oid, &base.name, bytes, depth + 1)?;
+            Ok(V::Domain {
+                value: Box::new(value),
+            })
+        }
+        SourceTypeDefinitionKind::Composite { fields } => {
+            let values = parse_record(bytes).map_err(|error| {
+                invalid(format!(
+                    "PostgreSQL composite {}.{} could not be decoded: {error}",
+                    definition.schema, definition.name
+                ))
+            })?;
+            if values.len() != fields.len() {
+                return Err(invalid(format!(
+                    "PostgreSQL composite {}.{} field count mismatch",
+                    definition.schema, definition.name
+                )));
+            }
+            let mut decoded = Vec::with_capacity(fields.len());
+            for (field, raw) in fields.iter().zip(values) {
+                let value = match raw {
+                    None => V::Null,
+                    Some(raw) => {
+                        let field_type = catalog
+                            .types
+                            .iter()
+                            .find(|item| item.oid == field.type_oid)
+                            .ok_or_else(|| {
+                                invalid(format!(
+                                    "PostgreSQL composite field {} has an unknown type OID",
+                                    field.name
+                                ))
+                            })?;
+                        decode_catalog_value(
+                            version,
+                            catalog,
+                            field.type_oid,
+                            &field_type.name,
+                            &raw,
+                            depth + 1,
+                        )?
+                    }
+                };
+                decoded.push(StructuredField {
+                    name: field.name.clone(),
+                    value,
+                });
+            }
+            Ok(V::Struct { fields: decoded })
+        }
+        SourceTypeDefinitionKind::Array {
+            element_oid,
+            delimiter,
+        } => {
+            let element_type = catalog
+                .types
+                .iter()
+                .find(|item| item.oid == *element_oid)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "PostgreSQL array {}.{} has an unknown element type",
+                        definition.schema, definition.name
+                    ))
+                })?;
+            let (tree, lower_bounds) = parse_array(bytes, *delimiter).map_err(|error| {
+                invalid(format!(
+                    "PostgreSQL array {}.{} could not be decoded: {error}",
+                    definition.schema, definition.name
+                ))
+            })?;
+            let (dimension_lengths, mut raw_values) = flatten_array(&tree)?;
+            let dimensions = u8::try_from(dimension_lengths.len())
+                .map_err(|_| invalid("PostgreSQL array dimension count exceeds 255"))?;
+            let lower_bounds = if dimension_lengths.is_empty() {
+                Vec::new()
+            } else {
+                lower_bounds.unwrap_or_else(|| vec![1; dimension_lengths.len()])
+            };
+            if lower_bounds.len() != dimension_lengths.len() {
+                return Err(invalid("PostgreSQL array bounds and dimensions disagree"));
+            }
+            let mut elements = Vec::with_capacity(raw_values.len());
+            for raw in raw_values.drain(..) {
+                elements.push(match raw {
+                    None => V::Null,
+                    Some(raw) => decode_catalog_value(
+                        version,
+                        catalog,
+                        *element_oid,
+                        &element_type.name,
+                        &raw,
+                        depth + 1,
+                    )?,
+                });
+            }
+            if dimensions <= 1 && lower_bounds.first().is_none_or(|bound| *bound == 1) {
+                Ok(V::Array { elements })
+            } else {
+                Ok(V::ArrayWithMetadata {
+                    elements,
+                    dimensions,
+                    lower_bounds,
+                    dimension_lengths,
+                })
+            }
+        }
+        SourceTypeDefinitionKind::Range { subtype_oid } => {
+            let subtype = catalog
+                .types
+                .iter()
+                .find(|item| item.oid == *subtype_oid)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "PostgreSQL range {}.{} has an unknown subtype",
+                        definition.schema, definition.name
+                    ))
+                })?;
+            decode_range(
+                version,
+                catalog,
+                *subtype_oid,
+                &subtype.name,
+                bytes,
+                depth + 1,
+            )
+        }
+        SourceTypeDefinitionKind::MultiRange { range_oid } => {
+            let range = catalog
+                .types
+                .iter()
+                .find(|item| item.oid == *range_oid)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "PostgreSQL multirange {}.{} has an unknown range type",
+                        definition.schema, definition.name
+                    ))
+                })?;
+            let SourceTypeDefinitionKind::Range { subtype_oid } = range.kind else {
+                return Err(invalid(
+                    "PostgreSQL multirange catalog entry does not refer to a range",
+                ));
+            };
+            let subtype = catalog
+                .types
+                .iter()
+                .find(|item| item.oid == subtype_oid)
+                .ok_or_else(|| invalid("PostgreSQL multirange subtype is missing"))?;
+            let text = std::str::from_utf8(bytes)?;
+            let body = text
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .ok_or_else(|| invalid("invalid PostgreSQL multirange text"))?;
+            let mut ranges = Vec::new();
+            for item in split_multirange(body)? {
+                ranges.push(decode_range(
+                    version,
+                    catalog,
+                    subtype_oid,
+                    &subtype.name,
+                    item.as_bytes(),
+                    depth + 1,
+                )?);
+            }
+            Ok(V::MultiRange { ranges })
+        }
+        SourceTypeDefinitionKind::Extension { extension, .. }
+            if extension.eq_ignore_ascii_case("hstore") && definition.name == "hstore" =>
+        {
+            decode_hstore(bytes)
+        }
+        SourceTypeDefinitionKind::Extension { extension, .. }
+            if extension.eq_ignore_ascii_case("postgis")
+                && matches!(definition.name.as_str(), "geometry" | "geography") =>
+        {
+            decode_postgis_ewkb(bytes)
+        }
+        SourceTypeDefinitionKind::Extension { .. } => Err(invalid(format!(
+            "PostgreSQL extension type {}.{} has no qualified semantic codec",
+            definition.schema, definition.name
+        ))),
+    }
+}
+
+fn parse_record(bytes: &[u8]) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut parser = TextParser::new(bytes);
+    parser.consume(b'(')?;
+    let mut fields = Vec::new();
+    if parser.peek() == Some(b')') {
+        parser.consume(b')')?;
+        parser.finish()?;
+        return Ok(fields);
+    }
+    loop {
+        let (value, quoted) = parser.token(b",)")?;
+        fields.push(if !quoted && value.is_empty() {
+            None
+        } else {
+            Some(value)
+        });
+        match parser.take()? {
+            b',' => continue,
+            b')' => break,
+            _ => unreachable!(),
+        }
+    }
+    parser.finish()?;
+    Ok(fields)
+}
+
+#[derive(Debug)]
+enum ArrayNode {
+    Branch(Vec<ArrayNode>),
+    Leaf(Option<Vec<u8>>),
+}
+
+fn parse_array(bytes: &[u8], delimiter: char) -> Result<(ArrayNode, Option<Vec<i32>>)> {
+    let delimiter = u8::try_from(delimiter as u32)
+        .map_err(|_| invalid("PostgreSQL array delimiter is not ASCII"))?;
+    let mut parser = TextParser::new(bytes);
+    let mut lower_bounds = Vec::new();
+    while parser.peek() == Some(b'[') {
+        parser.take()?;
+        let lower = parser.number_until(b':')?;
+        parser.consume(b':')?;
+        let upper = parser.number_until(b']')?;
+        parser.consume(b']')?;
+        let lower = lower.parse::<i32>()?;
+        let upper = upper.parse::<i32>()?;
+        let length = i64::from(upper) - i64::from(lower) + 1;
+        if !(0..=10_000_000).contains(&length) {
+            return Err(invalid("PostgreSQL array bound has invalid length"));
+        }
+        lower_bounds.push(lower);
+    }
+    let explicit_bounds = if lower_bounds.is_empty() {
+        None
+    } else {
+        Some(lower_bounds)
+    };
+    if explicit_bounds.is_some() {
+        parser.consume(b'=')?;
+    }
+    let tree = parse_array_level(&mut parser, delimiter)?;
+    parser.finish()?;
+    Ok((tree, explicit_bounds))
+}
+
+fn parse_array_level(parser: &mut TextParser<'_>, delimiter: u8) -> Result<ArrayNode> {
+    parser.consume(b'{')?;
+    let mut items = Vec::new();
+    if parser.peek() == Some(b'}') {
+        parser.take()?;
+        return Ok(ArrayNode::Branch(items));
+    }
+    loop {
+        items.push(if parser.peek() == Some(b'{') {
+            parse_array_level(parser, delimiter)?
+        } else {
+            let (value, quoted) = parser.token(&[delimiter, b'}'])?;
+            let null = !quoted && value.eq_ignore_ascii_case(b"NULL");
+            ArrayNode::Leaf(if null { None } else { Some(value) })
+        });
+        match parser.take()? {
+            value if value == delimiter => continue,
+            b'}' => break,
+            _ => unreachable!(),
+        }
+    }
+    Ok(ArrayNode::Branch(items))
+}
+
+type ArrayShape = Vec<u64>;
+type ArrayElements = Vec<Option<Vec<u8>>>;
+
+fn flatten_array(node: &ArrayNode) -> Result<(ArrayShape, ArrayElements)> {
+    match node {
+        ArrayNode::Leaf(value) => Ok((Vec::new(), vec![value.clone()])),
+        ArrayNode::Branch(children) if children.is_empty() => Ok((vec![0], Vec::new())),
+        ArrayNode::Branch(children) => {
+            let mut expected_shape: Option<Vec<u64>> = None;
+            let mut flat = Vec::new();
+            for child in children {
+                let (shape, values) = flatten_array(child)?;
+                if expected_shape.as_ref().is_some_and(|known| known != &shape) {
+                    return Err(invalid("PostgreSQL array value is ragged"));
+                }
+                expected_shape.get_or_insert(shape);
+                flat.extend(values);
+            }
+            let mut shape = vec![u64::try_from(children.len())?];
+            shape.extend(expected_shape.unwrap_or_default());
+            Ok((shape, flat))
+        }
+    }
+}
+
+fn decode_range(
+    version: &str,
+    catalog: &SourceTypeCatalog,
+    subtype_oid: u32,
+    subtype_name: &str,
+    bytes: &[u8],
+    depth: usize,
+) -> Result<V> {
+    let text = std::str::from_utf8(bytes)?;
+    if text == "empty" {
+        return Ok(V::Range {
+            empty: true,
+            lower: None,
+            upper: None,
+            lower_inclusive: false,
+            upper_inclusive: false,
+        });
+    }
+    let raw = text.as_bytes();
+    if raw.len() < 2 || !matches!(raw[0], b'[' | b'(') || !matches!(raw[raw.len() - 1], b']' | b')')
+    {
+        return Err(invalid("invalid PostgreSQL range text"));
+    }
+    let comma = find_unquoted(raw, b',')
+        .ok_or_else(|| invalid("PostgreSQL range is missing its separator"))?;
+    let lower_raw = unquote_range_bound(&raw[1..comma])?;
+    let upper_raw = unquote_range_bound(&raw[comma + 1..raw.len() - 1])?;
+    let lower = lower_raw
+        .map(|value| {
+            decode_catalog_value(
+                version,
+                catalog,
+                subtype_oid,
+                subtype_name,
+                &value,
+                depth + 1,
+            )
+            .map(Box::new)
+        })
+        .transpose()?;
+    let upper = upper_raw
+        .map(|value| {
+            decode_catalog_value(
+                version,
+                catalog,
+                subtype_oid,
+                subtype_name,
+                &value,
+                depth + 1,
+            )
+            .map(Box::new)
+        })
+        .transpose()?;
+    Ok(V::Range {
+        empty: false,
+        lower,
+        upper,
+        lower_inclusive: raw[0] == b'[',
+        upper_inclusive: raw[raw.len() - 1] == b']',
+    })
+}
+
+fn split_multirange(body: &str) -> Result<Vec<String>> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = body.as_bytes();
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut depth = 0_i32;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if byte == b'"' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        match byte {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            b',' if depth == 0 => {
+                result.push(body[start..index].trim().to_owned());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted || escaped || depth != 0 {
+        return Err(invalid("invalid PostgreSQL multirange quoting or bounds"));
+    }
+    result.push(body[start..].trim().to_owned());
+    Ok(result)
+}
+
+fn decode_hstore(bytes: &[u8]) -> Result<V> {
+    let mut parser = TextParser::new(bytes);
+    let mut entries = Vec::new();
+    if parser.peek().is_none() {
+        return Ok(V::Map { entries });
+    }
+    loop {
+        let (key, quoted) = parser.token(b"=")?;
+        if !quoted {
+            return Err(invalid("PostgreSQL hstore key must be quoted"));
+        }
+        parser.consume(b'=')?;
+        parser.consume(b'>')?;
+        let value = if parser.remaining().starts_with(b"NULL") {
+            parser.consume_bytes(b"NULL")?;
+            V::Null
+        } else {
+            let (value, quoted) = parser.token(b",")?;
+            if !quoted {
+                return Err(invalid("PostgreSQL hstore value must be quoted or NULL"));
+            }
+            text_value(&value)?
+        };
+        entries.push(MapEntry {
+            key: text_value(&key)?,
+            value,
+        });
+        if parser.peek().is_none() {
+            break;
+        }
+        parser.consume(b',')?;
+        parser.skip_spaces();
+    }
+    parser.finish()?;
+    Ok(V::Map { entries })
+}
+
+fn text_value(bytes: &[u8]) -> Result<V> {
+    let text = std::str::from_utf8(bytes)?;
+    Ok(V::Text {
+        charset: "UTF8".into(),
+        bytes_base64url: URL_SAFE_NO_PAD.encode(bytes),
+        text: Some(text.into()),
+    })
+}
+
+fn decode_postgis_ewkb(bytes: &[u8]) -> Result<V> {
+    if bytes.len() < 10
+        || !bytes.len().is_multiple_of(2)
+        || !bytes.iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(invalid("PostGIS text output is not valid hexadecimal EWKB"));
+    }
+    let raw = (0..bytes.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(std::str::from_utf8(&bytes[index..index + 2]).unwrap(), 16).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let little = match raw[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid("EWKB has an invalid byte-order marker")),
+    };
+    let word = |offset: usize| -> Result<u32> {
+        let bytes: [u8; 4] = raw
+            .get(offset..offset + 4)
+            .ok_or_else(|| invalid("truncated EWKB header"))?
+            .try_into()
+            .unwrap();
+        Ok(if little {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        })
+    };
+    let type_word = word(1)?;
+    let ewkb_has_z = type_word & 0x8000_0000 != 0;
+    let ewkb_has_m = type_word & 0x4000_0000 != 0;
+    let has_srid = type_word & 0x2000_0000 != 0;
+    let encoded_type = type_word & 0x1fff_ffff;
+    let iso_dimensions = encoded_type / 1000;
+    let geometry_id = if iso_dimensions == 0 {
+        encoded_type
+    } else {
+        encoded_type % 1000
+    };
+    let geometry_type = match geometry_id {
+        1 => "point",
+        2 => "linestring",
+        3 => "polygon",
+        4 => "multipoint",
+        5 => "multilinestring",
+        6 => "multipolygon",
+        7 => "geometrycollection",
+        _ => return Err(invalid("EWKB uses an unsupported geometry type")),
+    };
+    if iso_dimensions > 3 {
+        return Err(invalid("EWKB uses an unsupported coordinate dimension"));
+    }
+    let iso_has_z = matches!(iso_dimensions, 1 | 3);
+    let iso_has_m = matches!(iso_dimensions, 2 | 3);
+    let dimensions = 2 + u8::from(ewkb_has_z || iso_has_z) + u8::from(ewkb_has_m || iso_has_m);
+    let srid = if has_srid {
+        Some(word(5)? as i32)
+    } else {
+        None
+    };
+    Ok(V::Spatial {
+        format: SpatialFormat::Ewkb,
+        bytes_base64url: URL_SAFE_NO_PAD.encode(raw),
+        geometry_type: geometry_type.into(),
+        dimensions,
+        srid,
+        crs: None,
+    })
+}
+
+fn find_unquoted(bytes: &[u8], target: u8) -> Option<usize> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if byte == b'"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted && byte == target {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn unquote_range_bound(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.first() == Some(&b'"') {
+        let mut parser = TextParser::new(bytes);
+        let (value, quoted) = parser.token(&[])?;
+        parser.finish()?;
+        return if quoted {
+            Ok(Some(value))
+        } else {
+            Err(invalid("invalid quoted PostgreSQL range bound"))
+        };
+    }
+    Ok(Some(bytes.to_vec()))
+}
+
+struct TextParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+impl<'a> TextParser<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+    fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.pos..]
+    }
+    fn take(&mut self) -> Result<u8> {
+        let value = self
+            .peek()
+            .ok_or_else(|| invalid("unexpected end of PostgreSQL text value"))?;
+        self.pos += 1;
+        Ok(value)
+    }
+    fn consume(&mut self, expected: u8) -> Result<()> {
+        let offset = self.pos;
+        let actual = self.take()?;
+        if actual != expected {
+            return Err(invalid(format!(
+                "malformed PostgreSQL text value at offset {offset}: expected byte 0x{expected:02x}, found 0x{actual:02x}"
+            )));
+        }
+        Ok(())
+    }
+    fn consume_bytes(&mut self, expected: &[u8]) -> Result<()> {
+        if !self.remaining().starts_with(expected) {
+            return Err(invalid("malformed PostgreSQL text value"));
+        }
+        self.pos += expected.len();
+        Ok(())
+    }
+    fn skip_spaces(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.pos += 1;
+        }
+    }
+    fn number_until(&mut self, stop: u8) -> Result<String> {
+        let start = self.pos;
+        while self.peek().is_some_and(|byte| byte != stop) {
+            self.pos += 1;
+        }
+        if self.peek().is_none() {
+            return Err(invalid("truncated PostgreSQL array bounds"));
+        }
+        std::str::from_utf8(&self.bytes[start..self.pos])
+            .map(str::to_owned)
+            .map_err(Into::into)
+    }
+    fn token(&mut self, terminators: &[u8]) -> Result<(Vec<u8>, bool)> {
+        let quoted = self.peek() == Some(b'"');
+        if quoted {
+            self.take()?;
+        }
+        let mut value = Vec::new();
+        loop {
+            let Some(byte) = self.peek() else {
+                if quoted {
+                    return Err(invalid("unterminated quoted PostgreSQL text value"));
+                }
+                break;
+            };
+            if quoted && byte == b'"' {
+                self.take()?;
+                if self.peek() == Some(b'"') {
+                    self.take()?;
+                    value.push(b'"');
+                    continue;
+                }
+                break;
+            }
+            if !quoted && terminators.contains(&byte) {
+                break;
+            }
+            self.take()?;
+            if byte == b'\\' {
+                value.push(self.take()?);
+            } else {
+                value.push(byte);
+            }
+        }
+        if quoted && self.peek().is_some_and(|byte| !terminators.contains(&byte)) {
+            self.skip_spaces();
+            if self.peek().is_some_and(|byte| !terminators.contains(&byte)) {
+                return Err(invalid(format!(
+                    "quoted PostgreSQL text value at offset {} is followed by non-delimiter byte {:?}",
+                    self.pos,
+                    self.peek()
+                )));
+            }
+        }
+        Ok((value, quoted))
+    }
+    fn finish(&self) -> Result<()> {
+        if self.pos == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(invalid("trailing bytes in PostgreSQL text value"))
+        }
+    }
 }
 
 fn version_major(version: &str) -> u16 {
@@ -887,5 +1612,109 @@ mod tests {
             V::Network { family, prefix_length: Some(32), .. } if family == "ipv4"
         ));
         assert!(matches!(decode(142, b"<x/>").unwrap(), V::Xml { .. }));
+    }
+
+    #[test]
+    fn decodes_hstore_and_postgis_values_from_versioned_catalog_codecs() {
+        use crate::type_mapping::{SourceExtension, SourceTypeCatalog, SourceTypeDefinition};
+
+        let catalog = SourceTypeCatalog::with_extensions(
+            [
+                SourceTypeDefinition::extension(
+                    90_001,
+                    "extensions",
+                    "hstore",
+                    "hstore",
+                    "postgresql.hstore.text.v1",
+                    "UTF-8",
+                    Some(change_event::LogicalType::Map {
+                        key: Box::new(change_event::LogicalType::text("UTF8", None)),
+                        value: Box::new(change_event::LogicalType::text("UTF8", None)),
+                    }),
+                ),
+                SourceTypeDefinition::extension(
+                    90_002,
+                    "extensions",
+                    "geometry",
+                    "postgis",
+                    "postgresql.postgis.ewkb-hex.v1",
+                    "hex-EWKB",
+                    Some(change_event::LogicalType::spatial("*", None, 0)),
+                ),
+            ],
+            [
+                SourceExtension {
+                    name: "hstore".into(),
+                    version: "1.8".into(),
+                    schema: "extensions".into(),
+                    installed: true,
+                    available: true,
+                    target_compatible: None,
+                },
+                SourceExtension {
+                    name: "postgis".into(),
+                    version: "3.4.2".into(),
+                    schema: "extensions".into(),
+                    installed: true,
+                    available: true,
+                    target_compatible: None,
+                },
+            ],
+        );
+
+        let value = decode_catalog_column_for_version(
+            "15",
+            &catalog,
+            90_001,
+            "extensions.hstore",
+            b"broken",
+        );
+        assert!(value.is_err(), "malformed hstore must fail closed");
+        let value = decode_catalog_column_for_version(
+            "15",
+            &catalog,
+            90_001,
+            "extensions.hstore",
+            br#""name"=>"Ada", "nullable"=>NULL, "quote\"key"=>"a\\b""#,
+        )
+        .unwrap();
+        let V::Map { entries } = value else {
+            panic!("hstore must decode as a logical map")
+        };
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(&entries[0].key, V::Text { text: Some(key), .. } if key == "name"));
+        assert!(matches!(&entries[0].value, V::Text { text: Some(value), .. } if value == "Ada"));
+        assert!(matches!(&entries[1].value, V::Null));
+        assert!(matches!(&entries[2].key, V::Text { text: Some(key), .. } if key == "quote\"key"));
+        assert!(matches!(&entries[2].value, V::Text { text: Some(value), .. } if value == "a\\b"));
+
+        let value = decode_catalog_column_for_version(
+            "15",
+            &catalog,
+            90_002,
+            "extensions.geometry",
+            b"0101000020e6100000000000000000f03f0000000000000040",
+        )
+        .unwrap();
+        assert!(matches!(
+            value,
+            V::Spatial {
+                geometry_type,
+                dimensions: 2,
+                srid: Some(4326),
+                ..
+            } if geometry_type == "point"
+        ));
+
+        let iso_z =
+            decode_postgis_ewkb(b"01e9030000000000000000f03f00000000000000400000000000000840")
+                .unwrap();
+        assert!(matches!(iso_z, V::Spatial { dimensions: 3, .. }));
+        let iso_zm = decode_postgis_ewkb(
+            b"01b90b0000000000000000f03f000000000000004000000000000008400000000000001040",
+        )
+        .unwrap();
+        assert!(matches!(iso_zm, V::Spatial { dimensions: 4, .. }));
+        assert!(decode_postgis_ewkb(b"02ffffffff").is_err());
     }
 }

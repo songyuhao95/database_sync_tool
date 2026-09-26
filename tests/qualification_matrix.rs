@@ -362,6 +362,7 @@ fn representative_value(logical_type: &LogicalType) -> Option<LogicalValue> {
             elements: vec![representative_value(element)?],
             dimensions: *dimensions,
             lower_bounds: lower_bounds.clone(),
+            dimension_lengths: vec![1; usize::from(*dimensions)],
         },
         LogicalType::Struct { fields } => LogicalValue::Struct {
             fields: fields

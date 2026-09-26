@@ -989,21 +989,41 @@ fn structured_text(value: &LogicalValue) -> io::Result<String> {
             elements,
             dimensions,
             lower_bounds,
+            dimension_lengths,
         } => {
-            if *dimensions == 0 || usize::from(*dimensions) != lower_bounds.len() {
+            if *dimensions == 0 {
+                if !elements.is_empty() || !lower_bounds.is_empty() || !dimension_lengths.is_empty()
+                {
+                    return Err(capability_failure("zero-dimensional arrays must be empty"));
+                }
+                return Ok("{}".into());
+            }
+            if usize::from(*dimensions) != lower_bounds.len()
+                || usize::from(*dimensions) != dimension_lengths.len()
+            {
                 return Err(capability_failure(
-                    "array dimensions and lower bounds do not agree",
+                    "array dimensions, lower bounds, and lengths do not agree",
                 ));
             }
-            let values = array_literal(
-                elements
-                    .iter()
-                    .map(value_input)
-                    .collect::<io::Result<Vec<_>>>()?,
-            );
-            let lower = lower_bounds[0];
-            let upper = lower + i32::try_from(elements.len()).unwrap_or(i32::MAX) - 1;
-            Ok(format!("[{lower}:{upper}]={values}"))
+            let mut element_index = 0;
+            let values =
+                array_literal_with_shape(elements, dimension_lengths, 0, &mut element_index)?;
+            if element_index != elements.len() {
+                return Err(capability_failure(
+                    "array dimension lengths do not match the flattened element count",
+                ));
+            }
+            let mut bounds = String::new();
+            for (lower, length) in lower_bounds.iter().zip(dimension_lengths) {
+                let length = i32::try_from(*length).map_err(|_| {
+                    capability_failure("array dimension length exceeds PostgreSQL limits")
+                })?;
+                let upper = lower
+                    .checked_add(length - 1)
+                    .ok_or_else(|| capability_failure("array bound exceeds PostgreSQL limits"))?;
+                bounds.push_str(&format!("[{lower}:{upper}]"));
+            }
+            Ok(format!("{bounds}={values}"))
         }
         LogicalValue::Struct { fields } => Ok(format!(
             "({})",
@@ -1152,6 +1172,38 @@ fn array_literal(values: Vec<String>) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn array_literal_with_shape(
+    elements: &[LogicalValue],
+    lengths: &[u64],
+    dimension: usize,
+    element_index: &mut usize,
+) -> io::Result<String> {
+    if dimension == lengths.len() {
+        let element = elements
+            .get(*element_index)
+            .ok_or_else(|| capability_failure("array shape exceeds its flattened values"))?;
+        *element_index += 1;
+        let value = value_input(element)?;
+        return Ok(if value.starts_with('{') || value == "NULL" {
+            value
+        } else {
+            format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+        });
+    }
+    let length = usize::try_from(lengths[dimension])
+        .map_err(|_| capability_failure("array dimension length exceeds addressable memory"))?;
+    let mut children = Vec::with_capacity(length);
+    for _ in 0..length {
+        children.push(array_literal_with_shape(
+            elements,
+            lengths,
+            dimension + 1,
+            element_index,
+        )?);
+    }
+    Ok(format!("{{{}}}", children.join(",")))
 }
 
 fn composite_item(value: &str) -> String {
@@ -2126,4 +2178,44 @@ pub(crate) async fn snapshot_targets(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::structured_text;
+    use change_event::LogicalValue;
+
+    #[test]
+    fn postgres_array_writer_requires_shape_for_multidimensional_values() {
+        let legacy = LogicalValue::ArrayWithMetadata {
+            elements: vec![LogicalValue::Integer {
+                signed: true,
+                bits: 32,
+                value: "7".into(),
+            }],
+            dimensions: 2,
+            lower_bounds: vec![0, 2],
+            dimension_lengths: Vec::new(),
+        };
+        let error = structured_text(&legacy).unwrap_err();
+        assert!(error.to_string().contains("array dimensions"));
+
+        let complete = LogicalValue::ArrayWithMetadata {
+            elements: ["1", "2", "3", "4"]
+                .into_iter()
+                .map(|value| LogicalValue::Integer {
+                    signed: true,
+                    bits: 32,
+                    value: value.into(),
+                })
+                .collect(),
+            dimensions: 2,
+            lower_bounds: vec![0, 2],
+            dimension_lengths: vec![2, 2],
+        };
+        assert_eq!(
+            structured_text(&complete).unwrap(),
+            "[0:1][2:3]={{\"1\",\"2\"},{\"3\",\"4\"}}"
+        );
+    }
 }

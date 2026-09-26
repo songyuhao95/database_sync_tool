@@ -684,6 +684,7 @@ fn recursive_values_preserve_nulls_and_array_shape() {
         ],
         dimensions: 2,
         lower_bounds: vec![0, -2],
+        dimension_lengths: vec![1, 2],
     };
 
     value.validate().expect("recursive value should validate");
@@ -810,6 +811,90 @@ fn json_v03_replays_raw_and_recursive_values_without_target_metadata() {
         replayed.transaction().content_digest(),
         validated.transaction().content_digest()
     );
+}
+
+#[test]
+fn json_v03_replays_legacy_array_metadata_without_inventing_shape() {
+    use std::io::Cursor;
+
+    let mut transaction = insert_transaction();
+    transaction.changes[0].after.as_mut().unwrap()[0].datum =
+        Datum::Value(LogicalValue::ArrayWithMetadata {
+            elements: vec![
+                LogicalValue::Integer {
+                    signed: true,
+                    bits: 32,
+                    value: "1".into(),
+                },
+                LogicalValue::Null,
+                LogicalValue::Integer {
+                    signed: true,
+                    bits: 32,
+                    value: "3".into(),
+                },
+                LogicalValue::Integer {
+                    signed: true,
+                    bits: 32,
+                    value: "4".into(),
+                },
+            ],
+            dimensions: 2,
+            lower_bounds: vec![0, 2],
+            dimension_lengths: vec![2, 2],
+        });
+    let validated = validate(transaction).expect("array with complete shape is valid");
+    let encoded = json(&validated).unwrap();
+
+    let legacy = encoded
+        .lines()
+        .map(|line| {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            remove_dimension_lengths(&mut row);
+            serde_json::to_string(&row).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut reader = JsonReader::new(Cursor::new(legacy.as_bytes()));
+    let replayed = reader
+        .next_transaction()
+        .unwrap_or_else(|error| panic!("legacy v0.3 transaction validation failed: {error}"))
+        .unwrap_or_else(|| panic!("legacy v0.3 transaction ended before commit"));
+    reader.finish().unwrap();
+    assert!(matches!(
+        &replayed.transaction().changes[0].after.as_ref().unwrap()[0].datum,
+        Datum::Value(LogicalValue::ArrayWithMetadata {
+            elements,
+            dimensions: 2,
+            lower_bounds,
+            dimension_lengths,
+        }) if elements.len() == 4 && lower_bounds == &[0, 2] && dimension_lengths.is_empty()
+    ));
+    let replayed_again = json(&replayed).unwrap();
+    let mut reader = JsonReader::new(Cursor::new(replayed_again.as_bytes()));
+    let replayed_again = reader.next_transaction().unwrap().unwrap();
+    reader.finish().unwrap();
+    assert_eq!(
+        replayed.transaction().content_digest(),
+        replayed_again.transaction().content_digest()
+    );
+}
+
+fn remove_dimension_lengths(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("dimension_lengths");
+            for nested in object.values_mut() {
+                remove_dimension_lengths(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remove_dimension_lengths(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[test]

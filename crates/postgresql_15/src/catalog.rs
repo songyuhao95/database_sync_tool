@@ -1,4 +1,4 @@
-use crate::{Result, invalid, types};
+use crate::{Result, invalid};
 use sqlx::{PgConnection, Row};
 use std::collections::HashMap;
 #[derive(Clone, Debug)]
@@ -11,6 +11,8 @@ pub(crate) struct Column {
     pub type_name: String,
     pub type_definition_digest: String,
     pub type_definition_evidence: String,
+    pub type_definition_closure_evidence: String,
+    pub type_definition_closure_digest: String,
     pub representation_only: bool,
     pub representation_capture_allowed: bool,
     pub key: Option<usize>,
@@ -27,6 +29,7 @@ pub(crate) struct Table {
 pub(crate) struct LoadedCatalog {
     pub tables: HashMap<u32, Table>,
     pub type_names: HashMap<u32, (String, String)>,
+    pub type_catalog: crate::SourceTypeCatalog,
 }
 pub(crate) async fn load(
     conn: &mut PgConnection,
@@ -72,6 +75,7 @@ pub(crate) async fn load(
             .bind(i64::from(oid)).fetch_all(&mut *conn).await?;
         let mut columns = Vec::new();
         for column in column_rows {
+            let column_name: String = column.try_get("attname")?;
             let oid = u32::try_from(column.try_get::<i64, _>("type_oid")?)?;
             let native_type: String = column.try_get("native_type")?;
             let definition = type_catalog
@@ -88,18 +92,26 @@ pub(crate) async fn load(
                 &native_type,
                 &type_catalog,
             )
-            .map_err(|error| invalid(format!("{schema}.{name}: {error}")))?;
-            let is_enum = native_type.to_ascii_lowercase().starts_with("enum(");
-            let representation_capture_allowed = definition.schema == "pg_catalog";
-            if !(types::supported(oid) || is_enum || representation_capture_allowed)
-                || !column.try_get::<String, _>("generated")?.is_empty()
-            {
+            .map_err(|error| {
+                invalid(format!(
+                    "{schema}.{name}.{} ({native_type}): {error}",
+                    column_name
+                ))
+            })?;
+            let semantic_codec = crate::type_mapping::has_semantic_codec(&type_catalog, oid);
+            let representation_capture_allowed = !semantic_codec;
+            let closure = type_catalog
+                .definition_closure(oid)
+                .map_err(|error| invalid(format!("{schema}.{name}.{column_name}: {error}")))?;
+            let type_definition_closure_digest = closure.digest();
+            let type_definition_closure_evidence = serde_json::to_string(&closure)?;
+            if !column.try_get::<String, _>("generated")?.is_empty() {
                 return Err(invalid(format!(
                     "{schema}.{name}: unsupported type/generated column {native_type} (OID {oid})"
                 )));
             }
             columns.push(Column {
-                name: column.try_get("attname")?,
+                name: column_name,
                 oid,
                 modifier: column.try_get("atttypmod")?,
                 native_type,
@@ -107,7 +119,9 @@ pub(crate) async fn load(
                 type_name: definition.name.clone(),
                 type_definition_digest: definition.definition_digest.clone(),
                 type_definition_evidence: serde_json::to_string(definition)?,
-                representation_only: !types::supported(oid) && !is_enum,
+                type_definition_closure_evidence,
+                type_definition_closure_digest,
+                representation_only: !semantic_codec,
                 representation_capture_allowed,
                 key: column
                     .try_get::<Option<i32>, _>("key_ordinal")?
@@ -137,10 +151,19 @@ pub(crate) async fn load(
     }
     let type_names = type_catalog
         .types
-        .into_iter()
-        .map(|definition| (definition.oid, (definition.schema, definition.name)))
+        .iter()
+        .map(|definition| {
+            (
+                definition.oid,
+                (definition.schema.clone(), definition.name.clone()),
+            )
+        })
         .collect();
-    Ok(LoadedCatalog { tables, type_names })
+    Ok(LoadedCatalog {
+        tables,
+        type_names,
+        type_catalog,
+    })
 }
 
 /// Read the recursive PostgreSQL type directory once per capture activation.
@@ -155,7 +178,10 @@ pub async fn source_type_catalog(conn: &mut PgConnection) -> Result<crate::Sourc
     let rows = sqlx::query(
         "SELECT t.oid::bigint AS oid,n.nspname,t.typname,t.typtype::text AS typtype,
                 t.typbasetype::bigint AS base_oid,t.typelem::bigint AS elem_oid,
-                t.typrelid::bigint AS relid,
+                t.typrelid::bigint AS relid,t.typdelim::text AS delimiter,
+                (t.typsubscript='pg_catalog.array_subscript_handler'::regproc
+                 AND t.typelem<>0
+                 AND EXISTS (SELECT 1 FROM pg_type element WHERE element.typarray=t.oid)) AS is_array,
                 t.typnotnull,
                 r.rngtypid::bigint AS range_oid,r.rngsubtype::bigint AS range_subtype,
                 coll.collname AS collation,
@@ -179,21 +205,49 @@ pub async fn source_type_catalog(conn: &mut PgConnection) -> Result<crate::Sourc
         let schema: String = row.try_get("nspname")?;
         let name: String = row.try_get("typname")?;
         let kind: String = row.try_get("typtype")?;
+        let is_array: bool = row.try_get("is_array")?;
         let element_oid = u32::try_from(row.try_get::<i64, _>("elem_oid")?)?;
         let extension: Option<String> = row.try_get("extname")?;
         let definition = match kind.as_str() {
-            "b" if element_oid != 0 => {
-                SourceTypeDefinition::array(oid, &schema, &name, element_oid)
-            }
-            "b" if let Some(extension) = extension => SourceTypeDefinition::extension(
+            "b" if is_array && element_oid != 0 => SourceTypeDefinition::array_with_delimiter(
                 oid,
                 &schema,
                 &name,
-                extension,
-                "",
-                "postgresql.text.v1",
-                None,
+                element_oid,
+                row.try_get::<String, _>("delimiter")?
+                    .chars()
+                    .next()
+                    .ok_or_else(|| invalid("PostgreSQL array delimiter is empty"))?,
             ),
+            "b" if let Some(extension) = extension => {
+                let (codec, logical) = match (extension.as_str(), name.as_str()) {
+                    ("hstore", "hstore") => (
+                        "postgresql.hstore.text.v1",
+                        Some(change_event::LogicalType::Map {
+                            key: Box::new(change_event::LogicalType::text("UTF8", None)),
+                            value: Box::new(change_event::LogicalType::text("UTF8", None)),
+                        }),
+                    ),
+                    ("postgis", "geometry" | "geography") => (
+                        "postgresql.postgis.ewkb-hex.v1",
+                        Some(change_event::LogicalType::spatial("*", None, 0)),
+                    ),
+                    _ => ("", None),
+                };
+                SourceTypeDefinition::extension(
+                    oid,
+                    &schema,
+                    &name,
+                    extension,
+                    codec,
+                    if codec.ends_with("ewkb-hex.v1") {
+                        "hex-EWKB"
+                    } else {
+                        "UTF-8"
+                    },
+                    logical,
+                )
+            }
             "b" => SourceTypeDefinition::builtin(oid, &schema, &name),
             "e" => {
                 let labels = sqlx::query_scalar::<_, String>(
@@ -264,44 +318,33 @@ pub async fn source_type_catalog(conn: &mut PgConnection) -> Result<crate::Sourc
         };
         definitions.push(definition);
     }
-    let mut extensions = sqlx::query(
-        "SELECT extname,extversion,n.nspname AS schema FROM pg_extension e
-          JOIN pg_namespace n ON n.oid=e.extnamespace ORDER BY extname",
+    let extensions = sqlx::query(
+        "SELECT COALESCE(e.extname,a.name) AS name,
+                COALESCE(e.extversion,a.default_version) AS version,
+                COALESCE(n.nspname,'') AS schema,
+                e.oid IS NOT NULL AS installed,
+                a.name IS NOT NULL AS available
+           FROM pg_available_extensions a
+           FULL OUTER JOIN pg_extension e ON e.extname=a.name
+           LEFT JOIN pg_namespace n ON n.oid=e.extnamespace
+          ORDER BY COALESCE(e.extname,a.name)",
     )
     .fetch_all(&mut *conn)
     .await?
     .into_iter()
     .map(|row| {
         Ok(crate::SourceExtension {
-            name: row.try_get("extname")?,
-            version: row.try_get("extversion")?,
+            name: row.try_get("name")?,
+            version: row
+                .try_get::<Option<String>, _>("version")?
+                .unwrap_or_default(),
             schema: row.try_get("schema")?,
-            installed: true,
-            available: true,
+            installed: row.try_get("installed")?,
+            available: row.try_get("available")?,
             target_compatible: None,
         })
     })
     .collect::<Result<Vec<_>>>()?;
-    for extension in
-        sqlx::query("SELECT name,default_version FROM pg_available_extensions ORDER BY name")
-            .fetch_all(&mut *conn)
-            .await?
-    {
-        let name: String = extension.try_get("name")?;
-        if !extensions
-            .iter()
-            .any(|installed| installed.name.eq_ignore_ascii_case(&name))
-        {
-            extensions.push(crate::SourceExtension {
-                name,
-                version: extension.try_get("default_version")?,
-                schema: String::new(),
-                installed: false,
-                available: true,
-                target_compatible: None,
-            });
-        }
-    }
     Ok(crate::SourceTypeCatalog::with_extensions(
         definitions,
         extensions,

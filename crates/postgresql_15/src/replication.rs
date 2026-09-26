@@ -1,4 +1,8 @@
-use crate::{Result, catalog, decoder::Decoder, invalid};
+use crate::{
+    Result, catalog,
+    decoder::{Decoder, DecoderConfig},
+    invalid,
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{ServerBuildIdentity, Source, ValidatedTransaction};
 use pg_walstream::{
@@ -263,15 +267,16 @@ pub async fn replication_for_version(config: Config, expected_major: u16) -> Res
     Ok(Replication {
         connection,
         parser: LogicalReplicationParser::with_protocol_version(1),
-        decoder: Decoder::new(
+        decoder: Decoder::new(DecoderConfig {
             source,
             server_build,
-            settings.try_get::<String, _>("lc_monetary")?,
-            config.database,
-            loaded_catalog.tables,
-            loaded_catalog.type_names,
-            config.max_transaction_bytes,
-        ),
+            lc_monetary: settings.try_get::<String, _>("lc_monetary")?,
+            database: config.database,
+            tables: loaded_catalog.tables,
+            type_names: loaded_catalog.type_names,
+            type_catalog: loaded_catalog.type_catalog,
+            max_bytes: config.max_transaction_bytes,
+        }),
         start,
         acknowledged: 0,
         delivered: None,

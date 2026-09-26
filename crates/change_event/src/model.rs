@@ -263,6 +263,12 @@ pub enum LogicalValue {
         elements: Vec<LogicalValue>,
         dimensions: u8,
         lower_bounds: Vec<i32>,
+        /// Length of each dimension in row-major order. Empty means there is
+        /// no shape data (a zero-dimensional array, or a legacy v0.3 value).
+        /// Writers that need to recreate array shape must reject legacy values
+        /// whose dimension lengths are unavailable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dimension_lengths: Vec<u64>,
     },
     /// A source-invalid temporal value that must not be normalized to NULL.
     InvalidTemporal {

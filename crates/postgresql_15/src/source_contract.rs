@@ -249,6 +249,8 @@ fn validate_native_type_for_version(
             | "timestamp without time zone"
             | "timestamp with time zone"
     ) || native.ends_with("[]")
+        || is_qualified_type_name(&native)
+        || matches!(native.as_str(), "hstore" | "geometry" | "geography")
         || valid_character(&native)
         || valid_parameterized_numeric(&native)
         || valid_parameterized_timestamp(&native)
@@ -293,6 +295,34 @@ fn validate_representation(
             && definition.get("schema").and_then(serde_json::Value::as_str) == type_schema
             && definition.get("name").and_then(serde_json::Value::as_str) == type_name
     });
+    let type_definition_closure = metadata.get("type_definition_closure").and_then(|closure| {
+        serde_json::from_str::<crate::type_mapping::SourceTypeDefinitionClosure>(closure).ok()
+    });
+    let closure_digest_matches = type_definition_closure.as_ref().is_some_and(|closure| {
+        metadata
+            .get("type_definition_closure_digest")
+            .map(String::as_str)
+            == Some(format!("sha256:{}", closure.digest()).as_str())
+    });
+    let closure_root_matches =
+        type_definition_closure
+            .as_ref()
+            .zip(type_oid)
+            .is_some_and(|(closure, root_oid)| {
+                closure
+                    .types
+                    .iter()
+                    .find(|definition| definition.oid == root_oid)
+                    .and_then(|definition| serde_json::to_value(definition).ok())
+                    == definition.clone()
+            });
+    let closure_valid =
+        type_definition_closure
+            .as_ref()
+            .zip(type_oid)
+            .is_some_and(|(closure, root_oid)| {
+                crate::type_mapping::validate_type_definition_closure(closure, root_oid)
+            });
     ensure(
         context.connector.kind == "postgresql"
             && context.connector.version == version
@@ -309,7 +339,8 @@ fn validate_representation(
             && metadata.get("relation_schema").map(String::as_str) == Some(change.schema.as_str())
             && metadata.get("relation_name").map(String::as_str) == Some(change.table.as_str())
             && metadata.get("column_name").map(String::as_str) == Some(column.name.as_str())
-            && type_schema == Some("pg_catalog")
+            && type_schema.is_some_and(|schema| !schema.is_empty())
+            && type_name.is_some_and(|name| !name.is_empty())
             && type_oid.is_some_and(|oid| oid > 0)
             && metadata
                 .get("type_modifier")
@@ -329,8 +360,11 @@ fn validate_representation(
                 .is_some_and(|locale| !locale.is_empty())
             && definition_digest_matches
             && definition_identity_matches
+            && closure_digest_matches
+            && closure_root_matches
+            && closure_valid
             && expected_identity.as_deref() == Some(context.source_type_identity.as_str()),
-        "PostgreSQL source representation context does not match its checked built-in column",
+        "PostgreSQL source representation context does not match its checked type definition closure",
     )
 }
 
@@ -375,6 +409,33 @@ fn valid_parameterized_timestamp(native: &str) -> bool {
     };
     precision.parse::<u8>().is_ok_and(|value| value <= 6)
         && matches!(suffix, "without time zone" | "with time zone")
+}
+
+fn is_qualified_type_name(native: &str) -> bool {
+    if native.is_empty() || native.contains([';', '\0', '[', ']', '(', ')']) {
+        return false;
+    }
+    let mut quoted = false;
+    let mut dots = 0_u8;
+    let mut previous = None;
+    for byte in native.bytes() {
+        if quoted {
+            if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte == b'.' {
+            dots = dots.saturating_add(1);
+            if matches!(previous, None | Some(b'.')) {
+                return false;
+            }
+        } else if byte.is_ascii_whitespace() {
+            return false;
+        }
+        previous = Some(byte);
+    }
+    !quoted && dots == 1 && !matches!(previous, None | Some(b'.'))
 }
 
 fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str) -> bool {
@@ -483,6 +544,51 @@ fn logical_matches_native(value: &LogicalValue, native_type: &str, version: &str
                     })
                     .is_some_and(|members| members.iter().any(|member| member == label))
             }
+        }
+        LogicalValue::Domain { value } => {
+            is_qualified_type_name(&native) && !matches!(value.as_ref(), LogicalValue::Null)
+        }
+        LogicalValue::Struct { fields } => {
+            (native == "record" || is_qualified_type_name(&native))
+                && fields.iter().enumerate().all(|(index, field)| {
+                    !field.name.is_empty()
+                        && !fields[..index].iter().any(|prior| prior.name == field.name)
+                })
+        }
+        LogicalValue::Array { .. } | LogicalValue::ArrayWithMetadata { .. } => {
+            native.ends_with("[]")
+        }
+        LogicalValue::Range { .. } => {
+            matches!(
+                native.as_str(),
+                "int4range" | "int8range" | "numrange" | "tsrange" | "tstzrange" | "daterange"
+            ) || is_qualified_type_name(&native)
+        }
+        LogicalValue::MultiRange { .. } => {
+            matches!(
+                native.as_str(),
+                "int4multirange"
+                    | "int8multirange"
+                    | "nummultirange"
+                    | "tsmultirange"
+                    | "tstzmultirange"
+                    | "datemultirange"
+            ) || is_qualified_type_name(&native)
+        }
+        LogicalValue::Map { .. } => native == "hstore" || native.ends_with(".hstore"),
+        LogicalValue::Spatial {
+            geometry_type,
+            dimensions,
+            ..
+        } => {
+            (native == "geometry"
+                || native == "geography"
+                || native.starts_with("geometry(")
+                || native.starts_with("geography(")
+                || native.ends_with(".geometry")
+                || native.ends_with(".geography"))
+                && !geometry_type.is_empty()
+                && (2..=4).contains(dimensions)
         }
         LogicalValue::Duration { .. } | LogicalValue::Year { .. } => false,
         _ => false,

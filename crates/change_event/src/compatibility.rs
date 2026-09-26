@@ -1096,9 +1096,12 @@ impl LogicalType {
                     && (*cidr == prefix_length.is_some())
             }
             (Self::Xml, LogicalValue::Xml { .. }) => true,
-            (Self::Array { element }, LogicalValue::Array { elements }) => {
-                elements.iter().all(|value| element.matches_value(value))
-            }
+            (Self::Array { element }, LogicalValue::Array { elements }) => elements
+                .iter()
+                .all(|value| matches!(value, LogicalValue::Null) || element.matches_value(value)),
+            (Self::Array { element }, LogicalValue::ArrayWithMetadata { elements, .. }) => elements
+                .iter()
+                .all(|value| matches!(value, LogicalValue::Null) || element.matches_value(value)),
             (
                 Self::ArrayWithMetadata {
                     element,
@@ -1109,21 +1112,30 @@ impl LogicalType {
                     elements,
                     dimensions: value_dimensions,
                     lower_bounds: value_lower_bounds,
+                    ..
                 },
             ) => {
                 dimensions == value_dimensions
                     && lower_bounds == value_lower_bounds
-                    && elements.iter().all(|value| element.matches_value(value))
+                    && elements.iter().all(|value| {
+                        matches!(value, LogicalValue::Null) || element.matches_value(value)
+                    })
             }
             (Self::Struct { fields }, LogicalValue::Struct { fields: values }) => {
                 fields.len() == values.len()
                     && fields.iter().zip(values).all(|(field, value)| {
-                        field.name == value.name && field.logical_type.matches_value(&value.value)
+                        field.name == value.name
+                            && (matches!(&value.value, LogicalValue::Null) && field.nullable
+                                || field.logical_type.matches_value(&value.value))
                     })
             }
-            (Self::Map { key, value }, LogicalValue::Map { entries }) => entries
-                .iter()
-                .all(|entry| key.matches_value(&entry.key) && value.matches_value(&entry.value)),
+            (Self::Map { key, value }, LogicalValue::Map { entries }) => {
+                entries.iter().all(|entry| {
+                    key.matches_value(&entry.key)
+                        && (matches!(&entry.value, LogicalValue::Null)
+                            || value.matches_value(&entry.value))
+                })
+            }
             (Self::Range { element }, LogicalValue::Range { lower, upper, .. }) => lower
                 .iter()
                 .chain(upper.iter())
@@ -2545,9 +2557,32 @@ fn validate_recursive_value(value: &LogicalValue, depth: usize) -> Result<(), &'
             elements,
             dimensions,
             lower_bounds,
+            dimension_lengths,
         } => {
-            if *dimensions == 0 || usize::from(*dimensions) != lower_bounds.len() {
-                return Err("array dimensions and lower bounds do not agree");
+            if *dimensions == 0 {
+                if !elements.is_empty() || !lower_bounds.is_empty() || !dimension_lengths.is_empty()
+                {
+                    return Err("zero-dimensional arrays must be empty");
+                }
+            } else {
+                if usize::from(*dimensions) != lower_bounds.len()
+                    || (!dimension_lengths.is_empty()
+                        && usize::from(*dimensions) != dimension_lengths.len())
+                {
+                    return Err("array dimensions and lower bounds do not agree");
+                }
+                if !dimension_lengths.is_empty() {
+                    let element_count = dimension_lengths
+                        .iter()
+                        .try_fold(1_u64, |product, length| product.checked_mul(*length));
+                    if element_count.and_then(|count| usize::try_from(count).ok())
+                        != Some(elements.len())
+                    {
+                        return Err(
+                            "array dimension lengths do not match the flattened element count",
+                        );
+                    }
+                }
             }
             elements
                 .iter()

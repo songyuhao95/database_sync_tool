@@ -20,32 +20,46 @@ pub(crate) struct Decoder {
     database: String,
     tables: HashMap<u32, Table>,
     type_names: HashMap<u32, (String, String)>,
+    type_catalog: crate::SourceTypeCatalog,
     seen: HashSet<u32>,
     pending: Option<Pending>,
     previous_end: u64,
     max_bytes: usize,
 }
+
+pub(crate) struct DecoderConfig {
+    pub source: Source,
+    pub server_build: ServerBuildIdentity,
+    pub lc_monetary: String,
+    pub database: String,
+    pub tables: HashMap<u32, Table>,
+    pub type_names: HashMap<u32, (String, String)>,
+    pub type_catalog: crate::SourceTypeCatalog,
+    pub max_bytes: usize,
+}
+
+struct ImageContext<'a> {
+    source: &'a Source,
+    server_build: &'a ServerBuildIdentity,
+    lc_monetary: &'a str,
+    type_catalog: &'a crate::SourceTypeCatalog,
+    source_cursor: &'a change_event::SourceCursor,
+}
+
 impl Decoder {
-    pub fn new(
-        source: Source,
-        server_build: ServerBuildIdentity,
-        lc_monetary: String,
-        database: String,
-        tables: HashMap<u32, Table>,
-        type_names: HashMap<u32, (String, String)>,
-        max_bytes: usize,
-    ) -> Self {
+    pub fn new(config: DecoderConfig) -> Self {
         Self {
-            source,
-            server_build,
-            lc_monetary,
-            database,
-            tables,
-            type_names,
+            source: config.source,
+            server_build: config.server_build,
+            lc_monetary: config.lc_monetary,
+            database: config.database,
+            tables: config.tables,
+            type_names: config.type_names,
+            type_catalog: config.type_catalog,
             seen: HashSet::new(),
             pending: None,
             previous_end: 0,
-            max_bytes,
+            max_bytes: config.max_bytes,
         }
     }
     pub fn push(&mut self, message: M, bytes: usize) -> Result<Option<ValidatedTransaction>> {
@@ -149,15 +163,8 @@ impl Decoder {
             M::Insert { relation_id, tuple } => {
                 let t = self.table(relation_id)?;
                 let source_cursor = self.current_cursor()?;
-                let after = image(
-                    t,
-                    &tuple,
-                    false,
-                    &self.source,
-                    &self.server_build,
-                    &self.lc_monetary,
-                    source_cursor,
-                )?;
+                let context = self.image_context(&source_cursor);
+                let after = image(t, &tuple, false, &context)?;
                 self.row(relation_id, Operation::Insert, None, Some(after))?;
             }
             M::Update {
@@ -168,34 +175,13 @@ impl Decoder {
             } => {
                 let t = self.table(relation_id)?;
                 let source_cursor = self.current_cursor()?;
-                let after = image(
-                    t,
-                    &new_tuple,
-                    false,
-                    &self.source,
-                    &self.server_build,
-                    &self.lc_monetary,
-                    source_cursor.clone(),
-                )?;
+                let context = self.image_context(&source_cursor);
+                let after = image(t, &new_tuple, false, &context)?;
                 let before = match (key_type, old_tuple) {
-                    (Some('K'), Some(old)) => image(
-                        t,
-                        &old,
-                        true,
-                        &self.source,
-                        &self.server_build,
-                        &self.lc_monetary,
-                        source_cursor.clone(),
-                    )?,
-                    (Some('O'), Some(old)) if t.identity == b'f' => image(
-                        t,
-                        &old,
-                        false,
-                        &self.source,
-                        &self.server_build,
-                        &self.lc_monetary,
-                        source_cursor.clone(),
-                    )?,
+                    (Some('K'), Some(old)) => image(t, &old, true, &context)?,
+                    (Some('O'), Some(old)) if t.identity == b'f' => {
+                        image(t, &old, false, &context)?
+                    }
                     (None, None) if t.identity == b'd' => after
                         .iter()
                         .map(|c| {
@@ -222,15 +208,7 @@ impl Decoder {
                     'O' if t.identity == b'f' => false,
                     _ => return Err(invalid("invalid DELETE identity")),
                 };
-                let before = image(
-                    t,
-                    &old_tuple,
-                    key_only,
-                    &self.source,
-                    &self.server_build,
-                    &self.lc_monetary,
-                    source_cursor,
-                )?;
+                let before = image(t, &old_tuple, key_only, &self.image_context(&source_cursor))?;
                 self.row(relation_id, Operation::Delete, Some(before), None)?;
             }
             M::Truncate { .. } => {
@@ -248,9 +226,15 @@ impl Decoder {
                         "pgoutput TYPE references OID {type_id} absent from the checked PostgreSQL type catalog"
                     )));
                 };
-                if expected_schema != &namespace || expected_name != &type_name {
+                if !protocol_type_identity_matches(
+                    &self.type_catalog,
+                    type_id,
+                    &namespace,
+                    &type_name,
+                    &mut HashSet::new(),
+                ) {
                     return Err(invalid(format!(
-                        "pgoutput TYPE identity for OID {type_id} disagrees with the checked type catalog"
+                        "pgoutput TYPE identity for OID {type_id} is {namespace}.{type_name}, checked catalog expects {expected_schema}.{expected_name}"
                     )));
                 }
             }
@@ -312,15 +296,61 @@ impl Decoder {
         });
         Ok(())
     }
+
+    fn image_context<'a>(
+        &'a self,
+        source_cursor: &'a change_event::SourceCursor,
+    ) -> ImageContext<'a> {
+        ImageContext {
+            source: &self.source,
+            server_build: &self.server_build,
+            lc_monetary: &self.lc_monetary,
+            type_catalog: &self.type_catalog,
+            source_cursor,
+        }
+    }
+}
+
+fn protocol_type_identity_matches(
+    catalog: &crate::SourceTypeCatalog,
+    oid: u32,
+    namespace: &str,
+    name: &str,
+    seen: &mut HashSet<u32>,
+) -> bool {
+    if !seen.insert(oid) || seen.len() > 64 {
+        return false;
+    }
+    let Some(definition) = catalog
+        .types
+        .iter()
+        .find(|definition| definition.oid == oid)
+    else {
+        return false;
+    };
+    if definition.schema == namespace && definition.name == name {
+        return true;
+    }
+    match definition.kind {
+        crate::type_mapping::SourceTypeDefinitionKind::Domain { base_oid, .. } => {
+            let base = catalog
+                .types
+                .iter()
+                .find(|candidate| candidate.oid == base_oid);
+            base.is_some_and(|base| {
+                (base.schema == namespace && base.name == name)
+                    || (namespace.is_empty() && base.schema == "pg_catalog" && base.name == name)
+                    || protocol_type_identity_matches(catalog, base_oid, namespace, name, seen)
+            })
+        }
+        _ => false,
+    }
 }
 fn image(
     table: &Table,
     tuple: &TupleData,
     key_only: bool,
-    source: &Source,
-    server_build: &ServerBuildIdentity,
-    lc_monetary: &str,
-    source_cursor: change_event::SourceCursor,
+    context: &ImageContext<'_>,
 ) -> Result<Vec<ColumnDatum>> {
     if tuple.columns.len() != table.columns.len() {
         return Err(invalid("tuple column count differs from Relation"));
@@ -357,6 +387,14 @@ fn image(
                                 format!("sha256:{}", meta.type_definition_digest),
                             ),
                             (
+                                "type_definition_closure".into(),
+                                meta.type_definition_closure_evidence.clone(),
+                            ),
+                            (
+                                "type_definition_closure_digest".into(),
+                                format!("sha256:{}", meta.type_definition_closure_digest),
+                            ),
+                            (
                                 "source_catalog_digest".into(),
                                 table.source_type_catalog_digest.clone(),
                             ),
@@ -367,14 +405,14 @@ fn image(
                             ("session.bytea_output".into(), "hex".into()),
                             ("session.extra_float_digits".into(), "3".into()),
                             ("session.search_path".into(), "pg_catalog".into()),
-                            ("environment.lc_monetary".into(), lc_monetary.into()),
+                            ("environment.lc_monetary".into(), context.lc_monetary.into()),
                         ]);
                         let context = SourceRepresentationContext {
                             connector: ConnectorIdentity::new(
                                 "postgresql",
-                                source.version.split('.').next().unwrap_or("15"),
+                                context.source.version.split('.').next().unwrap_or("15"),
                             ),
-                            server_build: server_build.clone(),
+                            server_build: context.server_build.clone(),
                             source_type_identity: format!(
                                 "postgresql.pg_type.v1:{}:{}.{}",
                                 meta.oid, meta.type_schema, meta.type_name
@@ -386,7 +424,7 @@ fn image(
                             protocol: "pgoutput.v1".into(),
                             format: SourceRepresentationFormat::Text,
                             type_metadata,
-                            source_cursor: source_cursor.clone(),
+                            source_cursor: context.source_cursor.clone(),
                         };
                         Datum::SourceRepresentationEnvelope(SourceRepresentationEnvelope::new(
                             context,
@@ -394,12 +432,18 @@ fn image(
                             data.as_bytes(),
                         ))
                     }
-                    b't' => Datum::Value(types::decode_column_for_version(
-                        source.version.split('.').next().unwrap_or("15"),
-                        meta.oid,
-                        &meta.native_type,
-                        data.as_bytes(),
-                    )?),
+                    b't' if !meta.representation_only => {
+                        Datum::Value(types::decode_catalog_column_for_version(
+                            context.source.version.split('.').next().unwrap_or("15"),
+                            context.type_catalog,
+                            meta.oid,
+                            &meta.native_type,
+                            data.as_bytes(),
+                        ).map_err(|error| invalid(format!(
+                            "PostgreSQL column {} (OID {}, native type {}) could not be decoded: {error}",
+                            meta.name, meta.oid, meta.native_type
+                        )))?)
+                    }
                     _ => {
                         return Err(invalid(
                             "unexpected binary/invalid pgoutput value; text transfer required",
@@ -446,6 +490,8 @@ mod tests {
                         "{{\"oid\":20,\"schema\":\"pg_catalog\",\"name\":\"int8\",\"kind\":{{\"Builtin\":{{\"native_type\":\"int8\"}}}},\"collation\":null,\"definition_digest\":\"{}\"}}",
                         "1".repeat(64)
                     ),
+                    type_definition_closure_evidence: String::new(),
+                    type_definition_closure_digest: String::new(),
                     representation_only: false,
                     representation_capture_allowed: false,
                     key: Some(0),
@@ -462,6 +508,8 @@ mod tests {
                         "{{\"oid\":25,\"schema\":\"pg_catalog\",\"name\":\"text\",\"kind\":{{\"Builtin\":{{\"native_type\":\"text\"}}}},\"collation\":null,\"definition_digest\":\"{}\"}}",
                         "2".repeat(64)
                     ),
+                    type_definition_closure_evidence: String::new(),
+                    type_definition_closure_digest: String::new(),
                     representation_only: false,
                     representation_capture_allowed: false,
                     key: None,
@@ -490,25 +538,44 @@ mod tests {
         ])
     }
 
+    fn test_type_catalog() -> crate::SourceTypeCatalog {
+        crate::SourceTypeCatalog::new([
+            crate::SourceTypeDefinition::builtin(20, "pg_catalog", "int8"),
+            crate::SourceTypeDefinition::builtin(25, "pg_catalog", "text"),
+            crate::SourceTypeDefinition::builtin(790, "pg_catalog", "money"),
+        ])
+    }
+
+    fn test_type_closure(oid: u32) -> (String, String) {
+        let closure = test_type_catalog().definition_closure(oid).unwrap();
+        (serde_json::to_string(&closure).unwrap(), closure.digest())
+    }
+
     fn decoder() -> Decoder {
-        Decoder::new(
-            Source {
+        Decoder::new(DecoderConfig {
+            source: Source {
                 kind: "postgresql".into(),
                 version: "15.19".into(),
                 id: "postgresql:123456:1:16384:Q0RDX3Rlc3Q".into(),
             },
-            ServerBuildIdentity::new("postgresql", "community", "15.19", "PostgreSQL 15.19"),
-            "C".into(),
-            "CDC_test".into(),
-            [(42, table())].into_iter().collect(),
-            [
+            server_build: ServerBuildIdentity::new(
+                "postgresql",
+                "community",
+                "15.19",
+                "PostgreSQL 15.19",
+            ),
+            lc_monetary: "C".into(),
+            database: "CDC_test".into(),
+            tables: [(42, table())].into_iter().collect(),
+            type_names: [
                 (20, ("pg_catalog".into(), "int8".into())),
                 (25, ("pg_catalog".into(), "text".into())),
             ]
             .into_iter()
             .collect(),
-            1024 * 1024,
-        )
+            type_catalog: test_type_catalog(),
+            max_bytes: 1024 * 1024,
+        })
     }
 
     #[test]
@@ -593,6 +660,7 @@ mod tests {
     #[test]
     fn captures_unmapped_builtin_text_with_catalog_evidence_and_json_replay() {
         let money = crate::SourceTypeDefinition::builtin(790, "pg_catalog", "money");
+        let (closure_evidence, closure_digest) = test_type_closure(money.oid);
         let money_column = catalog::Column {
             name: "amount".into(),
             oid: money.oid,
@@ -602,6 +670,8 @@ mod tests {
             type_name: money.name.clone(),
             type_definition_digest: money.definition_digest.clone(),
             type_definition_evidence: serde_json::to_string(&money).unwrap(),
+            type_definition_closure_evidence: closure_evidence,
+            type_definition_closure_digest: closure_digest,
             representation_only: true,
             representation_capture_allowed: true,
             key: None,
@@ -622,6 +692,8 @@ mod tests {
                     type_name: "int8".into(),
                     type_definition_digest: "1".repeat(64),
                     type_definition_evidence: "{}".into(),
+                    type_definition_closure_evidence: String::new(),
+                    type_definition_closure_digest: String::new(),
                     representation_only: false,
                     representation_capture_allowed: false,
                     key: Some(0),
@@ -629,24 +701,30 @@ mod tests {
                 money_column,
             ],
         };
-        let mut decoder = Decoder::new(
-            Source {
+        let mut decoder = Decoder::new(DecoderConfig {
+            source: Source {
                 kind: "postgresql".into(),
                 version: "15.19".into(),
                 id: "postgresql:123456:1:16384:Q0RDX3Rlc3Q".into(),
             },
-            ServerBuildIdentity::new("postgresql", "community", "15.19", "PostgreSQL 15.19"),
-            "C".into(),
-            "CDC_test".into(),
-            [(43, table)].into_iter().collect(),
-            [
+            server_build: ServerBuildIdentity::new(
+                "postgresql",
+                "community",
+                "15.19",
+                "PostgreSQL 15.19",
+            ),
+            lc_monetary: "C".into(),
+            database: "CDC_test".into(),
+            tables: [(43, table)].into_iter().collect(),
+            type_names: [
                 (20, ("pg_catalog".into(), "int8".into())),
                 (790, ("pg_catalog".into(), "money".into())),
             ]
             .into_iter()
             .collect(),
-            1024 * 1024,
-        );
+            type_catalog: test_type_catalog(),
+            max_bytes: 1024 * 1024,
+        });
         let timestamp = 1_700_000_000_i64 * 1_000_000;
         decoder
             .push(
@@ -741,6 +819,170 @@ mod tests {
         );
         let error = crate::validate_change_event(tampered).unwrap_err();
         assert!(error.to_string().contains("source representation context"));
+    }
+
+    #[test]
+    fn captures_installed_but_unavailable_extension_as_representation_only() {
+        use crate::type_mapping::{SourceExtension, SourceTypeDefinition};
+
+        let extension_type = SourceTypeDefinition::extension(
+            9_001,
+            "app",
+            "custom_type",
+            "custom_extension",
+            "custom-extension.text.v1",
+            "UTF-8",
+            Some(change_event::LogicalType::text("UTF8", None)),
+        );
+        let catalog = crate::SourceTypeCatalog::with_extensions(
+            [
+                SourceTypeDefinition::builtin(20, "pg_catalog", "int8"),
+                extension_type.clone(),
+            ],
+            [SourceExtension {
+                name: "custom_extension".into(),
+                version: "2.1".into(),
+                schema: "app".into(),
+                installed: true,
+                available: false,
+                target_compatible: None,
+            }],
+        );
+        let mapping =
+            crate::source_type_mapping_with_catalog_for_version("15", "app.custom_type", &catalog)
+                .unwrap();
+        assert!(matches!(
+            mapping.logical_type,
+            change_event::LogicalType::Raw { ref codec_identity, .. }
+                if codec_identity == "postgresql.pgoutput.text-envelope.v1"
+        ));
+        let closure = catalog.definition_closure(extension_type.oid).unwrap();
+        let closure_evidence = serde_json::to_string(&closure).unwrap();
+        let column = catalog::Column {
+            name: "payload".into(),
+            oid: extension_type.oid,
+            modifier: -1,
+            native_type: "app.custom_type".into(),
+            type_schema: extension_type.schema.clone(),
+            type_name: extension_type.name.clone(),
+            type_definition_digest: extension_type.definition_digest.clone(),
+            type_definition_evidence: serde_json::to_string(&extension_type).unwrap(),
+            type_definition_closure_evidence: closure_evidence,
+            type_definition_closure_digest: closure.digest(),
+            representation_only: true,
+            representation_capture_allowed: true,
+            key: None,
+        };
+        let catalog_digest = catalog.evidence_digest();
+        let table = Table {
+            oid: 43,
+            schema: "public".into(),
+            name: "extension_values".into(),
+            identity: b'd',
+            source_type_catalog_digest: catalog_digest,
+            columns: vec![
+                catalog::Column {
+                    name: "id".into(),
+                    oid: 20,
+                    modifier: -1,
+                    native_type: "bigint".into(),
+                    type_schema: "pg_catalog".into(),
+                    type_name: "int8".into(),
+                    type_definition_digest: "1".repeat(64),
+                    type_definition_evidence: "{}".into(),
+                    type_definition_closure_evidence: String::new(),
+                    type_definition_closure_digest: String::new(),
+                    representation_only: false,
+                    representation_capture_allowed: false,
+                    key: Some(0),
+                },
+                column,
+            ],
+        };
+        let mut decoder = Decoder::new(DecoderConfig {
+            source: Source {
+                kind: "postgresql".into(),
+                version: "15.19".into(),
+                id: "postgresql:123456:1:16384:Q0RDX3Rlc3Q".into(),
+            },
+            server_build: ServerBuildIdentity::new(
+                "postgresql",
+                "community",
+                "15.19",
+                "PostgreSQL 15.19",
+            ),
+            lc_monetary: "C".into(),
+            database: "CDC_test".into(),
+            tables: [(43, table)].into_iter().collect(),
+            type_names: [
+                (20, ("pg_catalog".into(), "int8".into())),
+                (9_001, ("app".into(), "custom_type".into())),
+            ]
+            .into_iter()
+            .collect(),
+            type_catalog: catalog,
+            max_bytes: 1024 * 1024,
+        });
+        let timestamp = 1_700_000_000_i64 * 1_000_000;
+        decoder
+            .push(
+                M::Begin {
+                    final_lsn: 16,
+                    timestamp,
+                    xid: 99,
+                },
+                1,
+            )
+            .unwrap();
+        decoder
+            .push(
+                M::Relation {
+                    relation_id: 43,
+                    namespace: "public".into(),
+                    relation_name: "extension_values".into(),
+                    replica_identity: b'd',
+                    columns: vec![
+                        ColumnInfo::new(1, "id".into(), 20, -1),
+                        ColumnInfo::new(0, "payload".into(), 9_001, -1),
+                    ],
+                },
+                1,
+            )
+            .unwrap();
+        decoder
+            .push(
+                M::Insert {
+                    relation_id: 43,
+                    tuple: TupleData::new(vec![
+                        ColumnData::text(b"7".to_vec()),
+                        ColumnData::text(b"extension-output".to_vec()),
+                    ]),
+                },
+                1,
+            )
+            .unwrap();
+        let transaction = decoder
+            .push(
+                M::Commit {
+                    flags: 0,
+                    commit_lsn: 16,
+                    end_lsn: 32,
+                    timestamp,
+                },
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        let Datum::SourceRepresentationEnvelope(envelope) =
+            &transaction.transaction().changes[0].after.as_ref().unwrap()[1].datum
+        else {
+            panic!("extension value must be kept as a representation envelope")
+        };
+        assert_eq!(envelope.raw_bytes().unwrap(), b"extension-output");
+        assert_eq!(
+            envelope.context.type_metadata["type_definition_closure_digest"],
+            format!("sha256:{}", closure.digest())
+        );
     }
 
     #[test]

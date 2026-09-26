@@ -1,9 +1,10 @@
 //! PostgreSQL 15's strict Source Type Mapping.
 //!
 //! PostgreSQL's formatted catalog type is used only as source-definition
-//! evidence.  Values are never inspected to choose a mapping.  Types whose
-//! comparison, padding, JSON, array, or extension semantics are not carried
-//! by the current ChangeEvent contract fail closed.
+//! evidence. Values are never inspected to choose a mapping. Qualified
+//! semantic codecs produce LogicalValues; other safely framed pgoutput text
+//! values are captured as source-representation envelopes and remain distinct
+//! from semantic values until a user selects a qualified representation.
 
 use change_event::{
     ConnectorIdentity, DuplicateKeyPolicy, JsonProfile, LengthUnit, LogicalField, LogicalType,
@@ -12,9 +13,9 @@ use change_event::{
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, error::Error, fmt};
 
-pub const MAPPING_VERSION: &str = "postgresql-15.source-type-mapping.v2";
-pub const MAPPING_VERSION_16: &str = "postgresql-16.source-type-mapping.v2";
-pub const MAPPING_VERSION_17: &str = "postgresql-17.source-type-mapping.v2";
+pub const MAPPING_VERSION: &str = "postgresql-15.source-type-mapping.v3";
+pub const MAPPING_VERSION_16: &str = "postgresql-16.source-type-mapping.v3";
+pub const MAPPING_VERSION_17: &str = "postgresql-17.source-type-mapping.v3";
 
 /// The source-owned catalog evidence needed to map a user-defined PostgreSQL
 /// type.  The mapping layer intentionally receives this as an immutable
@@ -52,8 +53,166 @@ impl SourceTypeCatalog {
             .collect()
     }
 
+    pub(crate) fn definition_closure(
+        &self,
+        root_oid: u32,
+    ) -> Result<SourceTypeDefinitionClosure, String> {
+        use std::collections::HashSet;
+
+        fn visit(
+            catalog: &SourceTypeCatalog,
+            oid: u32,
+            seen: &mut HashSet<u32>,
+            types: &mut Vec<SourceTypeDefinition>,
+        ) -> Result<(), String> {
+            if !seen.insert(oid) {
+                return Ok(());
+            }
+            let definition = catalog
+                .types
+                .iter()
+                .find(|definition| definition.oid == oid)
+                .ok_or_else(|| format!("PostgreSQL type dependency OID {oid} is missing"))?;
+            types.push(definition.clone());
+            let dependencies = match &definition.kind {
+                SourceTypeDefinitionKind::Domain { base_oid, .. } => vec![*base_oid],
+                SourceTypeDefinitionKind::Composite { fields } => {
+                    fields.iter().map(|field| field.type_oid).collect()
+                }
+                SourceTypeDefinitionKind::Array { element_oid, .. } => vec![*element_oid],
+                SourceTypeDefinitionKind::Range { subtype_oid } => vec![*subtype_oid],
+                SourceTypeDefinitionKind::MultiRange { range_oid } => vec![*range_oid],
+                _ => Vec::new(),
+            };
+            for dependency in dependencies {
+                visit(catalog, dependency, seen, types)?;
+            }
+            Ok(())
+        }
+
+        let mut types = Vec::new();
+        visit(self, root_oid, &mut HashSet::new(), &mut types)?;
+        types.sort_by_key(|definition| definition.oid);
+        let mut extension_names = types
+            .iter()
+            .filter_map(|definition| match &definition.kind {
+                SourceTypeDefinitionKind::Extension { extension, .. } => Some(extension),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        extension_names.sort();
+        extension_names.dedup();
+        let extensions = extension_names
+            .into_iter()
+            .map(|name| {
+                self.extensions
+                    .iter()
+                    .find(|extension| extension.name.eq_ignore_ascii_case(name))
+                    .cloned()
+                    .ok_or_else(|| format!("PostgreSQL extension evidence for {name} is missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SourceTypeDefinitionClosure { types, extensions })
+    }
+
     fn digest(&self) -> String {
         self.evidence_digest()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SourceTypeDefinitionClosure {
+    pub types: Vec<SourceTypeDefinition>,
+    pub extensions: Vec<SourceExtension>,
+}
+
+impl SourceTypeDefinitionClosure {
+    pub(crate) fn digest(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("type closure is serializable");
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+pub(crate) fn validate_type_definition_closure(
+    closure: &SourceTypeDefinitionClosure,
+    root_oid: u32,
+) -> bool {
+    let definitions = closure
+        .types
+        .iter()
+        .map(|definition| (definition.oid, definition))
+        .collect::<std::collections::HashMap<_, _>>();
+    if definitions.len() != closure.types.len()
+        || !definitions.contains_key(&root_oid)
+        || closure
+            .types
+            .windows(2)
+            .any(|pair| pair[0].oid >= pair[1].oid)
+    {
+        return false;
+    }
+    if closure
+        .types
+        .iter()
+        .any(|definition| definition.definition_digest != expected_definition_digest(definition))
+    {
+        return false;
+    }
+    let mut required_extensions = closure
+        .types
+        .iter()
+        .filter_map(|definition| match &definition.kind {
+            SourceTypeDefinitionKind::Extension { extension, .. } => Some(extension.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    required_extensions.sort_by_key(|name| name.to_ascii_lowercase());
+    required_extensions.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if required_extensions.len() != closure.extensions.len()
+        || closure.extensions.iter().any(|extension| {
+            !extension.installed
+                || extension.version.trim().is_empty()
+                || extension.schema.trim().is_empty()
+        })
+        || closure
+            .extensions
+            .windows(2)
+            .any(|pair| pair[0].name.to_ascii_lowercase() >= pair[1].name.to_ascii_lowercase())
+        || required_extensions
+            .iter()
+            .zip(&closure.extensions)
+            .any(|(required, actual)| !required.eq_ignore_ascii_case(&actual.name))
+    {
+        return false;
+    }
+
+    let mut reachable = std::collections::HashSet::new();
+    let mut pending = vec![root_oid];
+    while let Some(oid) = pending.pop() {
+        if !reachable.insert(oid) {
+            continue;
+        }
+        let Some(definition) = definitions.get(&oid) else {
+            return false;
+        };
+        pending.extend(type_definition_dependencies(definition));
+    }
+    reachable.len() == definitions.len()
+}
+
+fn type_definition_dependencies(definition: &SourceTypeDefinition) -> Vec<u32> {
+    match &definition.kind {
+        SourceTypeDefinitionKind::Domain { base_oid, .. } => vec![*base_oid],
+        SourceTypeDefinitionKind::Composite { fields } => {
+            fields.iter().map(|field| field.type_oid).collect()
+        }
+        SourceTypeDefinitionKind::Array { element_oid, .. } => vec![*element_oid],
+        SourceTypeDefinitionKind::Range { subtype_oid } => vec![*subtype_oid],
+        SourceTypeDefinitionKind::MultiRange { range_oid } => vec![*range_oid],
+        _ => Vec::new(),
     }
 }
 
@@ -107,6 +266,8 @@ pub enum SourceTypeDefinitionKind {
     },
     Array {
         element_oid: u32,
+        #[serde(default = "default_array_delimiter")]
+        delimiter: char,
     },
     Range {
         subtype_oid: u32,
@@ -218,7 +379,31 @@ impl SourceTypeDefinition {
             oid,
             schema: schema.into(),
             name: name.into(),
-            kind: SourceTypeDefinitionKind::Array { element_oid },
+            kind: SourceTypeDefinitionKind::Array {
+                element_oid,
+                delimiter: ',',
+            },
+            collation: None,
+            definition_digest: String::new(),
+        }
+        .finalized()
+    }
+
+    pub fn array_with_delimiter(
+        oid: u32,
+        schema: impl Into<String>,
+        name: impl Into<String>,
+        element_oid: u32,
+        delimiter: char,
+    ) -> Self {
+        Self {
+            oid,
+            schema: schema.into(),
+            name: name.into(),
+            kind: SourceTypeDefinitionKind::Array {
+                element_oid,
+                delimiter,
+            },
             collation: None,
             definition_digest: String::new(),
         }
@@ -290,6 +475,10 @@ impl SourceTypeDefinition {
     }
 }
 
+fn default_array_delimiter() -> char {
+    ','
+}
+
 fn expected_definition_digest(definition: &SourceTypeDefinition) -> String {
     let bytes = serde_json::to_vec(&(
         definition.oid,
@@ -352,15 +541,6 @@ impl SourceTypeMappingError {
             code: format!("postgresql{version}.source_type.codec_unqualified"),
             message: format!(
                 "PostgreSQL {version} type {native_type:?} has no verified source codec"
-            ),
-        }
-    }
-
-    fn extension_unavailable(version: &str, native_type: &str, extension: &str) -> Self {
-        Self {
-            code: format!("postgresql{version}.source_type.extension_unavailable"),
-            message: format!(
-                "PostgreSQL {version} type {native_type:?} requires extension {extension:?}, which is not available"
             ),
         }
     }
@@ -577,7 +757,10 @@ fn logical_type_with_catalog(
                 native_type,
             ));
         }
-        if let Some(definition) = builtin_array_definition(element, catalog) {
+        let mut logical = logical_type_with_catalog(element, catalog, version)?;
+        if matches!(logical, LogicalType::Raw { .. }) {
+            let definition = array_definition_for_element(element, catalog, version)?
+                .ok_or_else(|| SourceTypeMappingError::missing_catalog(version, native_type))?;
             return Ok(LogicalType::raw(
                 "postgresql.pgoutput.text-envelope.v1",
                 format!("{}.{}", definition.schema, definition.name),
@@ -585,7 +768,6 @@ fn logical_type_with_catalog(
                 "UTF-8",
             ));
         }
-        let mut logical = logical_type_with_catalog(element, catalog, version)?;
         for _ in 0..dimensions {
             logical = LogicalType::Array {
                 element: Box::new(logical),
@@ -598,31 +780,58 @@ fn logical_type_with_catalog(
             members: enum_members(native_type, version)?,
         });
     }
+    if let Some(canonical_builtin) = builtin_catalog_name(native_type) {
+        if let Some(logical) = logical_type_from_builtin(canonical_builtin, version)? {
+            return Ok(logical);
+        }
+        if let Some(definition) = catalog.types.iter().find(|definition| {
+            definition.schema == "pg_catalog" && definition.name == canonical_builtin
+        }) {
+            return logical_type_from_definition(definition, catalog, version, &mut Vec::new());
+        }
+    }
     if let Some(logical) = logical_type_from_builtin(native_type, version)? {
         return Ok(logical);
     }
     let definition = find_definition(native_type, catalog, version)?;
+    if !has_semantic_codec(catalog, definition.oid)
+        && !matches!(definition.kind, SourceTypeDefinitionKind::Extension { .. })
+    {
+        return Ok(LogicalType::raw(
+            "postgresql.pgoutput.text-envelope.v1",
+            format!("{}.{}", definition.schema, definition.name),
+            definition_digest(definition, version)?,
+            "UTF-8",
+        ));
+    }
     let mut stack = Vec::new();
     logical_type_from_definition(definition, catalog, version, &mut stack)
 }
 
-fn builtin_array_definition<'a>(
+fn array_definition_for_element<'a>(
     element_native_type: &str,
     catalog: &'a SourceTypeCatalog,
-) -> Option<&'a SourceTypeDefinition> {
-    let element_name = builtin_catalog_name(element_native_type)?;
-    let element_oid = catalog
-        .types
-        .iter()
-        .find(|definition| definition.schema == "pg_catalog" && definition.name == element_name)?
-        .oid;
-    catalog.types.iter().find(|definition| {
+    version: &str,
+) -> Result<Option<&'a SourceTypeDefinition>, SourceTypeMappingError> {
+    let element_definition = find_definition(element_native_type, catalog, version)
+        .ok()
+        .or_else(|| {
+            let name = builtin_catalog_name(element_native_type)?;
+            catalog
+                .types
+                .iter()
+                .find(|definition| definition.schema == "pg_catalog" && definition.name == name)
+        });
+    let Some(element_definition) = element_definition else {
+        return Ok(None);
+    };
+    Ok(catalog.types.iter().find(|definition| {
         definition.schema == "pg_catalog"
             && matches!(
                 definition.kind,
-                SourceTypeDefinitionKind::Array { element_oid: known } if known == element_oid
+                SourceTypeDefinitionKind::Array { element_oid: known, .. } if known == element_definition.oid
             )
-    })
+    }))
 }
 
 fn builtin_catalog_name(native_type: &str) -> Option<&'static str> {
@@ -746,6 +955,12 @@ fn logical_type_from_builtin(
         "xml" => Ok(LogicalType::xml()),
         "interval" => interval(native_type, version),
         "numeric" | "decimal" => numeric(native_type, version),
+        "timestamp" | "timestamp without time zone" => Ok(LogicalType::LocalDatetime {
+            fractional_precision: 6,
+        }),
+        "timestamptz" | "timestamp with time zone" => Ok(LogicalType::Instant {
+            fractional_precision: 6,
+        }),
         // `money` formatting depends on lc_monetary. Until a semantic money
         // codec is qualified, the catalog-backed mapping uses the explicit
         // pgoutput text representation path below.
@@ -918,6 +1133,57 @@ fn definition_by_oid<'a>(
         })
 }
 
+pub(crate) fn has_semantic_codec(catalog: &SourceTypeCatalog, oid: u32) -> bool {
+    fn visit(catalog: &SourceTypeCatalog, oid: u32, stack: &mut Vec<u32>) -> bool {
+        if stack.contains(&oid) {
+            return false;
+        }
+        let Some(definition) = catalog
+            .types
+            .iter()
+            .find(|definition| definition.oid == oid)
+        else {
+            return false;
+        };
+        stack.push(oid);
+        let result = match &definition.kind {
+            SourceTypeDefinitionKind::Builtin { .. } => crate::types::supported(oid),
+            SourceTypeDefinitionKind::Enum { .. } => true,
+            SourceTypeDefinitionKind::Domain { base_oid, .. } => visit(catalog, *base_oid, stack),
+            SourceTypeDefinitionKind::Composite { fields } => fields
+                .iter()
+                .all(|field| visit(catalog, field.type_oid, stack)),
+            SourceTypeDefinitionKind::Array { element_oid, .. } => {
+                visit(catalog, *element_oid, stack)
+            }
+            SourceTypeDefinitionKind::Range { subtype_oid } => visit(catalog, *subtype_oid, stack),
+            SourceTypeDefinitionKind::MultiRange { range_oid } => {
+                let Some(range) = catalog.types.iter().find(|value| value.oid == *range_oid) else {
+                    stack.pop();
+                    return false;
+                };
+                matches!(&range.kind, SourceTypeDefinitionKind::Range { subtype_oid }
+                    if visit(catalog, *subtype_oid, stack))
+            }
+            SourceTypeDefinitionKind::Extension { extension, .. } => {
+                let installed = catalog.extensions.iter().any(|candidate| {
+                    candidate.name.eq_ignore_ascii_case(extension)
+                        && candidate.installed
+                        && candidate.available
+                });
+                installed
+                    && ((extension.eq_ignore_ascii_case("hstore")
+                        && definition.name.eq_ignore_ascii_case("hstore"))
+                        || (extension.eq_ignore_ascii_case("postgis")
+                            && matches!(definition.name.as_str(), "geometry" | "geography")))
+            }
+        };
+        stack.pop();
+        result
+    }
+    visit(catalog, oid, &mut Vec::new())
+}
+
 fn logical_type_from_definition(
     definition: &SourceTypeDefinition,
     catalog: &SourceTypeCatalog,
@@ -936,7 +1202,9 @@ fn logical_type_from_definition(
     stack.push(definition.oid);
     let result = match &definition.kind {
         SourceTypeDefinitionKind::Builtin { native_type } => {
-            if let Some(logical_type) = logical_type_from_builtin(native_type, version)? {
+            if let Some(logical_type) =
+                logical_type_for_catalog_builtin(definition.oid, native_type, version)?
+            {
                 Ok(logical_type)
             } else if definition.schema == "pg_catalog" {
                 Ok(LogicalType::raw(
@@ -994,31 +1262,21 @@ fn logical_type_from_definition(
                 fields: logical_fields,
             })
         }
-        SourceTypeDefinitionKind::Array { element_oid } if definition.schema == "pg_catalog" => {
-            Ok(LogicalType::raw(
-                "postgresql.pgoutput.text-envelope.v1",
-                format!("{}.{}", definition.schema, definition.name),
-                definition_digest(definition, version)?,
-                "UTF-8",
-            ))
-        }
-        SourceTypeDefinitionKind::Range { .. } | SourceTypeDefinitionKind::MultiRange { .. }
-            if definition.schema == "pg_catalog" =>
-        {
-            Ok(LogicalType::raw(
-                "postgresql.pgoutput.text-envelope.v1",
-                format!("{}.{}", definition.schema, definition.name),
-                definition_digest(definition, version)?,
-                "UTF-8",
-            ))
-        }
-        SourceTypeDefinitionKind::Array { element_oid } => {
+        SourceTypeDefinitionKind::Array { element_oid, .. } => {
             let element = definition_by_oid(*element_oid, catalog, version)?;
-            Ok(LogicalType::Array {
-                element: Box::new(logical_type_from_definition(
-                    element, catalog, version, stack,
-                )?),
-            })
+            let logical_element = logical_type_from_definition(element, catalog, version, stack)?;
+            if matches!(logical_element, LogicalType::Raw { .. }) {
+                Ok(LogicalType::raw(
+                    "postgresql.pgoutput.text-envelope.v1",
+                    format!("{}.{}", definition.schema, definition.name),
+                    definition_digest(definition, version)?,
+                    "UTF-8",
+                ))
+            } else {
+                Ok(LogicalType::Array {
+                    element: Box::new(logical_element),
+                })
+            }
         }
         SourceTypeDefinitionKind::Range { subtype_oid } => {
             let subtype = definition_by_oid(*subtype_oid, catalog, version)?;
@@ -1061,17 +1319,18 @@ fn logical_type_from_definition(
                     version,
                     &format!("extension {extension} type {}", definition.name),
                 ))
-            } else if extension_state.is_some_and(|known| !known.available) {
-                Err(SourceTypeMappingError::extension_unavailable(
-                    version,
-                    &definition.name,
-                    extension,
-                ))
             } else if extension_state.is_some_and(|known| known.target_compatible == Some(false)) {
                 Err(SourceTypeMappingError::extension_target_blocked(
                     version,
                     &definition.name,
                     extension,
+                ))
+            } else if extension_state.is_some_and(|known| !known.available) {
+                Ok(LogicalType::raw(
+                    "postgresql.pgoutput.text-envelope.v1",
+                    format!("{}.{}", definition.schema, definition.name),
+                    definition_digest(definition, version)?,
+                    "UTF-8",
                 ))
             } else if let Some(logical_type) = logical_type {
                 Ok(logical_type.clone())
@@ -1079,9 +1338,11 @@ fn logical_type_from_definition(
                 .as_deref()
                 .is_none_or(|identity| identity.trim().is_empty())
             {
-                Err(SourceTypeMappingError::missing_codec(
-                    version,
-                    &definition.name,
+                Ok(LogicalType::raw(
+                    "postgresql.pgoutput.text-envelope.v1",
+                    format!("{}.{}", definition.schema, definition.name),
+                    definition_digest(definition, version)?,
+                    encoding,
                 ))
             } else {
                 let Some(codec_identity) = codec_identity else {
@@ -1101,6 +1362,30 @@ fn logical_type_from_definition(
     };
     stack.pop();
     result
+}
+
+fn logical_type_for_catalog_builtin(
+    oid: u32,
+    native_type: &str,
+    version: &str,
+) -> Result<Option<LogicalType>, SourceTypeMappingError> {
+    let logical = match oid {
+        1083 => Some(LogicalType::LocalTime {
+            fractional_precision: 6,
+        }),
+        1114 => Some(LogicalType::LocalDatetime {
+            fractional_precision: 6,
+        }),
+        1184 => Some(LogicalType::Instant {
+            fractional_precision: 6,
+        }),
+        1266 => Some(LogicalType::offset_time(6)),
+        _ => None,
+    };
+    logical.map_or_else(
+        || logical_type_from_builtin(native_type, version),
+        |value| Ok(Some(value)),
+    )
 }
 
 fn validate_enum_labels(labels: &[String], version: &str) -> Result<(), SourceTypeMappingError> {
@@ -1743,12 +2028,14 @@ mod tests {
 
         let mut unavailable = catalog.clone();
         unavailable.extensions[0].available = false;
-        assert_eq!(
+        assert!(matches!(
             source_type_mapping_with_catalog("public.geometry", &unavailable)
-                .unwrap_err()
-                .code(),
-            "postgresql15.source_type.extension_unavailable"
-        );
+                .unwrap()
+                .logical_type,
+            LogicalType::Raw { ref codec_identity, .. }
+                if codec_identity == "postgresql.pgoutput.text-envelope.v1"
+        ));
+        assert!(!has_semantic_codec(&unavailable, 9_001));
 
         let mut target_blocked = catalog.clone();
         target_blocked.extensions[0].target_compatible = Some(false);
@@ -1767,5 +2054,79 @@ mod tests {
                 .code(),
             "postgresql15.source_type.invalid_declaration"
         );
+    }
+
+    #[test]
+    fn recursive_type_definition_closure_is_complete_canonical_and_extension_bound() {
+        let catalog = SourceTypeCatalog::with_extensions(
+            [
+                SourceTypeDefinition::builtin(23, "pg_catalog", "int4"),
+                SourceTypeDefinition::extension(
+                    9_002,
+                    "extensions",
+                    "hstore",
+                    "hstore",
+                    "postgresql.hstore.text.v1",
+                    "UTF-8",
+                    Some(LogicalType::Map {
+                        key: Box::new(LogicalType::text("UTF8", None)),
+                        value: Box::new(LogicalType::text("UTF8", None)),
+                    }),
+                ),
+                SourceTypeDefinition::composite(
+                    9_003,
+                    "app",
+                    "record_with_map",
+                    [
+                        SourceTypeField::new("id", 23, false),
+                        SourceTypeField::new("attributes", 9_002, true),
+                    ],
+                ),
+            ],
+            [SourceExtension {
+                name: "hstore".into(),
+                version: "1.8".into(),
+                schema: "extensions".into(),
+                installed: true,
+                available: true,
+                target_compatible: None,
+            }],
+        );
+        let closure = catalog.definition_closure(9_003).unwrap();
+        assert_eq!(
+            closure
+                .types
+                .iter()
+                .map(|definition| definition.oid)
+                .collect::<Vec<_>>(),
+            [23, 9_002, 9_003]
+        );
+        assert!(validate_type_definition_closure(&closure, 9_003));
+
+        let mut missing = closure.clone();
+        missing.types.retain(|definition| definition.oid != 9_002);
+        assert!(!validate_type_definition_closure(&missing, 9_003));
+
+        let mut extra = closure.clone();
+        extra
+            .types
+            .push(SourceTypeDefinition::builtin(25, "pg_catalog", "text"));
+        extra.types.sort_by_key(|definition| definition.oid);
+        assert!(!validate_type_definition_closure(&extra, 9_003));
+
+        let mut no_extension_evidence = closure.clone();
+        no_extension_evidence.extensions.clear();
+        assert!(!validate_type_definition_closure(
+            &no_extension_evidence,
+            9_003
+        ));
+
+        let mut unavailable = closure.clone();
+        unavailable.extensions[0].available = false;
+        assert!(validate_type_definition_closure(&unavailable, 9_003));
+
+        let mut not_installed = closure;
+        not_installed.extensions[0].installed = false;
+        assert!(!validate_type_definition_closure(&not_installed, 9_003));
     }
 }

@@ -111,7 +111,7 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "source")
             .count(),
-        12
+        15
     );
     let postgres_builtin_capture_suites: BTreeSet<_> = suites
         .iter()
@@ -148,6 +148,43 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             argument
                 .as_str()
                 .is_some_and(|argument| argument.ends_with("_all_builtin_types_capture"))
+        }));
+    }
+    let postgres_recursive_capture_suites: BTreeSet<_> = suites
+        .iter()
+        .filter(|suite| {
+            suite["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("postgresql_") && id.ends_with(".recursive_types"))
+        })
+        .map(|suite| suite["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        postgres_recursive_capture_suites,
+        BTreeSet::from([
+            "postgresql_15.recursive_types",
+            "postgresql_16.recursive_types",
+            "postgresql_17.recursive_types",
+        ])
+    );
+    for suite in suites.iter().filter(|suite| {
+        suite["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("postgresql_") && id.ends_with(".recursive_types"))
+    }) {
+        assert_eq!(suite["mode"], "Live");
+        assert_eq!(suite["category"], "source");
+        assert!(
+            suite["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|argument| { argument == "live_recursive_capture" })
+        );
+        assert!(suite["args"].as_array().unwrap().iter().any(|argument| {
+            argument
+                .as_str()
+                .is_some_and(|argument| argument.ends_with("_recursive_type_capture"))
         }));
     }
     let all_mysql_type_capture_suites: BTreeSet<_> = suites

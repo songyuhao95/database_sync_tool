@@ -622,11 +622,31 @@ fn logical_value_at_depth(value: &LogicalValue, depth: usize) -> Result<()> {
             elements,
             dimensions,
             lower_bounds,
+            dimension_lengths,
         } => {
-            ensure(
-                *dimensions > 0 && usize::from(*dimensions) == lower_bounds.len(),
-                "array dimensions and lower bounds do not agree",
-            )?;
+            if *dimensions == 0 {
+                ensure(
+                    elements.is_empty() && lower_bounds.is_empty() && dimension_lengths.is_empty(),
+                    "zero-dimensional arrays must be empty",
+                )?;
+            } else {
+                ensure(
+                    usize::from(*dimensions) == lower_bounds.len()
+                        && (dimension_lengths.is_empty()
+                            || usize::from(*dimensions) == dimension_lengths.len()),
+                    "array dimensions and lower bounds do not agree",
+                )?;
+                if !dimension_lengths.is_empty() {
+                    let element_count = dimension_lengths
+                        .iter()
+                        .try_fold(1_u64, |product, length| product.checked_mul(*length));
+                    ensure(
+                        element_count.and_then(|count| usize::try_from(count).ok())
+                            == Some(elements.len()),
+                        "array dimension lengths do not match the flattened element count",
+                    )?;
+                }
+            }
             for element in elements {
                 logical_value_at_depth(element, depth + 1)?;
             }
