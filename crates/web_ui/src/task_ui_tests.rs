@@ -74,7 +74,19 @@ fn task_tree_controls_keep_hidden_database_selector_and_error_text_visible() {
     assert!(tasks.contains("task-compatibility-status"));
     assert!(tasks.contains("待预检"));
     assert!(tasks.contains("验证能力"));
-    assert!(tasks.contains("loss.explanation"));
+    assert!(tasks.contains("function compatibilityLossSummary"));
+    assert!(tasks.contains("function appendCompatibilityCandidates"));
+    assert!(tasks.contains("response.available_candidates?.length"));
+    assert!(tasks.contains("选择目的端如何保存这个源字段"));
+    assert!(tasks.contains("只保留源端表示（不会还原为原生值）"));
+    assert!(tasks.contains("LogicalValue 可读回"));
+    assert!(tasks.contains("riskConfirmedDigest!==plan.plan_digest"));
+    assert!(tasks.contains("源端捕获能力缺口"));
+    assert!(tasks.contains("目标能力"));
+    assert!(
+        include_str!("tasks.rs")
+            .contains("pub available_candidates: Vec<change_event::TargetTypeCandidate>")
+    );
     assert!(tasks.contains("nullable"));
     assert!(tasks.contains("target_probe"));
     assert!(tasks.contains("compatibility-technical"));

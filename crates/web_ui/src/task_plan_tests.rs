@@ -141,6 +141,8 @@ fn task_page_exposes_plan_status_and_requalification_action() {
     assert!(script.contains("task.plan_status"));
     assert!(script.contains("ColumnConversionPlan"));
     assert!(script.contains("兼容计划预览"));
-    assert!(script.contains("转换参数"));
+    assert!(script.contains("转换规则"));
+    assert!(script.contains("方案："));
+    assert!(!script.contains("parameterText"));
     assert!(script.contains("示例转换"));
 }

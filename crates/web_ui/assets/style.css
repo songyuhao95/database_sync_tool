@@ -422,6 +422,17 @@ button.tree-row:hover{background:var(--sub)}
 .compatibility-human-row{display:grid;grid-template-columns:145px minmax(0,1fr);gap:10px;align-items:start;font-size:12px;line-height:1.55}
 .compatibility-human-row b{color:var(--text)}
 .compatibility-human-row p{margin:0;color:var(--muted);overflow-wrap:anywhere}
+.compatibility-candidates{display:grid;gap:9px;margin:0;padding:12px;border:1px solid var(--line);border-radius:5px}
+.compatibility-candidates legend{padding:0 5px;color:var(--text);font-size:14px;font-weight:600}
+.compatibility-candidate{display:grid;grid-template-columns:17px minmax(0,1fr);gap:10px;align-items:start;padding:12px;border:1px solid var(--line);border-radius:5px;background:var(--card);cursor:pointer}
+.compatibility-candidate:has(input:checked){border-color:var(--brand);background:color-mix(in srgb,var(--brand) 7%,var(--card));box-shadow:inset 3px 0 var(--brand)}
+.compatibility-candidate>input{width:16px;height:16px;margin:2px 0 0;accent-color:var(--brand)}
+.compatibility-candidate-body{display:grid;gap:6px;min-width:0;font-size:12px;line-height:1.5}
+.compatibility-candidate-title{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;color:var(--text)}
+.compatibility-candidate-badges{color:var(--muted);font-size:11px;font-weight:400}
+.compatibility-candidate-explanation{color:var(--muted);overflow-wrap:anywhere}
+.compatibility-candidate-confirm{font-size:11px}
+.compatibility-no-plan{margin:0;padding:11px 12px;border-left:3px solid var(--warn);border-radius:3px;background:color-mix(in srgb,var(--warn) 7%,var(--card));line-height:1.55}
 .compatibility-risk-badge{width:max-content;margin:2px 0 0;padding:3px 8px;border-radius:12px;background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn);font-size:12px}
 .compatibility-advanced,.compatibility-technical{border:1px solid var(--line);border-radius:4px;padding:9px 11px;color:var(--muted);font-size:12px}
 .compatibility-advanced summary,.compatibility-technical summary{cursor:pointer;color:var(--text)}

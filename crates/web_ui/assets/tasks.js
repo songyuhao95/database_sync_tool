@@ -57,7 +57,15 @@ function taskModeLabel(mode) {
 function conversionKind(parameters) {
   return parameters.range_kind||parameters.conversion_kind||parameters.value_strategy||(parameters.json_strategy?'json':undefined);
 }
+function compatibilityQualificationLabel(value) {
+  return {EXACT:'原生等价',RANGE_CHECKED:'范围内值完整保留',EXPLICIT_CONVERSION:'显式转换',UNSUPPORTED:'暂不可用'}[String(value||'').toUpperCase()]||'待资格验证';
+}
+function compatibilityStorageLabel(value) {
+  return {postgresql_text_tagged_json:'PostgreSQL TEXT 值载体',postgresql_bytea:'PostgreSQL BYTEA 表示载体',mysql_json_tagged_value:'MySQL JSON 值载体',mysql_longblob:'MySQL LONGBLOB 表示载体'}[value]||'预先创建的目的端载体列';
+}
 function conversionExample(kind,parameters) {
+  if(kind==='logical_value_json')return '示例：源字段值 → 带有 LogicalValue 类型信息的 JSON/TEXT 记录 → 使用 CDC 的值格式读取回原值';
+  if(kind==='source_representation')return '示例：源数据库协议负载和类型证据 → 表示封套 → 从 BYTEA/LONGBLOB 取回封套；这不会把它还原成目的库原生字段值';
   if(kind==='binary')return '示例：仅按 raw bytes 写入；长度、固定填充和字节边界不满足即拒绝，禁止降级为文本';
   if(kind==='bit_string')return '示例：按声明的 bit 长度、MSB/LSB 顺序和末字节 padding 写入；长度或格式不符即拒绝';
   if(kind==='spatial')return '示例：必须同时匹配 WKB/EWKB、几何类型、维度、SRID 和 CRS；任一元数据不明即阻断';
@@ -75,6 +83,8 @@ function conversionExample(kind,parameters) {
   return '示例：按已保存的类型规则执行；格式、能力或结构失败时回滚事务且不推进 checkpoint';
 }
 function conversionTarget(kind,parameters,nativeType) {
+  if(kind==='logical_value_json')return '目标结果：CDC 通用值载体（'+(nativeType||'JSON/TEXT')+'），不是源数据库原生列类型';
+  if(kind==='source_representation')return '目标结果：源协议表示封套（'+(nativeType||'BYTEA/BLOB')+'），只保存可取回的来源表示';
   if(kind==='binary')return '目标结果：raw bytes（不转文本）'+(parameters.target_length?`，目标长度 ${parameters.target_length} bytes`:'' );
   if(kind==='bit_string')return '目标结果：bit string（长度 '+(parameters.target_bit_length||parameters.target_length||'未知')+' bits，'+(parameters.target_bit_order||'未声明')+'，padding '+(parameters.target_padding||'未声明')+'）';
   if(kind==='spatial')return '目标结果：'+(parameters.target_spatial_format||'未声明')+' '+(parameters.target_geometry_type||'未声明')+'，'+(parameters.target_dimensions||'未声明')+'D，SRID '+(parameters.target_srid||'未声明')+'，CRS '+(parameters.target_crs||'未声明');
@@ -92,6 +102,15 @@ function compatibilityFieldType(field) {
 function compatibilityFieldCollation(field) {
   return field?.collation||field?.logical_type?.collation||'';
 }
+function compatibilityLossSummary(loss,fallback,kind) {
+  if(!loss||kind==='logical_value_json'||kind==='source_representation')return fallback;
+  const consequences=[];
+  if(loss.value)consequences.push('字段值可能改变，或不能按源端类型直接还原');
+  if(loss.comparison)consequences.push('相等判断或唯一性判断可能与源端不同');
+  if(loss.ordering)consequences.push('排序结果可能与源端不同');
+  if(loss.constraints)consequences.push('源端约束不会自动复制，写入时按目的端约束处理');
+  return consequences.length?consequences.join('；'):fallback;
+}
 function compatibilityNormalizedNativeType(value) {
   const normalized=String(value||'').trim().toLowerCase().replace(/\s+/g,' ');
   return normalized
@@ -103,9 +122,9 @@ function compatibilityRiskLabel(value) {
 }
 function compatibilityRuleKind(parameters) {
   const kind=conversionKind(parameters||{});
-  return {enum_label:'ENUM 按标签',set_members:'SET 按成员集合',bit_string:'BIT 按位串',binary:'二进制按原始字节',text:'文本编码转换',json:'JSON 结构转换',integer:'整数范围转换',decimal:'小数精度转换',float:'浮点转换',temporal:'时间精度/时区转换'}[kind]||'按目标字段规则';
+  return {logical_value_json:'保存为 CDC 通用值',source_representation:'保存源端协议表示',enum_label:'ENUM 按标签',set_members:'SET 按成员集合',bit_string:'BIT 按位串',binary:'二进制按原始字节',text:'文本编码转换',json:'JSON 结构转换',integer:'整数范围转换',decimal:'小数精度转换',float:'浮点转换',temporal:'时间精度/时区转换'}[kind]||'按目标字段规则';
 }
-function compatibilityHumanSummary(source,sink,result,plan,targetOverride) {
+function compatibilityHumanSummary(source,sink,result,plan,targetOverride,candidate) {
   const target=plan?.target||targetOverride||{};
   const parameters=plan?.target?.parameters||targetOverride?.parameters||{};
   const sourceType=compatibilityFieldType(source),targetType=target.native_type||compatibilityFieldType(sink);
@@ -119,47 +138,72 @@ function compatibilityHumanSummary(source,sink,result,plan,targetOverride) {
   let conversion='按目标端的 '+compatibilityRuleKind(parameters)+' 规则写入。';
   let risk='不会静默丢弃数据；无法满足目标字段约束时拒绝本次写入。';
   let loss='当前计划没有声明值语义损失。';
-  if(kind==='text'){
+  let retained='按已验证的字段计划保留源值；不满足目标定义的值会被拒绝。';
+  let targetBehavior='目标字段按其自身类型和能力工作；只有计划明确标为原生等价时，才可认为源端原生行为也保留。';
+  if(kind==='logical_value_json'){
+    conversion='把 ChangeEvent 中带类型和值的 LogicalValue 保存到目的端 CDC 通用值载体；读取时可按相同格式解包。';
+    risk='LogicalValue 格式或值校验失败、目标列容量不足或读回校验不一致时，整笔源事务失败并回滚。';
+    loss='逻辑值及类型信息可读回；目的端该列不是源数据库原生类型，源端的原生比较、排序、索引和约束行为不会随载体保留。';
+    retained='ChangeEvent LogicalValue 中的类型和值，包括其精度和递归结构；目标 Sink 写入后会校验读回内容。';
+    targetBehavior='目的端保存的是 '+compatibilityStorageLabel(parameters.target_storage)+'；需要通过 CDC 的 LogicalValue 格式读取和解包，不能直接当作源端原生类型执行运算。';
+  } else if(kind==='source_representation'){
+    conversion='把源端协议负载及解读它所需的类型证据封装后，原样保存到目的端二进制载体。';
+    risk='源端没有安全边界可供捕获、类型定义证据不匹配、封套校验失败或超过载体容量时，整笔源事务回滚；该字段不能作为主键、唯一键或更新定位键。';
+    loss='可取回并校验封套中的源协议表示，但它不会恢复成目的库的原生值，也不保留源库的查询、比较、排序、索引和约束行为。';
+    retained='源端协议表示负载、源类型定义/版本证据及完整性校验信息；读回验证只证明封套和负载完整。';
+    targetBehavior='目的端保存的是 '+compatibilityStorageLabel(parameters.target_storage)+'；若要重新解释为原生值，需要相符的源版本和解码器。';
+  } else if(kind==='text'){
     const sourceCharset=parameters.source_charset||'源端字符集',targetCharset=parameters.target_charset||'目标字符集';
     conversion='将源端文本按 '+targetCharset+' 编码后写入 '+targetType+'；排序和比较以目标端规则为准。';
     risk='不可编码字符或超出目标长度时拒绝，不截断；排序规则变化可能改变大小写、重音和排序结果。';
     loss=sourceCharset!==targetCharset||sourceCollation!==targetCollation?'字符集或排序比较语义可能变化，原始文本本身不主动截断。':'没有声明字符集或排序语义变化。';
+    retained='可按目标字符集编码的文本内容；不满足编码或长度限制时拒绝，不截断。';
+    targetBehavior=sourceCollation&&targetCollation&&sourceCollation!==targetCollation?'文本按目的端排序规则比较；大小写、重音和排序结果可能不同。':'文本使用目的字段的字符集与排序规则。';
   } else if(kind==='binary'){
     conversion='保留原始字节写入目标二进制字段，不把二进制转成文本。';
     risk='字节长度超过目标上限或固定长度规则不匹配时拒绝。';
     loss='不丢失字节；长度不兼容时整笔事务失败。';
+    retained='二进制字节顺序和内容；长度或固定填充不符时拒绝。';
   } else if(kind==='bit_string'){
     conversion='按声明的位数、位顺序和末字节填充写入目标 BIT 字段。';
     risk='位数、填充或格式不符合目标声明时拒绝。';
     loss='不丢失有效位；不会把 BIT 静默转换成整数或文本。';
+    retained='有效位及其声明的位数、顺序和末字节填充。';
   } else if(kind==='enum_label'){
     conversion='按 ENUM 标签名称匹配写入，不按内部 ordinal 数字转换。';
     risk='源端出现目的端没有的标签时拒绝；标签顺序变化不会改变标签含义。';
     loss='不丢失已知标签；未知标签不会被改写成其他标签。';
+    retained='ENUM 标签名称；不会按内部序号转换。';
   } else if(kind==='set_members'){
     conversion='按 SET 成员名称组成目标成员集合，写入时按目标声明顺序编码。';
     risk='未知成员、重复成员或格式错误时拒绝。';
     loss='成员集合语义保留，显示顺序可能按目标字段顺序变化。';
+    retained='SET 成员集合；写入顺序按目的端声明规范化。';
   } else if(kind==='integer'){
     conversion='按目标整数的有符号性和取值范围写入。';
     risk='越过目标最小值或最大值时拒绝，不回绕、不截断。';
     loss='计划没有声明数值损失；超范围值会使事务失败。';
+    retained='处于目的类型范围内的整数值和符号语义。';
   } else if(kind==='decimal'){
     conversion='按目标 DECIMAL 的精度和小数位写入。';
     risk='需要舍入或超出精度时拒绝，不静默四舍五入。';
     loss='计划没有声明小数损失；不满足精度的值会使事务失败。';
+    retained='可由目的端精度精确表示的小数；需要舍入的值拒绝。';
   } else if(kind==='float'){
     conversion='按目标浮点宽度写入可精确表示的有限值。';
     risk='溢出、非有限值或不可避免的舍入时拒绝。';
     loss='不把特殊值或不可精确值静默写入目标。';
+    retained='可由目的端精确表示的浮点值；溢出或精度损失时拒绝。';
   } else if(kind==='json'){
     conversion=parameters.json_strategy==='normalized_text'?'把结构化 JSON 转为规范化 UTF-8 文本。':'保持为目标结构化 JSON/JSONB。';
     risk=parameters.json_strategy==='normalized_text'?'解析失败时拒绝，原始空白、键顺序和重复键不保留。':'结构化值不符合目标 JSON 能力时拒绝。';
     loss=parameters.json_strategy==='normalized_text'?'JSON 数据值语义保留，但原始文本格式可能变化。':'当前计划没有声明 JSON 值语义损失。';
+    retained='JSON 数据值；规范化文本策略不会保留原始空白、键顺序或重复键。';
   } else if(kind==='temporal'){
     conversion='按已保存的时间精度和时区策略转换后写入。';
     risk='精度无法保留或时区策略缺失时拒绝；显示的本地时间可能变化。';
     loss='时间点或本地时间语义按计划保留，超出目标精度的值不静默舍入。';
+    retained='计划声明的时间点/本地时间语义和精度；无法无损转换的值拒绝。';
   }
   const status=String(result?.status||'').toUpperCase();
   const example=plan?.examples?.[0];
@@ -168,32 +212,106 @@ function compatibilityHumanSummary(source,sink,result,plan,targetOverride) {
     : conversionExample(kind,parameters);
   const targetText=conversionTarget(kind,parameters,targetType);
   const locator={preserved:'保留主键/Row Locator 语义，可用于定位更新和删除',value_only:'仅用于值写入，不得用于主键、唯一键或 Row Locator',blocked:'已阻断：不能用该转换定位行',not_used:'该字段不参与 Row Locator'}[String(plan?.locator_impact||'').toLowerCase()]||'需要按任务的键策略使用；有损转换不可用于键定位';
-  const lossDetails=plan?.loss?.explanation
-    ? plan.loss.explanation+(plan.loss.value||plan.loss.comparison||plan.loss.ordering||plan.loss.constraints?'（计划已标记对应语义风险）':'')
-    : '';
+  const lossDetails=compatibilityLossSummary(plan?.loss,loss,kind);
   if(lossDetails)loss=lossDetails;
   const targetPrerequisite=plan?.target_probe_digest
     ? '目的端 '+targetType+' 字段、能力和会话预检已通过；目标定义、扩展或会话变化后必须重新预检。'
     : '目的端必须预先创建 '+targetType+' 字段，并在启动前完成能力预检；未完成预检前不能把本地同类型判断当作原生等价。';
-  return {difference:difference.join('；'),conversion,target:targetText,example:exampleText,risk,loss,locator,prerequisite:targetPrerequisite,status,riskLabel:compatibilityRiskLabel(plan?.risk||result?.risk)};
+  const qualification=plan?.qualification||candidate?.qualification||result?.qualification;
+  if(!['logical_value_json','source_representation'].includes(kind)&&qualification==='EXACT')targetBehavior='目的端按 '+targetType+' 原生类型保存，可使用该类型已验证的查询、比较和约束行为。';
+  else if(!['logical_value_json','source_representation'].includes(kind)&&qualification==='RANGE_CHECKED')targetBehavior='目的端按 '+targetType+' 保存；仅在计划声明的范围/精度内保留值，相关约束需按目标字段定义执行。';
+  else if(!['logical_value_json','source_representation'].includes(kind)&&qualification==='EXPLICIT_CONVERSION')targetBehavior='目的端使用 '+targetType+' 保存显式转换结果；上面列出的源类型行为变化不会自动恢复。';
+  return {difference:difference.join('；'),conversion,target:targetText,example:exampleText,retained,targetBehavior,loss,locator,prerequisite:targetPrerequisite,status,riskLabel:compatibilityRiskLabel(plan?.risk||candidate?.risk||result?.risk)};
 }
 function appendCompatibilitySummary(parent,summary) {
   const section=node('section','compatibility-human-summary');
   section.append(node('h3','','这次转换会发生什么'));
-  [['字段差异',summary.difference],['转换方式',summary.conversion],['目标结果',summary.target],['示例转换',summary.example],['可能损失或语义变化',summary.loss],['键定位影响',summary.locator],['目标前置条件',summary.prerequisite],['风险和失败条件',summary.risk],['事务行为','失败时整笔事务回滚，checkpoint 不推进。']].forEach(([label,value])=>{
+  [['字段差异',summary.difference],['转换方式',summary.conversion],['保留的数据',summary.retained],['目的端如何使用',summary.targetBehavior],['目标结果',summary.target],['示例',summary.example],['可能损失或语义变化',summary.loss],['键定位影响',summary.locator],['目标前置条件',summary.prerequisite],['风险和失败条件',summary.risk],['事务行为','失败时整笔事务回滚，checkpoint 不推进。']].forEach(([label,value])=>{
     const row=node('div','compatibility-human-row');row.append(node('b','',label),node('p','',value));section.append(row);
   });
   if(summary.riskLabel)section.append(node('p','compatibility-risk-badge','风险等级：'+summary.riskLabel));
   parent.append(section);
+}
+function compatibilityCandidateDescription(candidate,source,sink) {
+  const parameters=candidate?.target?.parameters||{},kind=conversionKind(parameters),target=candidate?.target?.native_type||'目的端字段类型';
+  const risk=compatibilityRiskLabel(candidate?.risk),qualification=String(candidate?.qualification||'').toUpperCase();
+  if(kind==='source_representation')return {
+    title:'只保留源端表示（不会还原为原生值）',
+    storage:'目标列：'+target+' · '+compatibilityStorageLabel(parameters.target_storage),
+    keeps:'保留源协议负载、源类型证据和完整性信息，可从目标列取回并校验。',
+    limitation:'不能在目的端按源类型查询、比较、排序或计算；要还原原生值需要匹配的源版本和解码器。不能用于主键、唯一键或更新定位。',
+    qualification:'只保证封套可读回',risk,requiresConfirmation:candidate?.requires_confirmation!==false
+  };
+  if(kind==='logical_value_json')return {
+    title:'保留 ChangeEvent 值（写入 CDC 通用值载体）',
+    storage:'目标列：'+target+' · '+compatibilityStorageLabel(parameters.target_storage),
+    keeps:'保留 LogicalValue 的类型和值，可由 CDC 值格式解包；目标端会校验写入后的值。',
+    limitation:'目的端该列不是源数据库原生类型，源类型的比较、排序、索引和约束行为不随载体保留；不能用于主键、唯一键或更新定位。',
+    qualification:'LogicalValue 可读回',risk,requiresConfirmation:Boolean(candidate?.requires_confirmation)
+  };
+  const label=compatibilityQualificationLabel(candidate?.qualification);
+  let keeps='按该方案声明的转换规则保留字段值；若目标范围、精度或格式无法容纳该值，则拒绝整笔事务。';
+  let limitation='目的端使用自己的类型、排序和约束规则；请核对下方预检生成的具体转换与损失说明。';
+  if(qualification==='EXACT'){
+    keeps='经此 Source/Sink 组合资格验证的值可按目的端原生类型写入，预期值、比较和排序语义均保留。';
+    limitation='源端与目的端的原生类型名可能不同；这项结论只适用于当前字段定义、连接器版本和能力摘要。';
+  } else if(qualification==='RANGE_CHECKED'){
+    keeps='在目标字段声明的取值范围和精度内，值可完整保留；运行时会逐值检查。';
+    limitation='超出范围、精度或目标约束的值会使事务失败，不截断、不回绕、不静默舍入。';
+  } else if(qualification==='EXPLICIT_CONVERSION'){
+    keeps='按选定规则转换后的目标值；具体保留和改变的内容以服务端生成的字段计划为准。';
+    limitation='这不是原生等价转换，可能改变值、比较、排序或约束语义；保存前会展示具体影响并要求确认。';
+  }
+  return {
+    title:label+' → '+target,
+    storage:'源类型：'+compatibilityFieldType(source)+' → 方案目标类型：'+target+'；实际目标列：'+compatibilityFieldType(sink),
+    keeps,
+    limitation,
+    qualification:label,risk,requiresConfirmation:Boolean(candidate?.requires_confirmation)
+  };
+}
+function appendCompatibilityCandidates(parent,candidates,selectedRuleId,selectedRuleVersion,source,sink,onSelect,disabled=false) {
+  if(!candidates.length)return;
+  const fieldset=node('fieldset','compatibility-candidates');
+  fieldset.append(node('legend','','选择目的端如何保存这个源字段'));
+  candidates.forEach(candidate=>{
+    const description=compatibilityCandidateDescription(candidate,source,sink);
+    const card=node('label','compatibility-candidate');
+    const radio=node('input');radio.type='radio';radio.name='compatibility-rule';radio.value=candidate.rule.id;
+    radio.checked=selectedRuleId===candidate.rule.id&&selectedRuleVersion===candidate.rule.version;
+    radio.disabled=disabled;
+    radio.addEventListener('change',()=>{if(radio.checked)onSelect(candidate);});
+    const body=node('span','compatibility-candidate-body');
+    const title=node('span','compatibility-candidate-title');
+    title.append(node('b','',description.title),node('span','compatibility-candidate-badges',description.qualification+' · 风险 '+description.risk));
+    body.append(title,node('span','muted',description.storage),node('span','compatibility-candidate-explanation','保留：'+description.keeps),node('span','compatibility-candidate-explanation','限制：'+description.limitation));
+    if(description.requiresConfirmation)body.append(node('span','warn compatibility-candidate-confirm','选择后必须阅读并确认该方案的风险。'));
+    card.append(radio,body);fieldset.append(card);
+  });
+  parent.append(fieldset);
+}
+function compatibilityNoPlanMessage(failure,result) {
+  const code=String(failure?.code||result?.reason_code||''),kind=String(failure?.class||result?.failure?.class||'').toUpperCase();
+  if(kind==='SOURCE_CONTRACT'||code.includes('source_type')||code.includes('source_representation'))return '源端捕获能力缺口：当前 Source 还不能安全读取或标记这种字段值。兼容选项无法绕过这个缺口，需要先补齐源协议解码或表示封套捕获。';
+  if(kind==='TARGET_CAPABILITY'||['UNSUPPORTED','BLOCKED'].includes(compatibilityStatus(result)))return '没有找到经过资格验证的目的端表示。可能是目的端字段定义或所需扩展不匹配，也可能是 Sink 尚未实现该类型；这不是让你随意填写参数就能解决的问题。';
+  if(kind==='STALE_INPUT'||['STALE'].includes(compatibilityStatus(result)))return '实例配置或字段元数据已变化，请重新加载两端库表并再次预检。';
+  return '目前无法生成可用的兼容方案；请查看下方技术诊断，确认需要修复的是 Source 捕获、目标能力还是字段配置。';
+}
+function compatibilityStatusMessage(status) {
+  return {
+    COMPATIBLE:'当前目标字段和能力预检通过，计划可以保存。',
+    NEEDS_CONFIRMATION:'请先阅读上方说明并确认转换风险。',
+    NEEDS_CONFIGURATION:'补齐所需设置后，系统会重新检查目标字段。',
+    UNSUPPORTED:'没有可用的已资格方案。',
+    BLOCKED:'该字段当前被安全规则阻止。',
+    STALE:'预检依据已变化，需要重新加载并检查。'
+  }[status]||'请检查兼容方案和目标字段。';
 }
 function compatibilityOptionLabel(name) {
   return {target_charset:'目标字符集',target_length:'目标长度',target_length_unit:'长度单位',target_collation:'目标排序规则',encoding_policy:'字符编码策略',length_policy:'超长处理',collation_policy:'排序规则策略',target_precision:'目标精度',precision_policy:'精度处理',temporal_strategy:'时间转换策略',time_zone:'时区',json_strategy:'JSON 处理方式'}[name]||name;
 }
 function compatibilityOptionHelp(name) {
   return {target_charset:'决定文本如何编码写入目标端。',target_length:'必须与预先创建的目标字段长度一致。',target_length_unit:'目标长度按字节还是字符计算。',target_collation:'决定目标端文本比较和排序方式。',encoding_policy:'当前只允许严格编码，无法编码时拒绝。',length_policy:'当前只允许拒绝超长值，禁止静默截断。',collation_policy:'当前按目标端排序规则执行。',target_precision:'目标数值或时间字段保留的精度。',precision_policy:'当前只允许拒绝精度损失。',temporal_strategy:'决定本地时间和绝对时间如何转换。',time_zone:'绝对时间转换使用的时区。',json_strategy:'选择结构化 JSON 或规范化文本。'}[name]||'';
-}
-function compatibilityOptionAdvanced(name) {
-  return ['encoding_policy','length_policy','collation_policy','precision_policy'].includes(name);
 }
 function registeredConnector(instance,role) {
   if(!instance)return null;
@@ -507,17 +625,19 @@ async function renderTaskDetail(id) {
       preview.append(node('p','muted','尚未保存字段兼容计划；缺少计划或风险确认时不能启动任务。'));
     } else {
       task.plans.forEach(plan=>{
-        const parameters=plan.target?.parameters||{}, parameterText=Object.entries(parameters).map(([key,value])=>key+'='+value).join(' · ');
+        const parameters=plan.target?.parameters||{},kind=conversionKind(parameters);
         const card=node('article','task-plan-card');
         card.append(node('b','',plan.source_field?.lineage_id+' → '+plan.target_field?.lineage_id));
-        card.append(node('p','muted','资格：'+(plan.qualification||'未配置')+' · 风险等级：'+compatibilityRiskLabel(plan.risk)));
+        const planMode=kind==='source_representation'?'只保留源端表示':kind==='logical_value_json'?'CDC 通用值载体':compatibilityQualificationLabel(plan.qualification);
+        card.append(node('p','muted','方案：'+planMode+' · 风险等级：'+compatibilityRiskLabel(plan.risk)));
         appendCompatibilitySummary(card,compatibilityHumanSummary(
           {native_type:plan.source_field?.native_type,collation:parameters.source_collation},
           {native_type:plan.target?.native_type,collation:parameters.target_collation},
           {status:'COMPATIBLE',risk:plan.risk},plan
         ));
         const technical=node('details','compatibility-technical'),technicalTitle=node('summary','','查看技术细节');technical.append(technicalTitle);
-        if(parameterText)technical.append(node('p','mono','转换参数：'+parameterText));
+        if(plan.rule)technical.append(node('p','mono','转换规则：'+plan.rule.id+' · '+plan.rule.version));
+        if(plan.capability_code)technical.append(node('p','mono','目标能力：'+plan.capability_code));
         if(plan.risk_code)technical.append(node('p','mono','风险代码：'+plan.risk_code));
         if(plan.target_probe_digest)technical.append(node('p','mono','目标端预检证据：'+plan.target_probe_digest));
         technical.append(node('p','mono','计划摘要：'+(plan.plan_digest||'未知')));
@@ -635,10 +755,14 @@ async function renderTaskAdd() {
     const saved=compatibility.get(columnKey(schema,table,column));
     const status=compatibilityStatus(saved?.result);
     if(status==='COMPATIBLE') {
-      const qualification=String(saved.result.qualification||'').toUpperCase();
+      const plan=saved.result.plan,parameters=plan?.target?.parameters||saved.parameters||{};
+      const kind=conversionKind(parameters),qualification=String(plan?.qualification||saved.result.qualification||'').toUpperCase();
+      if(kind==='source_representation')return {className:'configured',label:'仅保留源端表示'};
+      if(kind==='logical_value_json')return {className:'configured',label:'CDC 通用值载体'};
       if(qualification==='EXACT')return {className:'equivalent',label:'原生等价'};
-      if(qualification==='RANGE_CHECKED')return {className:'configured',label:'值完整保留'};
-      return {className:'configured',label:'已配置'};
+      if(qualification==='RANGE_CHECKED')return {className:'configured',label:'范围内完整保留'};
+      if(qualification==='EXPLICIT_CONVERSION')return {className:'configured',label:'显式转换已确认'};
+      return {className:'configured',label:'已预检'};
     }
     if(status==='NEEDS_CONFIRMATION')return {className:'confirm',label:'需确认'};
     if(status==='NEEDS_CONFIGURATION')return {className:'pending',label:'需配置'};
@@ -815,6 +939,7 @@ async function renderTaskAdd() {
     if(!source||!sink)return;
     const saved=compatibility.get(row.key);
     let parameters={...(saved?.parameters||{})},confirmations=[...(saved?.confirmations||[])],response=null;
+    let riskConfirmed=false,riskConfirmedDigest='',previewDirty=false,loadingSelection=false,previewRequest=0;
     const dialog=node('dialog','compatibility-dialog'),form=node('form','compatibility-form');
     const heading=node('div','dialog-heading'),headingText=node('div');
     headingText.append(node('h2','','兼容选项'),node('p','muted',row.schema+'.'+row.table+'.'+row.column));
@@ -834,66 +959,120 @@ async function renderTaskAdd() {
     async function request(nextParameters,nextConfirmations) {
       return api('/api/compatibility/preview',{method:'POST',body:JSON.stringify(payload(nextParameters,nextConfirmations))});
     }
+    function selectedCandidate(candidates) {
+      return candidates.find(candidate=>candidate.rule.id===parameters.__rule_id&&candidate.rule.version===parameters.__rule_version);
+    }
+    function appendTechnicalDiagnostic(parent,failure,result) {
+      const code=failure?.code||result?.failure?.code||result?.reason_code;
+      const message=failure?.message||result?.failure?.message||result?.explanation;
+      if(!code&&!message)return;
+      const technical=node('details','compatibility-technical'),summary=node('summary','','查看诊断信息');technical.append(summary);
+      if(failure?.class||result?.failure?.class)technical.append(node('p','mono','类别：'+(failure?.class||result.failure.class)));
+      if(code)technical.append(node('p','mono','代码：'+code));
+      if(message)technical.append(node('p','mono',message));
+      parent.append(technical);
+    }
+    function chooseCandidate(candidate) {
+      if(parameters.__rule_id===candidate.rule.id&&parameters.__rule_version===candidate.rule.version)return;
+      // A candidate change invalidates every option and risk acknowledgement
+      // from the previously previewed plan.
+      parameters={__rule_id:candidate.rule.id,__rule_version:candidate.rule.version};
+      confirmations=[];riskConfirmed=false;riskConfirmedDigest='';previewDirty=false;
+      const requestId=++previewRequest;loadingSelection=true;renderPreview();
+      request(parameters,[]).then(next=>{if(requestId===previewRequest)response=next;}).catch(reason=>{if(requestId===previewRequest)response={error:{message:reason.message}};}).finally(()=>{if(requestId===previewRequest){loadingSelection=false;renderPreview();}});
+    }
     function renderPreview() {
       if(response?.result&&compatibilityStatus(response.result)!=='COMPATIBLE')
         compatibility.set(row.key,{parameters:{...parameters},confirmations:[...confirmations],result:response.result});
+      const settingsOpen=Boolean(content.querySelector('.compatibility-advanced')?.open);
       content.replaceChildren();
       const sourceLabel='源端：'+compatibilityFieldType(source)+(source.collation?' · '+source.collation:'');
       const sinkLabel='目的端：'+compatibilityFieldType(sink)+(sink.collation?' · '+sink.collation:'');
       content.append(node('p','compatibility-field-pair',sourceLabel+' → '+sinkLabel));
-      if(response?.error){content.append(node('p','task-error',response.error.message));verify.disabled=true;return;}
+      if(response?.error){
+        content.append(node('p','warn compatibility-no-plan',compatibilityNoPlanMessage(response.error,response.result)));
+        appendTechnicalDiagnostic(content,response.error,response.result);verify.disabled=true;return;
+      }
       const result=response?.result;
       if(!result){content.append(node('p','task-error','兼容性预览没有返回结果'));verify.disabled=true;return;}
-      const candidates=result.candidates||[],rules=response.candidates||[];
-      if(candidates.length>1){
-        const label=node('label','compatibility-option-label','选择目标字段表示方式'),select=node('select','select');
-        candidates.forEach(candidate=>{const option=node('option','',candidate.target.native_type+' · '+candidate.qualification+' · 风险 '+candidate.risk);option.value=candidate.rule.id;option.selected=parameters.__rule_id===candidate.rule.id;select.append(option);});
-        if(!select.value&&candidates[0])select.value=candidates[0].rule.id;
-        select.addEventListener('change',()=>{const candidate=candidates.find(item=>item.rule.id===select.value);if(candidate){parameters.__rule_id=candidate.rule.id;parameters.__rule_version=candidate.rule.version;renderPreview();}});
-        content.append(label);label.append(select);
-      } else if(candidates[0]) {
+      const candidates=response.available_candidates?.length?response.available_candidates:(result.candidates||[]),rules=response.candidates||[];
+      let selected=selectedCandidate(candidates);
+      if(candidates.length===1&&!selected){
         parameters.__rule_id=candidates[0].rule.id;parameters.__rule_version=candidates[0].rule.version;
+        selected=candidates[0];loadingSelection=true;
+        content.append(node('p','muted','找到唯一的已资格方案，正在按当前目标字段生成计划…'));
+        verify.disabled=true;
+        request(parameters,[]).then(next=>{response=next;}).catch(reason=>{response={error:{message:reason.message}};}).finally(()=>{loadingSelection=false;renderPreview();});
+        return;
       }
-      const ruleId=parameters.__rule_id||(candidates[0]?.rule.id||'');
-      const rule=rules.find(item=>item.rule.id===ruleId)||rules[0];
-      const selectedCandidate=candidates.find(candidate=>candidate.rule.id===ruleId)||candidates[0];
-      appendCompatibilitySummary(content,compatibilityHumanSummary(source,sink,result,result.plan,selectedCandidate?.target));
+      appendCompatibilityCandidates(content,candidates,selected?.rule.id,selected?.rule.version,source,sink,chooseCandidate,loadingSelection);
+      const rule=selected&&rules.find(item=>item.rule.id===selected.rule.id&&item.rule.version===selected.rule.version);
+      if(candidates.length>1&&!selected){
+        content.append(node('p','warn compatibility-no-plan','请先选择一种目的端保存方式。选择后系统会按目标字段重新预检，并说明该方案会保留什么、改变什么。'));
+        verify.disabled=true;return;
+      }
+      if(candidates.length===0){
+        content.append(node('p','warn compatibility-no-plan',compatibilityNoPlanMessage(result.failure,result)));
+        appendTechnicalDiagnostic(content,result.failure,result);
+        verify.disabled=true;return;
+      }
+      if(loadingSelection){
+        content.append(node('p','muted','正在按所选方案重新检查实际目标字段…'));
+        verify.disabled=true;return;
+      }
+      appendCompatibilitySummary(content,compatibilityHumanSummary(source,sink,result,result.plan,selected?.target,selected));
       if(rule?.options?.length){
-        const fieldset=node('fieldset','compatibility-options');fieldset.append(node('legend','','需要时调整转换设置'));
-        const advanced=node('details','compatibility-advanced'),advancedTitle=node('summary','','高级设置（通常无需修改）'),advancedFields=node('div','compatibility-advanced-fields');advanced.append(advancedTitle,advancedFields);
-        let visibleCount=0,advancedCount=0;
+        const advanced=node('details','compatibility-advanced'),advancedTitle=node('summary','','可选：调整转换设置'),advancedFields=node('div','compatibility-advanced-fields');advanced.append(advancedTitle,advancedFields);
+        advanced.open=settingsOpen;
         rule.options.forEach(spec=>{const label=node('label','compatibility-option-label');label.append(node('span','',compatibilityOptionLabel(spec.name)));const help=compatibilityOptionHelp(spec.name);if(help)label.append(node('small','muted',help));const allowedValues=Array.isArray(spec.allowed_values)?spec.allowed_values:[];const input=allowedValues.length?node('select','select'):node('input','input');
           input.name='compat-option';input.dataset.option=spec.name;input.required=spec.required;
           if(input.tagName==='SELECT'){allowedValues.forEach(value=>{const option=node('option','',value);option.value=value;input.append(option);});}
           input.value=parameters[spec.name]||compatibilityDefault(spec,source,sink);label.append(input);
-          if(compatibilityOptionAdvanced(spec.name)){advancedFields.append(label);advancedCount++;}else{fieldset.append(label);visibleCount++;}
+          input.addEventListener('change',()=>{parameters[spec.name]=input.value;previewDirty=true;riskConfirmed=false;riskConfirmedDigest='';confirmations=[];renderPreview();});
+          advancedFields.append(label);
         });
-        if(visibleCount)content.append(fieldset);
-        if(advancedCount)content.append(advanced);
+        content.append(advanced);
       }
       const status=compatibilityStatus(result);
       const statusLabel={COMPATIBLE:'可同步',NEEDS_CONFIRMATION:'需要风险确认',NEEDS_CONFIGURATION:'需要配置参数',UNSUPPORTED:'不支持',BLOCKED:'已阻断',STALE:'已过期'}[status]||result.status;
-      content.append(node('p',status==='COMPATIBLE'?'good':'warn','状态：'+statusLabel+' · '+result.explanation));
+      content.append(node('p',status==='COMPATIBLE'?'good':'warn','状态：'+statusLabel+' · '+compatibilityStatusMessage(status)));
+      if(previewDirty)content.append(node('p','warn','转换设置已修改；当前说明来自上一次预检。点击“验证并保存”后会重新计算风险，旧确认已清除。'));
       const needsConfirm=status==='NEEDS_CONFIRMATION'||result.requires_confirmation;
       if(needsConfirm&&result.plan){
         const label=node('label','compatibility-confirm-label'),check=node('input');check.type='checkbox';check.name='compat-confirm';
-        label.append(check,document.createTextNode('我已了解该字段的转换风险，同意按上述规则执行'));content.append(label);
+        const kind=conversionKind(result.plan.target?.parameters||selected?.target?.parameters||{});
+        const confirmationText=kind==='source_representation'
+          ?'我理解这里只保存可读回的源协议表示，不会得到目的端原生值，也不能用于查询、比较、排序或键定位。'
+          :kind==='logical_value_json'
+            ?'我理解这里保存的是 CDC 通用值载体；可以由 CDC 解包，但不是目的端原生类型，也不能用于键定位。'
+            :'我已阅读上方的字段差异、保留内容、可能损失和键定位影响，同意按该计划执行。';
+        check.checked=riskConfirmed&&riskConfirmedDigest===result.plan.plan_digest;
+        check.addEventListener('change',()=>{riskConfirmed=check.checked;riskConfirmedDigest=check.checked?result.plan.plan_digest:'';});
+        label.append(check,document.createTextNode(confirmationText));content.append(label);
       }
-      verify.disabled=['UNSUPPORTED','BLOCKED','STALE'].includes(status)||Boolean(response.error);
+      if(result.failure||status!=='COMPATIBLE')appendTechnicalDiagnostic(content,result.failure,result);
+      verify.textContent=previewDirty?'重新预检并保存':'验证并保存';
+      verify.disabled=['UNSUPPORTED','BLOCKED','STALE'].includes(status)||Boolean(response.error)||(!result.plan&&status!=='NEEDS_CONFIGURATION');
     }
-    try {response=await request(parameters,confirmations);renderPreview();}
+    try {
+      response=await request(parameters,confirmations);
+      const candidates=response.result?.candidates||[];
+      if(candidates.length===1&&(!parameters.__rule_id||!selectedCandidate(candidates))){
+        parameters.__rule_id=candidates[0].rule.id;parameters.__rule_version=candidates[0].rule.version;
+        response=await request(parameters,[]);
+      }
+      renderPreview();
+    }
     catch(reason){response={error:{message:reason.message}};renderPreview();}
     form.addEventListener('submit',async event=>{
       event.preventDefault();if(verify.disabled)return;verify.disabled=true;
-      const values=form.querySelectorAll('[data-option]');values.forEach(input=>{parameters[input.dataset.option]=input.value;});
-      const selected=form.querySelector('[data-option]');
-      if(response?.candidates?.length){const selectedRule=parameters.__rule_id||response.result?.candidates?.[0]?.rule.id;if(selectedRule){const candidate=response.result.candidates.find(item=>item.rule.id===selectedRule)||response.result.candidates[0];parameters.__rule_id=candidate.rule.id;parameters.__rule_version=candidate.rule.version;}}
+      form.querySelectorAll('[data-option]').forEach(input=>{parameters[input.dataset.option]=input.value;});
+      confirmations=[];previewDirty=false;
       try {
         response=await request(parameters,[]);
         if(compatibilityStatus(response.result)==='NEEDS_CONFIRMATION'&&response.result.plan){
-          const check=form.querySelector('[name=compat-confirm]');
-          if(!check?.checked){renderPreview();return;}
           const plan=response.result.plan;
+          if(!riskConfirmed||riskConfirmedDigest!==plan.plan_digest){riskConfirmed=false;riskConfirmedDigest='';renderPreview();return;}
           confirmations=[{source_field_lineage:plan.source_field.lineage_id,target_field_lineage:plan.target_field.lineage_id,rule:plan.rule,plan_digest:plan.plan_digest,actor:state.me.user.username,confirmed_at:new Date().toISOString(),reason:'添加任务页确认兼容转换风险'}];
           response=await request(parameters,confirmations);
         }
@@ -901,7 +1080,6 @@ async function renderTaskAdd() {
         compatibility.set(row.key,{parameters:{...parameters},confirmations:[...confirmations],result:response.result});
         dialog.close();renderTrees();updateSummary();
       } catch(reason){response={error:{message:reason.message}};renderPreview();}
-      finally {if(dialog.open)verify.disabled=false;}
     });
   }
   function focusRow(rowKey) {

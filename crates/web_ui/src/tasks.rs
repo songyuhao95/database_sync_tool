@@ -84,6 +84,10 @@ pub(crate) struct FieldCompatibilityPreview {
     pub result: Option<change_event::CompatibilityResult>,
     pub error: Option<FieldCompatibilityPreviewError>,
     pub candidates: Vec<CompatibilityRuleOptions>,
+    /// All target representations that qualify for this field binding. The
+    /// selected result may contain only one candidate, but the UI must keep
+    /// the other qualified choices available for comparison.
+    pub available_candidates: Vec<change_event::TargetTypeCandidate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1123,6 +1127,29 @@ impl Store {
         let target_build = server_build_identity(sink_connector, &sink.metadata);
         let route_id = input.draft_id;
         let configuration_revision = format!("{route_id}:r1");
+        let mut discovery_parameters = input.parameters.clone();
+        discovery_parameters.remove("__rule_id");
+        discovery_parameters.remove("__rule_version");
+        let available_candidates =
+            crate::registry::field_compatibility_with_source_evidence_and_target_probe(
+                source_connector,
+                sink_connector,
+                &source_table,
+                &sink_table,
+                &source_column,
+                &sink_column,
+                &route_id,
+                &configuration_revision,
+                Some(source_build.clone()),
+                Some(target_build.clone()),
+                source.source_type_catalog.as_ref(),
+                source_environment_fingerprint(&source.metadata),
+                &discovery_parameters,
+                &[],
+                Some(&target_probe),
+            )
+            .map(|result| result.candidates)
+            .unwrap_or_default();
         let compatibility =
             crate::registry::field_compatibility_with_source_evidence_and_target_probe(
                 source_connector,
@@ -1153,10 +1180,8 @@ impl Store {
             ),
         };
         let manifest = sink_connector.structured_manifest(target_build);
-        let candidates = result
-            .as_ref()
-            .into_iter()
-            .flat_map(|result| result.candidates.iter())
+        let candidates = available_candidates
+            .iter()
             .filter_map(|candidate| {
                 manifest
                     .capabilities
@@ -1177,6 +1202,7 @@ impl Store {
             result,
             error,
             candidates,
+            available_candidates,
         })
     }
 
