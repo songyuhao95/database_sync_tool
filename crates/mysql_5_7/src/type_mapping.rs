@@ -10,7 +10,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{ConnectorIdentity, LengthUnit, LogicalType, LogicalValue, SourceTypeMapping};
 use sha2::{Digest as _, Sha256};
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 pub const MAPPING_VERSION: &str = "mysql-5.7.source-type-mapping.v1";
 
@@ -68,7 +68,26 @@ pub fn source_type_mapping(
     let logical_type = logical_type(&declaration, charset, collation)?;
     let normalized_native = native_type.trim().to_ascii_lowercase();
     let mapping_id = format!("mysql57.source-type.{}", declaration.base);
-    let evidence_digest = evidence_digest(&normalized_native, charset, collation, &logical_type);
+    let mut value_representation = BTreeMap::new();
+    if let LogicalType::BitString { length } = &logical_type {
+        value_representation.insert("bit_order".into(), "lsb_first".into());
+        value_representation.insert(
+            "bit_padding".into(),
+            if length.is_multiple_of(8) {
+                "none"
+            } else {
+                "zero"
+            }
+            .into(),
+        );
+    }
+    let evidence_digest = evidence_digest(
+        &normalized_native,
+        charset,
+        collation,
+        &logical_type,
+        &value_representation,
+    );
     Ok(SourceTypeMapping {
         connector: ConnectorIdentity::new("mysql", "5.7"),
         native_type: normalized_native,
@@ -80,6 +99,7 @@ pub fn source_type_mapping(
         source_build: None,
         environment_fingerprint: None,
         source_representation_evidence: None,
+        value_representation,
     })
 }
 
@@ -862,6 +882,7 @@ fn evidence_digest(
     charset: Option<&str>,
     collation: Option<&str>,
     logical_type: &LogicalType,
+    value_representation: &BTreeMap<String, String>,
 ) -> String {
     let input = serde_json::to_vec(&(
         MAPPING_VERSION,
@@ -869,6 +890,7 @@ fn evidence_digest(
         charset,
         collation,
         logical_type,
+        value_representation,
     ))
     .expect("SourceTypeMapping evidence is serializable");
     let digest = Sha256::digest(input);

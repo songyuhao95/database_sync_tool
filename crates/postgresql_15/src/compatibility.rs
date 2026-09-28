@@ -156,6 +156,9 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
     for length in [1_u64, 8, 12, 16, 32, 64, 128, 256, 512, 1_024] {
         add_exact_bit_string(&mut capabilities, length);
     }
+    // PostgreSQL permits arbitrary BIT / BIT VARYING widths. The wildcard
+    // capability is bound to each pre-created target column during planning.
+    add_exact_bit_string(&mut capabilities, u64::MAX);
     for precision in 0..=6 {
         add_exact(
             &mut capabilities,
@@ -335,7 +338,12 @@ fn add_exact(
 }
 
 fn add_exact_bit_string(capabilities: &mut Vec<CapabilityEntry>, length: u64) {
-    let mut target = TargetRepresentation::new(format!("bit({length})"));
+    let dynamic_length = length == u64::MAX;
+    let mut target = TargetRepresentation::new(if dynamic_length {
+        "bit".to_owned()
+    } else {
+        format!("bit({length})")
+    });
     target
         .parameters
         .insert("bit_length_unit".into(), "bits".into());
@@ -344,7 +352,9 @@ fn add_exact_bit_string(capabilities: &mut Vec<CapabilityEntry>, length: u64) {
         .insert("target_bit_order".into(), "msb_first".into());
     target.parameters.insert(
         "target_padding".into(),
-        if length.is_multiple_of(8) {
+        if dynamic_length {
+            "auto"
+        } else if length.is_multiple_of(8) {
             "none"
         } else {
             "zero"
@@ -355,7 +365,11 @@ fn add_exact_bit_string(capabilities: &mut Vec<CapabilityEntry>, length: u64) {
         capabilities,
         LogicalType::bit_string(length),
         target,
-        format!("bit.{length}"),
+        if dynamic_length {
+            "bit.any".into()
+        } else {
+            format!("bit.{length}")
+        },
     );
 }
 
@@ -459,6 +473,7 @@ fn add_logical_value_json_carrier(capabilities: &mut Vec<CapabilityEntry>) {
             PresenceState::Value,
             PresenceState::Null,
             PresenceState::Unchanged,
+            PresenceState::Unavailable,
         ],
         rule,
     });
@@ -488,6 +503,7 @@ fn add_source_representation_carrier(capabilities: &mut Vec<CapabilityEntry>) {
         PresenceState::SourceRepresentation,
         PresenceState::Null,
         PresenceState::Unchanged,
+        PresenceState::Unavailable,
     ];
     let mut rule = explicit_rule(&code, logical.clone(), target.clone(), Vec::new());
     rule.version = "postgresql-15.sink-carrier.v1".into();

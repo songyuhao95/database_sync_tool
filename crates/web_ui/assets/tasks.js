@@ -57,6 +57,9 @@ function taskModeLabel(mode) {
 function conversionKind(parameters) {
   return parameters.range_kind||parameters.conversion_kind||parameters.value_strategy||(parameters.json_strategy?'json':undefined);
 }
+function isExplicitCarrierCandidate(candidate) {
+  return ['logical_value_json','source_representation'].includes(candidate?.target?.parameters?.conversion_kind);
+}
 function compatibilityQualificationLabel(value) {
   return {EXACT:'原生等价',RANGE_CHECKED:'范围内值完整保留',EXPLICIT_CONVERSION:'显式转换',UNSUPPORTED:'暂不可用'}[String(value||'').toUpperCase()]||'待资格验证';
 }
@@ -997,7 +1000,7 @@ async function renderTaskAdd() {
       if(!result){content.append(node('p','task-error','兼容性预览没有返回结果'));verify.disabled=true;return;}
       const candidates=response.available_candidates?.length?response.available_candidates:(result.candidates||[]),rules=response.candidates||[];
       let selected=selectedCandidate(candidates);
-      if(candidates.length===1&&!selected){
+      if(candidates.length===1&&!selected&&!isExplicitCarrierCandidate(candidates[0])){
         parameters.__rule_id=candidates[0].rule.id;parameters.__rule_version=candidates[0].rule.version;
         selected=candidates[0];loadingSelection=true;
         content.append(node('p','muted','找到唯一的已资格方案，正在按当前目标字段生成计划…'));
@@ -1007,7 +1010,7 @@ async function renderTaskAdd() {
       }
       appendCompatibilityCandidates(content,candidates,selected?.rule.id,selected?.rule.version,source,sink,chooseCandidate,loadingSelection);
       const rule=selected&&rules.find(item=>item.rule.id===selected.rule.id&&item.rule.version===selected.rule.version);
-      if(candidates.length>1&&!selected){
+      if(!selected&&(candidates.length>1||candidates.some(isExplicitCarrierCandidate))){
         content.append(node('p','warn compatibility-no-plan','请先选择一种目的端保存方式。选择后系统会按目标字段重新预检，并说明该方案会保留什么、改变什么。'));
         verify.disabled=true;return;
       }
@@ -1057,7 +1060,7 @@ async function renderTaskAdd() {
     try {
       response=await request(parameters,confirmations);
       const candidates=response.result?.candidates||[];
-      if(candidates.length===1&&(!parameters.__rule_id||!selectedCandidate(candidates))){
+      if(candidates.length===1&&!isExplicitCarrierCandidate(candidates[0])&&(!parameters.__rule_id||!selectedCandidate(candidates))){
         parameters.__rule_id=candidates[0].rule.id;parameters.__rule_version=candidates[0].rule.version;
         response=await request(parameters,[]);
       }

@@ -86,7 +86,9 @@ $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString
 $out = Join-Path $root "target\test-results\$runId"
 New-Item -ItemType Directory -Path $out -Force | Out-Null
 $oldArtifacts = [Environment]::GetEnvironmentVariable('CDC_TEST_ARTIFACT_DIR', 'Process')
+$oldTypeEvidenceArtifacts = [Environment]::GetEnvironmentVariable('CDC_TYPE_QUALIFICATION_ARTIFACT_DIR', 'Process')
 $env:CDC_TEST_ARTIFACT_DIR = $out
+$env:CDC_TYPE_QUALIFICATION_ARTIFACT_DIR = Join-Path $out 'type-evidence'
 $results = [Collections.Generic.List[object]]::new()
 $importedConfigKeys = @()
 Push-Location $root
@@ -171,6 +173,7 @@ try {
 } finally {
     Pop-Location
     [Environment]::SetEnvironmentVariable('CDC_TEST_ARTIFACT_DIR', $oldArtifacts, 'Process')
+    [Environment]::SetEnvironmentVariable('CDC_TYPE_QUALIFICATION_ARTIFACT_DIR', $oldTypeEvidenceArtifacts, 'Process')
     foreach ($name in $importedConfigKeys) {
         Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
     }

@@ -129,7 +129,20 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "source")
             .count(),
-        15
+        16
+    );
+    let mysql_snapshot_suite = suites
+        .iter()
+        .find(|suite| suite["id"] == "mysql.all_types_snapshot_round_trip")
+        .expect("all native MySQL types must have a live full-snapshot round-trip suite");
+    assert_eq!(mysql_snapshot_suite["mode"], "Live");
+    assert_eq!(
+        mysql_snapshot_suite["databases"],
+        serde_json::json!(["mysql_5_7", "mysql_8_0", "mysql_8_4"])
+    );
+    assert_eq!(
+        mysql_snapshot_suite["stages"],
+        serde_json::json!(["Read", "Sql"])
     );
     let postgres_builtin_capture_suites: BTreeSet<_> = suites
         .iter()
@@ -197,7 +210,7 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|argument| { argument == "live_recursive_capture" })
+                .any(|argument| { argument == "live_builtin_capture" })
         );
         assert!(suite["args"].as_array().unwrap().iter().any(|argument| {
             argument
@@ -227,7 +240,7 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "sink")
             .count(),
-        12
+        15
     );
     for suite_id in [
         "mysql_5_7.representation_carriers",
@@ -326,6 +339,41 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .find(|suite| suite["id"] == suite_id)
             .expect("every Source component must have a registered live suite");
         assert_eq!(suite["category"], "source");
+        let database = source["database"].as_str().unwrap();
+        let expected_type_suites: Vec<String> = match database {
+            "mysql_5_7" | "mysql_8_0" | "mysql_8_4" => {
+                vec![format!("{database}.all_types_capture")]
+            }
+            "postgresql_15" | "postgresql_16" | "postgresql_17" => vec![
+                format!("{database}.builtins"),
+                format!("{database}.recursive_types"),
+            ],
+            _ => unreachable!("six connector roster is fixed"),
+        };
+        let additional = source["additional_suites"].as_array().unwrap();
+        assert_eq!(
+            additional
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            expected_type_suites,
+            "every Source qualification must require its all-native-type fixtures"
+        );
+        for additional_suite in additional {
+            let id = additional_suite.as_str().unwrap();
+            let definition = suites
+                .iter()
+                .find(|candidate| candidate["id"] == id)
+                .expect("all-native-type Source fixture must be registered");
+            assert_eq!(definition["category"], "source");
+            assert_eq!(definition["required_for_live_qualified"], true);
+            assert!(
+                definition["databases"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(database))
+            );
+        }
         if let Some(major) = source["database"]
             .as_str()
             .unwrap()
@@ -376,6 +424,21 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .find(|suite| suite["id"] == suite_id)
             .expect("every Sink component must have a registered live suite");
+        let database = sink["database"].as_str().unwrap();
+        let carrier_suite = format!("{database}.representation_carriers");
+        assert!(
+            sink["additional_suites"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate == &serde_json::json!(carrier_suite)),
+            "all LogicalValue variants and source representations must qualify {database}"
+        );
+        let carrier_definition = suites
+            .iter()
+            .find(|candidate| candidate["id"] == carrier_suite)
+            .expect("every Sink must register a carrier qualification suite");
+        assert_eq!(carrier_definition["required_for_live_qualified"], true);
         let fixtures = suite["source_fixtures"]
             .as_array()
             .unwrap()
@@ -413,6 +476,36 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
                         || (major == "15" && arg.contains("postgres15_writes_sql_transaction"))
                 })
             }));
+            let native_type_suite =
+                format!("{}.native_type_apply", sink["database"].as_str().unwrap());
+            assert!(
+                sink["additional_suites"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| { entry == &serde_json::json!(native_type_suite) })
+            );
+            let native_type_definition = suites
+                .iter()
+                .find(|entry| entry["id"] == native_type_suite)
+                .expect("every PostgreSQL Sink must qualify native logical values");
+            assert_eq!(native_type_definition["required_for_live_qualified"], true);
+            assert_eq!(native_type_definition["category"], "sink");
+            assert_eq!(
+                native_type_definition["source_fixtures"],
+                serde_json::json!(["postgresql_15"])
+            );
+            assert!(
+                native_type_definition["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| {
+                        arg.as_str().is_some_and(|arg| {
+                            arg.contains(&format!("postgres{major}_writes_native_type_values"))
+                        })
+                    })
+            );
         }
     }
     assert_eq!(

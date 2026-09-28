@@ -520,10 +520,16 @@ fn target_capability_shortfalls_block_json_enum_set_without_text_fallback() {
     .unwrap();
     assert_eq!(
         result.status,
-        change_event::CompatibilityStatus::Unsupported
+        change_event::CompatibilityStatus::NeedsConfiguration,
+        "a tagged-value TEXT carrier may be offered, but must never be selected silently"
     );
-    assert_eq!(
-        result.reason_code,
-        "target_capability.no_qualified_representation"
-    );
+    assert!(result.plan.is_none());
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate
+            .target
+            .parameters
+            .get("conversion_kind")
+            .map(String::as_str)
+            == Some("logical_value_json")
+    }));
 }

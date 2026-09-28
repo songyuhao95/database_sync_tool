@@ -55,6 +55,7 @@ fn snapshot_data_type_supported(data_type: &str) -> bool {
             | "timestamp"
             | "year"
             | "json"
+            | "geometry"
             | "point"
             | "linestring"
             | "polygon"
@@ -62,6 +63,7 @@ fn snapshot_data_type_supported(data_type: &str) -> bool {
             | "multilinestring"
             | "multipolygon"
             | "geometrycollection"
+            | "geomcollection"
     )
 }
 
@@ -323,6 +325,9 @@ impl SnapshotReader {
             .map(|(_, c)| {
                 let name = quote_identifier(&c.name);
                 match c.data_type.as_str() {
+                    // SET's character rendering is comma-joined and cannot
+                    // preserve labels containing commas. Read its native bitmask.
+                    "set" => format!("CAST({name} AS UNSIGNED)"),
                     "timestamp" => format!("CAST(UNIX_TIMESTAMP({name}) AS CHAR)"),
                     "year" => format!("CAST({name} AS CHAR)"),
                     _ => name,
@@ -493,6 +498,7 @@ mod tests {
         assert!(snapshot_data_type_supported("set"));
         assert!(snapshot_data_type_supported("point"));
         assert!(snapshot_data_type_supported("geometrycollection"));
+        assert!(snapshot_data_type_supported("geomcollection"));
     }
     #[test]
     fn cancelled_snapshot_does_not_connect() {

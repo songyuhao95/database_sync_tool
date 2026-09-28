@@ -1,23 +1,32 @@
 //! Live recursive PostgreSQL type capture qualification.
 //! Uses isolated schema, publication, and slot names on authorized PG15/16/17 instances.
 
-use change_event::{Datum, LogicalValue, Operation};
+use change_event::{Datum, LogicalValue, Operation, ServerBuildIdentity};
 use postgresql_15::{CancellationToken, Config};
 use sqlx::{Connection, PgConnection};
 use std::{env, time::Duration};
 
-#[path = "../../../tests/support/postgres_env.rs"]
-mod postgres_env;
+use super::{postgres_env, type_qualification_evidence};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-async fn capture_recursive_types(major: u16) -> TestResult {
+pub(super) struct RecursiveCapture {
+    pub(super) table_name: String,
+    pub(super) transactions: Vec<change_event::ValidatedTransaction>,
+    pub(super) catalog: postgresql_15::SourceTypeCatalog,
+    pub(super) source_build: ServerBuildIdentity,
+    pub(super) fields: Vec<(String, String)>,
+    pub(super) dynamic_classes: Vec<String>,
+}
+
+pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveCapture> {
     let version = major.to_string();
     let password = env::var(postgres_env::env_name(&version, "TEST_PASSWORD"))?;
     let tag = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
     let schema = format!("cdc_pg{major}_recursive_{tag}");
+    let table_name = format!("events_{major}_{tag}");
     let publication = format!("cdc_pg{major}_recursive_pub_{tag}");
     let slot = format!("cdcpg{major}recursive{tag}");
     let admin_user = postgres_env::setting(&version, "ADMIN_USER", "postgres");
@@ -27,16 +36,20 @@ async fn capture_recursive_types(major: u16) -> TestResult {
         PgConnection::connect_with(&postgres_env::options(&version, &admin_user, &password))
             .await?;
     let mut created_hstore = false;
+    let mut created_postgis = false;
     let result = async {
         execute(&mut admin, format!("CREATE SCHEMA {schema}")).await?;
+        execute(&mut admin, "CREATE SCHEMA IF NOT EXISTS \"CDC_test\"".into()).await?;
         let (hstore_schema, created) = ensure_hstore(&mut admin, &schema).await?;
         created_hstore = created;
-        let postgis_schema = installed_extension_schema(&mut admin, "postgis").await?;
+        let (postgis_schema, created) = ensure_postgis(&mut admin).await?;
+        created_postgis = created;
         eprintln!(
-            "PostgreSQL {major} recursive qualification extensions: hstore={}, hstore_temporary_install={}, postgis={}",
+            "PostgreSQL {major} recursive qualification extensions: hstore={}, hstore_temporary_install={}, postgis={}, postgis_temporary_install={}",
             hstore_schema.is_some(),
             created_hstore,
-            postgis_schema.is_some()
+            postgis_schema.is_some(),
+            created_postgis
         );
         execute(
             &mut admin,
@@ -78,7 +91,7 @@ async fn capture_recursive_types(major: u16) -> TestResult {
         execute(
             &mut admin,
             format!(
-                "CREATE TABLE {schema}.events (
+                "CREATE TABLE \"CDC_test\".{table_name} (
                     id bigint PRIMARY KEY,
                     mood {schema}.mood NOT NULL,
                     score {schema}.positive_int NOT NULL,
@@ -95,25 +108,25 @@ async fn capture_recursive_types(major: u16) -> TestResult {
         .await?;
         execute(
             &mut admin,
-            format!("ALTER TABLE {schema}.events REPLICA IDENTITY FULL"),
+            format!("ALTER TABLE \"CDC_test\".{table_name} REPLICA IDENTITY FULL"),
         )
         .await?;
         execute(
             &mut admin,
-            format!("CREATE PUBLICATION {publication} FOR TABLE {schema}.events"),
+            format!("CREATE PUBLICATION {publication} FOR TABLE \"CDC_test\".{table_name}"),
         )
         .await?;
         execute(
             &mut admin,
             format!(
-                "GRANT USAGE ON SCHEMA {schema} TO {reader_user}, {writer_user}"
+                "GRANT USAGE ON SCHEMA \"CDC_test\", {schema} TO {reader_user}, {writer_user}"
             ),
         )
         .await?;
         execute(
             &mut admin,
             format!(
-                "GRANT SELECT, INSERT, UPDATE, DELETE ON {schema}.events TO {reader_user}, {writer_user}"
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON \"CDC_test\".{table_name} TO {reader_user}, {writer_user}"
             ),
         )
         .await?;
@@ -133,6 +146,26 @@ async fn capture_recursive_types(major: u16) -> TestResult {
         drop(initial);
         config.create_slot = false;
         config.expected_source_id = Some(source_id);
+
+        let catalog = postgresql_15::source_type_catalog(&mut admin).await?;
+        let server_version: String = sqlx::query_scalar("SHOW server_version")
+            .fetch_one(&mut admin)
+            .await?;
+        if server_version.split('.').next() != Some(version.as_str()) {
+            return Err(std::io::Error::other(format!(
+                "PostgreSQL source {major} endpoint returned unexpected server version {server_version}"
+            ))
+            .into());
+        }
+        let server_version_text: String = sqlx::query_scalar("SELECT version()")
+            .fetch_one(&mut admin)
+            .await?;
+        let source_build = ServerBuildIdentity::new(
+            "postgresql",
+            "community",
+            server_version,
+            server_version_text,
+        );
 
         let mut writer = PgConnection::connect_with(&postgres_env::options(
             &version,
@@ -194,7 +227,7 @@ async fn capture_recursive_types(major: u16) -> TestResult {
         execute(
             &mut writer,
             format!(
-                "INSERT INTO {schema}.events ({}) VALUES ({})",
+                "INSERT INTO \"CDC_test\".{table_name} ({}) VALUES ({})",
                 insert_columns.join(", "),
                 insert_values.join(", ")
             ),
@@ -203,13 +236,13 @@ async fn capture_recursive_types(major: u16) -> TestResult {
         execute(
             &mut writer,
             format!(
-                "UPDATE {schema}.events SET nullable_marker='now-present' WHERE id=1"
+                "UPDATE \"CDC_test\".{table_name} SET nullable_marker='now-present' WHERE id=1"
             ),
         )
         .await?;
         execute(
             &mut writer,
-            format!("DELETE FROM {schema}.events WHERE id=1"),
+            format!("DELETE FROM \"CDC_test\".{table_name} WHERE id=1"),
         )
         .await?;
 
@@ -248,7 +281,37 @@ async fn capture_recursive_types(major: u16) -> TestResult {
             assert_eq!(change_event::json(&replay)?, encoded);
             reader.finish()?;
         }
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        let mut dynamic_classes = vec![
+            "postgresql.arrays".to_owned(),
+            "postgresql.domains".to_owned(),
+            "postgresql.enums".to_owned(),
+            "postgresql.composites".to_owned(),
+            "postgresql.ranges".to_owned(),
+        ];
+        if hstore_schema.is_some() || postgis_schema.is_some() {
+            dynamic_classes.push("postgresql.extensions_and_custom_base_types".to_owned());
+        }
+        if hstore_schema.is_some() {
+            dynamic_classes.push("postgresql.user_defined_base_types".to_owned());
+        }
+        let fields = row
+            .iter()
+            .filter(|column| column.name != "id")
+            .map(|column| (column.name.clone(), column.native_type.clone()))
+            .collect();
+        type_qualification_evidence::record_dynamic_type_class_evidence(
+            &format!("postgresql_{major}"),
+            &format!("postgresql_{major}.recursive_type_fixtures"),
+            dynamic_classes.clone(),
+        )?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(RecursiveCapture {
+            table_name: table_name.clone(),
+            transactions,
+            catalog,
+            source_build,
+            fields,
+            dynamic_classes,
+        })
     }
     .await;
 
@@ -258,7 +321,11 @@ async fn capture_recursive_types(major: u16) -> TestResult {
     .bind(&slot)
     .execute(&mut admin)
     .await;
-    let _ = execute(&mut admin, format!("DROP TABLE IF EXISTS {schema}.events")).await;
+    let _ = execute(
+        &mut admin,
+        format!("DROP TABLE IF EXISTS \"CDC_test\".{table_name}"),
+    )
+    .await;
     if created_hstore {
         let _ = execute(&mut admin, "DROP EXTENSION IF EXISTS hstore".into()).await;
     }
@@ -272,6 +339,9 @@ async fn capture_recursive_types(major: u16) -> TestResult {
         format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
     )
     .await;
+    if created_postgis {
+        let _ = execute(&mut admin, "DROP EXTENSION IF EXISTS postgis".into()).await;
+    }
     result
 }
 
@@ -322,6 +392,25 @@ async fn ensure_hstore(
     }
 }
 
+async fn ensure_postgis(connection: &mut PgConnection) -> TestResult<(Option<String>, bool)> {
+    if let Some(schema) = installed_extension_schema(connection, "postgis").await? {
+        return Ok((Some(schema), false));
+    }
+    let available = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name='postgis')",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !available {
+        return Ok((None, false));
+    }
+    execute(connection, "CREATE EXTENSION postgis".into()).await?;
+    let schema = installed_extension_schema(connection, "postgis")
+        .await?
+        .ok_or("PostGIS reports installed but has no extension schema")?;
+    Ok((Some(schema), true))
+}
+
 fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -363,7 +452,8 @@ macro_rules! live_test {
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "requires a configured PostgreSQL live test instance"]
         async fn $name() -> TestResult {
-            capture_recursive_types($major).await
+            let _ = capture_recursive_types($major).await?;
+            Ok(())
         }
     };
 }

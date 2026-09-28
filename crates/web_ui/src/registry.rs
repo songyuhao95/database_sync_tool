@@ -12,7 +12,10 @@ use change_event::{
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, OnceLock, RwLock},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ConnectorIdentity {
@@ -46,7 +49,7 @@ pub(crate) struct ConnectorDescriptor {
     pub(crate) adapter: AdapterKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AdapterKind {
     Mysql57,
     Mysql80,
@@ -275,15 +278,32 @@ impl ConnectorDescriptor {
     pub(crate) fn structured_manifest(
         &self,
         target_build: ServerBuildIdentity,
-    ) -> TargetCapabilityManifest {
-        match self.adapter {
+    ) -> Arc<TargetCapabilityManifest> {
+        // Version manifests contain thousands of static type/length entries.
+        // A field preview repeatedly requests the same build; the live target
+        // probe remains per-field and is deliberately not cached here.
+        type ManifestCache = RwLock<HashMap<(AdapterKind, String), Arc<TargetCapabilityManifest>>>;
+        static MANIFESTS: OnceLock<ManifestCache> = OnceLock::new();
+        let manifests = MANIFESTS.get_or_init(|| RwLock::new(HashMap::new()));
+        let key = (self.adapter, change_event::stable_digest(&target_build));
+        if let Some(cached) = manifests.read().expect("manifest cache read").get(&key) {
+            return Arc::clone(cached);
+        }
+        let manifest = Arc::new(match self.adapter {
             AdapterKind::Mysql57 => mysql_5_7::compatibility_manifest(target_build),
             AdapterKind::Mysql80 => mysql_8_0::compatibility_manifest(target_build),
             AdapterKind::Mysql84 => mysql_8_4::compatibility_manifest(target_build),
             AdapterKind::Postgresql15 => postgresql_15::compatibility_manifest(target_build),
             AdapterKind::Postgresql16 => postgresql_16::compatibility_manifest(target_build),
             AdapterKind::Postgresql17 => postgresql_17::compatibility_manifest(target_build),
-        }
+        });
+        Arc::clone(
+            manifests
+                .write()
+                .expect("manifest cache write")
+                .entry(key)
+                .or_insert(manifest),
+        )
     }
 
     pub(crate) fn source_type_mapping(
@@ -585,6 +605,14 @@ pub(crate) fn field_compatibility_with_source_evidence_and_target_probe(
             )
         });
     let manifest = sink_connector.structured_manifest(manifest_build);
+    // A Raw field carries a protocol envelope, not a decoded Value. An
+    // Unavailable before-image is still safe for a non-key field because the
+    // sink does not write it; the common event validator checks its position.
+    let value_presence = if matches!(source_mapping.logical_type, LogicalType::Raw { .. }) {
+        PresenceState::SourceRepresentation
+    } else {
+        PresenceState::Value
+    };
     change_event::plan_field_compatibility(FieldCompatibilityInput {
         source_field,
         target_field,
@@ -602,7 +630,7 @@ pub(crate) fn field_compatibility_with_source_evidence_and_target_probe(
         manifest: &manifest,
         operations: vec![Operation::Insert, Operation::Update, Operation::Delete],
         presences: vec![
-            PresenceState::Value,
+            value_presence,
             PresenceState::Null,
             PresenceState::Unchanged,
             PresenceState::Unavailable,

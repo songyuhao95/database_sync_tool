@@ -164,7 +164,11 @@ fn mysql_id_plan(
         options: options("mysql-id-route"),
     })
     .unwrap();
-    assert_eq!(result.status, change_event::CompatibilityStatus::Compatible);
+    assert_eq!(
+        result.status,
+        change_event::CompatibilityStatus::Compatible,
+        "{result:?}"
+    );
     result.plan.expect("id must have a conversion plan")
 }
 
@@ -319,7 +323,7 @@ fn binary_and_bit_string_keep_raw_boundaries_and_metadata() {
             bytes_base64url: URL_SAFE_NO_PAD.encode([0xaa, 0]),
             bit_length: 10,
             padding: BitPadding::Zero,
-            bit_order: BitOrder::MsbFirst,
+            bit_order: BitOrder::LsbFirst,
         },
         "bit(10)",
         Source {
@@ -339,19 +343,159 @@ fn binary_and_bit_string_keep_raw_boundaries_and_metadata() {
     .unwrap();
     let plan = result.plan.unwrap();
     assert_eq!(plan.target.parameters["target_bit_length"], "10");
-    assert_eq!(plan.target.parameters["target_bit_order"], "msb_first");
+    assert_eq!(plan.target.parameters["target_bit_order"], "lsb_first");
     assert_eq!(plan.target.parameters["target_padding"], "zero");
     let error = change_event::validate_value_against_plan(
         &plan,
         &LogicalValue::BitString {
-            bytes_base64url: URL_SAFE_NO_PAD.encode([0xaa, 1]),
+            bytes_base64url: URL_SAFE_NO_PAD.encode([0xaa, 0x40]),
             bit_length: 10,
             padding: BitPadding::Zero,
-            bit_order: BitOrder::MsbFirst,
+            bit_order: BitOrder::LsbFirst,
         },
     )
     .unwrap_err();
     assert_eq!(error.code, "target_capability.bit_padding_invalid");
+}
+
+#[test]
+fn bit_plan_repackages_meaningful_bits_for_the_target_bit_order() {
+    let source_value = LogicalValue::BitString {
+        // The meaningful source sequence is 1011000000 in MSB-first order.
+        bytes_base64url: URL_SAFE_NO_PAD.encode([0xb0_u8, 0]),
+        bit_length: 10,
+        padding: BitPadding::Zero,
+        bit_order: BitOrder::MsbFirst,
+    };
+    let validated = change_event::validate(transaction(
+        source_value,
+        "bit(10)",
+        Source {
+            kind: "postgresql".into(),
+            version: "15.19".into(),
+            id: "source".into(),
+        },
+    ))
+    .unwrap();
+    let mut manifest = mysql_8_0::compatibility_manifest(ServerBuildIdentity::new(
+        "mysql",
+        "oracle",
+        "8.0.36",
+        "mysql-8.0.36",
+    ));
+    let bit_capability = manifest
+        .capabilities
+        .iter_mut()
+        .find(|entry| {
+            matches!(
+                entry.source_logical_type,
+                LogicalType::BitString { length: 10 }
+            )
+        })
+        .expect("MySQL sink has a BIT(10) representation");
+    bit_capability
+        .target
+        .parameters
+        .insert("target_bit_order".into(), "lsb_first".into());
+    manifest.digest = manifest.computed_digest();
+
+    let mapping = SourceTypeMapping::new(
+        ConnectorIdentity::new("postgresql", "15"),
+        "bit(10)",
+        LogicalType::bit_string(10),
+        "postgresql15.source-type.bit",
+        "postgresql-test.v1",
+    );
+    let mut field_input = input(
+        field("bit(10)", LogicalType::bit_string(10), None),
+        target_field("bit(10)", LogicalType::bit_string(10), None),
+        mapping,
+        &manifest,
+        "bit-order-route",
+    );
+    field_input.source_type_mapping = field_input
+        .source_type_mapping
+        .with_value_representation_parameter("bit_order", "msb_first");
+    let result = change_event::plan_field_compatibility(field_input).unwrap();
+    assert_eq!(
+        result.status,
+        change_event::CompatibilityStatus::Compatible,
+        "{result:?}"
+    );
+    let plan = result.plan.expect("BIT conversion plan");
+    let converted =
+        change_event::convert_transaction_with_plans(validated.transaction().clone(), &[plan])
+            .expect("the plan should re-pack bits without losing their values");
+    let Datum::Value(LogicalValue::BitString {
+        bytes_base64url,
+        bit_length,
+        padding,
+        bit_order,
+    }) = &converted.changes[0].after.as_ref().unwrap()[1].datum
+    else {
+        panic!("converted datum remains a bit string");
+    };
+    assert_eq!(*bit_length, 10);
+    assert_eq!(*padding, BitPadding::Zero);
+    assert_eq!(*bit_order, BitOrder::LsbFirst);
+    assert_eq!(URL_SAFE_NO_PAD.decode(bytes_base64url).unwrap(), [0x0d, 0]);
+}
+
+#[test]
+fn mysql_source_bit_mapping_repackages_values_for_postgresql_sink() {
+    let mapping = mysql_5_7::source_type_mapping("bit(10)", None, None).unwrap();
+    assert_eq!(mapping.value_representation["bit_order"], "lsb_first");
+    let source_value = LogicalValue::BitString {
+        // The meaningful sequence is 1011000000 in MySQL's LSB-first layout.
+        bytes_base64url: URL_SAFE_NO_PAD.encode([0x0d_u8, 0]),
+        bit_length: 10,
+        padding: BitPadding::Zero,
+        bit_order: BitOrder::LsbFirst,
+    };
+    let validated = change_event::validate(transaction(
+        source_value,
+        "bit(10)",
+        Source {
+            kind: "mysql".into(),
+            version: "5.7.44".into(),
+            id: "source".into(),
+        },
+    ))
+    .unwrap();
+    let manifest = postgresql_15::compatibility_manifest(ServerBuildIdentity::new(
+        "postgresql",
+        "community",
+        "15.19",
+        "postgres-15.19",
+    ));
+    let result = change_event::plan_field_compatibility(input(
+        field("bit(10)", mapping.logical_type.clone(), None),
+        target_field("bit(10)", LogicalType::bit_string(10), None),
+        mapping,
+        &manifest,
+        "mysql-to-postgresql-bit-route",
+    ))
+    .unwrap();
+    assert_eq!(
+        result.status,
+        change_event::CompatibilityStatus::Compatible,
+        "{result:?}"
+    );
+    let plan = result.plan.unwrap();
+    assert_eq!(plan.target.parameters["target_bit_order"], "msb_first");
+    let converted =
+        change_event::convert_transaction_with_plans(validated.transaction().clone(), &[plan])
+            .expect("bit values must be repacked for the PostgreSQL representation");
+    let Datum::Value(LogicalValue::BitString {
+        bytes_base64url,
+        bit_order,
+        ..
+    }) = &converted.changes[0].after.as_ref().unwrap()[1].datum
+    else {
+        panic!("converted datum remains a bit string");
+    };
+    assert_eq!(*bit_order, BitOrder::MsbFirst);
+    assert_eq!(URL_SAFE_NO_PAD.decode(bytes_base64url).unwrap(), [0xb0, 0]);
 }
 
 #[test]
@@ -483,11 +627,11 @@ fn mysql_sink_uses_json_value_carrier_for_a_qualified_recursive_plan() {
     ));
     let source = field("integer[]", logical, None);
     let target = target_field("json", LogicalType::json(), None);
-    let result = change_event::plan_compatibility(CompatibilityInput {
+    let input = |selected_rule| CompatibilityInput {
         transaction: &transaction,
-        source_field: source,
-        target_field: target,
-        source_type_mapping: mapping,
+        source_field: source.clone(),
+        target_field: target.clone(),
+        source_type_mapping: mapping.clone(),
         source_connector: ConnectorIdentity::new("postgresql", "15"),
         sink_connector: manifest.connector.clone(),
         source_build: Some(ServerBuildIdentity::new(
@@ -498,9 +642,31 @@ fn mysql_sink_uses_json_value_carrier_for_a_qualified_recursive_plan() {
         )),
         target_build: Some(manifest.target_build.clone()),
         manifest: &manifest,
-        options: options("mysql-recursive-route"),
-    })
-    .unwrap();
+        options: RouteOptions {
+            selected_rule,
+            ..options("mysql-recursive-route")
+        },
+    };
+    let discovery = change_event::plan_compatibility(input(None)).unwrap();
+    assert_eq!(
+        discovery.status,
+        change_event::CompatibilityStatus::NeedsConfiguration
+    );
+    let carrier_rule = discovery
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str)
+                == Some("recursive")
+        })
+        .expect("recursive value carrier must be offered")
+        .rule
+        .clone();
+    let result = change_event::plan_compatibility(input(Some(carrier_rule))).unwrap();
     assert_eq!(
         result.status,
         change_event::CompatibilityStatus::NeedsConfirmation
@@ -587,6 +753,36 @@ fn mysql_sink_uses_native_spatial_wkb_binding_and_srid() {
 }
 
 #[test]
+fn mysql_geomcollection_catalog_alias_and_unconstrained_srid_are_qualified() {
+    let source_mapping = mysql_5_7::source_type_mapping("geometrycollection", None, None).unwrap();
+    let target_mapping = mysql_8_0::source_type_mapping("geomcollection", None, None).unwrap();
+    assert_eq!(source_mapping.logical_type, target_mapping.logical_type);
+    let manifest = mysql_8_0::compatibility_manifest(ServerBuildIdentity::new(
+        "mysql",
+        "oracle",
+        "8.0.36",
+        "mysql-8.0.36",
+    ));
+    let result = change_event::plan_field_compatibility(input(
+        field(
+            "geometrycollection",
+            source_mapping.logical_type.clone(),
+            None,
+        ),
+        target_field("geomcollection", target_mapping.logical_type.clone(), None),
+        source_mapping,
+        &manifest,
+        "mysql-geomcollection-route",
+    ))
+    .unwrap();
+    assert_eq!(
+        result.status,
+        change_event::CompatibilityStatus::Compatible,
+        "{result:?}"
+    );
+}
+
+#[test]
 fn failed_conversion_does_not_partially_write_and_null_unchanged_are_preserved() {
     let mapping = mysql_5_7::source_type_mapping("bit(10)", None, None).unwrap();
     let manifest = mysql_8_0::compatibility_manifest(ServerBuildIdentity::new(
@@ -600,7 +796,7 @@ fn failed_conversion_does_not_partially_write_and_null_unchanged_are_preserved()
             bytes_base64url: URL_SAFE_NO_PAD.encode([0xaa, 0]),
             bit_length: 10,
             padding: BitPadding::Zero,
-            bit_order: BitOrder::MsbFirst,
+            bit_order: BitOrder::LsbFirst,
         },
         "bit(10)",
         Source {
@@ -622,10 +818,10 @@ fn failed_conversion_does_not_partially_write_and_null_unchanged_are_preserved()
     let mut invalid = validated.transaction().clone();
     let after = invalid.changes[0].after.as_mut().unwrap();
     after[1].datum = Datum::Value(LogicalValue::BitString {
-        bytes_base64url: URL_SAFE_NO_PAD.encode([0xaa, 1]),
+        bytes_base64url: URL_SAFE_NO_PAD.encode([0xaa, 0x40]),
         bit_length: 10,
         padding: BitPadding::Zero,
-        bit_order: BitOrder::MsbFirst,
+        bit_order: BitOrder::LsbFirst,
     });
     let before = format!("{invalid:?}");
     assert!(

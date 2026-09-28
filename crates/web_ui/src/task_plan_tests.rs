@@ -33,6 +33,29 @@ fn risk_confirmation_attribution_is_assigned_by_the_server() {
 }
 
 #[test]
+fn plan_set_digest_binds_confirmation_identity_without_audit_timestamp() {
+    let (_dir, _store, _actor, mut task) = fixture();
+    task.risk_confirmations = vec![RiskConfirmation {
+        source_field_lineage: "source-field".into(),
+        target_field_lineage: "target-field".into(),
+        rule: RuleReference {
+            id: "carrier-rule".into(),
+            version: "v1".into(),
+        },
+        plan_digest: "confirmed-plan".into(),
+        actor: "admin".into(),
+        confirmed_at: "2026-09-28T00:00:00Z".into(),
+        reason: Some("carrier risk accepted".into()),
+    }];
+    let first = crate::tasks::computed_plan_set_digest(&task);
+    task.risk_confirmations[0].confirmed_at = "2026-09-28T01:00:00Z".into();
+    task.risk_confirmations[0].actor = "another-admin".into();
+    assert_eq!(crate::tasks::computed_plan_set_digest(&task), first);
+    task.risk_confirmations[0].plan_digest = "another-plan".into();
+    assert_ne!(crate::tasks::computed_plan_set_digest(&task), first);
+}
+
+#[test]
 fn legacy_task_plans_are_persisted_as_unsafe_and_block_start() {
     let (_dir, store, actor, task) = fixture();
     let (status, version, plan_count, confirmation_count): (String, Option<String>, i64, i64) =

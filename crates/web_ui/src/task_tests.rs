@@ -47,7 +47,7 @@ fn table() -> CatalogTable {
         primary_key: vec!["id".into()],
         columns: vec![CatalogColumn {
             name: "id".into(),
-            column_type: "int(11) unsigned".into(),
+            column_type: "int(10) unsigned".into(),
             nullable: false,
             extra: String::new(),
             collation: None,
@@ -68,7 +68,8 @@ fn mysql_char_columns_reach_the_common_compatibility_planner() {
         default_value: None,
     });
     let sink = source.clone();
-    assert!(validate_pair(&source, &sink).is_ok());
+    let result = validate_pair(&source, &sink);
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[test]
@@ -87,7 +88,10 @@ fn table_preflight_preserves_integer_semantics_and_keys() {
     assert!(validate_pair(&source, &sink).is_err());
     sink = source.clone();
     sink.columns[0].nullable = true;
-    assert!(validate_pair(&source, &sink).is_err());
+    assert!(validate_pair(&source, &sink).is_ok());
+    let mut nullable_source = source.clone();
+    nullable_source.columns[0].nullable = true;
+    assert!(validate_pair(&nullable_source, &source).is_err());
     sink = source.clone();
     sink.columns[0].collation = Some("utf8mb4_0900_ai_ci".into());
     assert!(validate_pair(&source, &sink).is_err());
@@ -271,7 +275,8 @@ fn selected_columns_require_primary_keys_and_safe_sink_defaults() {
 
     assert!(validate_selected_pair(&source, &sink, &["id".into()]).is_err());
     sink.columns[1].default_value = Some(String::new());
-    assert!(validate_selected_pair(&source, &sink, &["id".into()]).is_ok());
+    let result = validate_selected_pair(&source, &sink, &["id".into()]);
+    assert!(result.is_ok(), "{result:?}");
     assert!(validate_selected_pair(&source, &sink, &["message".into()]).is_err());
     sink = source.clone();
     assert!(validate_selected_pair(&source, &sink, &["id".into(), "message".into()]).is_ok());

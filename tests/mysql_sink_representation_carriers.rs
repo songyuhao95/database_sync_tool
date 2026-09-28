@@ -929,6 +929,7 @@ fn every_mysql_sink_qualifies_tagged_logical_value_and_source_representation_car
                 change_event::PresenceState::SourceRepresentation,
                 change_event::PresenceState::Null,
                 change_event::PresenceState::Unchanged,
+                change_event::PresenceState::Unavailable,
             ]
         );
     }
@@ -1135,6 +1136,78 @@ fn all_mysql_sinks_render_tagged_logical_values_and_source_envelopes() {
     assert_rendered!(mysql_5_7, manifests[0].clone());
     assert_rendered!(mysql_8_0, manifests[1].clone());
     assert_rendered!(mysql_8_4, manifests[2].clone());
+}
+
+#[test]
+fn mysql_carrier_plans_accept_unavailable_before_and_unchanged_after_values() {
+    let table = "partial_carrier_update";
+    let mut transaction = insert_transaction(
+        table,
+        Datum::Value(LogicalValue::Uuid {
+            value: "550e8400-e29b-41d4-a716-446655440000".into(),
+        }),
+        "uuid",
+    )
+    .transaction()
+    .clone();
+    let change = &mut transaction.changes[0];
+    change.operation = Operation::Update;
+    let mut before = change.after.clone().expect("insert after image");
+    let mut after = before.clone();
+    before[1].datum = Datum::Unavailable;
+    after[1].datum = Datum::Unchanged;
+    change.before = Some(before);
+    change.after = Some(after);
+    let transaction = change_event::validate(transaction).unwrap();
+
+    macro_rules! assert_sink_accepts_partial_carrier_image {
+        ($adapter:ident, $manifest:expr) => {{
+            let manifest = $manifest;
+            let plans = vec![
+                mysql_plan(
+                    &manifest,
+                    MysqlPlanSpec::new(
+                        table,
+                        "id",
+                        "bigint",
+                        LogicalType::integer(true, 64),
+                        "bigint",
+                        LogicalType::integer(true, 64),
+                    )
+                    .key(0),
+                ),
+                mysql_plan(
+                    &manifest,
+                    MysqlPlanSpec::new(
+                        table,
+                        "payload",
+                        "uuid",
+                        LogicalType::Uuid,
+                        "json",
+                        LogicalType::json(),
+                    )
+                    .conversion(
+                        "logical_value_json",
+                        vec![
+                            PresenceState::Value,
+                            PresenceState::Null,
+                            PresenceState::Unchanged,
+                        ],
+                    ),
+                ),
+            ];
+            let sql = ::$adapter::sql_with_plans(&transaction, &plans)
+                .expect("non-writable partial-image carrier values are not rendered");
+            let statement = sql.statements().next().expect("one UPDATE");
+            assert!(statement.contains("UPDATE"));
+            assert!(!statement.contains("`payload` ="));
+        }};
+    }
+
+    let manifests = manifests();
+    assert_sink_accepts_partial_carrier_image!(mysql_5_7, manifests[0].clone());
+    assert_sink_accepts_partial_carrier_image!(mysql_8_0, manifests[1].clone());
+    assert_sink_accepts_partial_carrier_image!(mysql_8_4, manifests[2].clone());
 }
 
 #[test]

@@ -474,7 +474,7 @@ fn add_exact_bit_string(capabilities: &mut Vec<CapabilityEntry>, length: u64) {
         .insert("bit_length_unit".into(), "bits".into());
     target
         .parameters
-        .insert("target_bit_order".into(), "msb_first".into());
+        .insert("target_bit_order".into(), "lsb_first".into());
     target.parameters.insert(
         "target_padding".into(),
         if length.is_multiple_of(8) {
@@ -657,6 +657,7 @@ fn add_logical_value_json_carrier(capabilities: &mut Vec<CapabilityEntry>) {
             PresenceState::Value,
             PresenceState::Null,
             PresenceState::Unchanged,
+            PresenceState::Unavailable,
         ],
         rule,
     });
@@ -683,6 +684,7 @@ fn add_source_representation_carrier(capabilities: &mut Vec<CapabilityEntry>) {
         PresenceState::SourceRepresentation,
         PresenceState::Null,
         PresenceState::Unchanged,
+        PresenceState::Unavailable,
     ];
     let mut rule = explicit_rule(&code, logical.clone(), target.clone(), Vec::new());
     rule.supported_presence = presence.clone();

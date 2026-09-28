@@ -414,3 +414,296 @@ fn target_probe_failure_is_reported_as_target_capability_failure() {
     assert_eq!(error.class(), FailureClass::TargetCapability);
     assert_eq!(error.code(), "target_capability.probe_not_qualified");
 }
+
+#[test]
+fn each_sink_exposes_an_explicit_value_carrier_that_can_be_confirmed() {
+    let source_connector = SourceRegistry.find("mysql", "5.7").unwrap();
+    let source = CatalogTable {
+        schema: "CDC_test".into(),
+        name: "carrier_test".into(),
+        engine: "InnoDB".into(),
+        primary_key: vec!["id".into()],
+        columns: vec![
+            CatalogColumn {
+                name: "id".into(),
+                column_type: "bigint".into(),
+                nullable: false,
+                extra: String::new(),
+                collation: None,
+                default_value: None,
+            },
+            CatalogColumn {
+                name: "payload".into(),
+                column_type: "json".into(),
+                nullable: true,
+                extra: String::new(),
+                collation: None,
+                default_value: None,
+            },
+        ],
+    };
+    let source_build = ServerBuildIdentity::new("mysql", "oracle", "5.7.44", "mysql-5.7.44");
+    for (kind, version, native_type) in [
+        ("mysql", "5.7", "json"),
+        ("mysql", "8.0", "json"),
+        ("mysql", "8.4", "json"),
+        ("postgresql", "15", "text"),
+        ("postgresql", "16", "text"),
+        ("postgresql", "17", "text"),
+    ] {
+        let sink_connector = SinkRegistry.find(kind, version).unwrap();
+        let target_build = ServerBuildIdentity::new(kind, "test", version, "test-build");
+        let mut sink = source.clone();
+        sink.engine = if kind == "mysql" {
+            "InnoDB"
+        } else {
+            "PostgreSQL"
+        }
+        .into();
+        sink.columns[1].column_type = native_type.into();
+        let manifest = sink_connector.structured_manifest(target_build.clone());
+        let carrier = manifest
+            .capabilities
+            .iter()
+            .find(|capability| {
+                capability
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("logical_value_json")
+            })
+            .expect("every sink offers a tagged LogicalValue carrier");
+        assert_eq!(carrier.target.native_type, native_type);
+        let probe = TargetCapabilityProbe::new(
+            target_build.clone(),
+            "CDC_test",
+            "carrier_test",
+            "payload",
+            TargetColumnMetadata::new(catalog_fingerprint(&sink)).with_native_type(native_type),
+            [CapabilityProbeEntry::new(
+                &carrier.code,
+                CapabilityProbeStatus::Qualified,
+            )],
+            [],
+            TargetSessionProfile::new("test-session", std::iter::empty::<(String, String)>()),
+        );
+        let plan = |parameters: &BTreeMap<String, String>, confirmations: &[RiskConfirmation]| {
+            field_compatibility_with_source_evidence_and_target_probe(
+                source_connector,
+                sink_connector,
+                &source,
+                &sink,
+                &source.columns[1],
+                &sink.columns[1],
+                "draft-carrier-test",
+                "draft-carrier-test:r1",
+                Some(source_build.clone()),
+                Some(target_build.clone()),
+                None,
+                None,
+                parameters,
+                confirmations,
+                Some(&probe),
+            )
+            .expect("qualified target probe must allow planning")
+        };
+        let discovery = plan(&BTreeMap::new(), &[]);
+        assert_eq!(
+            discovery.status,
+            CompatibilityStatus::NeedsConfiguration,
+            "{kind} {version}: {} ({})",
+            discovery.reason_code,
+            discovery.explanation
+        );
+        assert!(
+            discovery.plan.is_none(),
+            "carrier must not be selected implicitly"
+        );
+        assert!(
+            discovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate.rule.id == carrier.rule.id)
+        );
+        let selection = BTreeMap::from([
+            ("__rule_id".into(), carrier.rule.id.clone()),
+            ("__rule_version".into(), carrier.rule.version.clone()),
+        ]);
+        let unconfirmed = plan(&selection, &[]);
+        assert_eq!(unconfirmed.status, CompatibilityStatus::NeedsConfirmation);
+        let pending = unconfirmed
+            .plan
+            .expect("risk preview includes the carrier plan");
+        assert_eq!(
+            pending
+                .target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str),
+            Some("logical_value_json")
+        );
+        assert_eq!(
+            pending.target_probe_digest.as_deref(),
+            Some(probe.digest.as_str())
+        );
+        let confirmation = RiskConfirmation {
+            source_field_lineage: pending.source_field.lineage_id.clone(),
+            target_field_lineage: pending.target_field.lineage_id.clone(),
+            rule: pending.rule.clone(),
+            plan_digest: pending.plan_digest.clone(),
+            actor: "test".into(),
+            confirmed_at: "2026-09-28T00:00:00Z".into(),
+            reason: Some("carrier limitations acknowledged".into()),
+        };
+        let confirmed = plan(&selection, &[confirmation]);
+        assert_eq!(confirmed.status, CompatibilityStatus::Compatible);
+        assert_eq!(confirmed.plan.unwrap().plan_digest, pending.plan_digest);
+    }
+}
+
+#[test]
+fn each_sink_exposes_an_explicit_source_representation_carrier() {
+    let source_connector = SourceRegistry.find("postgresql", "15").unwrap();
+    let source = CatalogTable {
+        schema: "application".into(),
+        name: "carrier_test".into(),
+        engine: "PostgreSQL".into(),
+        primary_key: vec!["id".into()],
+        columns: vec![
+            CatalogColumn {
+                name: "id".into(),
+                column_type: "bigint".into(),
+                nullable: false,
+                extra: String::new(),
+                collation: None,
+                default_value: None,
+            },
+            CatalogColumn {
+                name: "payload".into(),
+                column_type: "application.invoice_code".into(),
+                nullable: true,
+                extra: String::new(),
+                collation: None,
+                default_value: None,
+            },
+        ],
+    };
+    let catalog =
+        postgresql_15::SourceTypeCatalog::new([postgresql_15::SourceTypeDefinition::builtin(
+            90_001,
+            "application",
+            "invoice_code",
+        )]);
+    let source_build = ServerBuildIdentity::new("postgresql", "postgresql", "15.0", "test-build");
+    for (kind, version, native_type) in [
+        ("mysql", "5.7", "longblob"),
+        ("mysql", "8.0", "longblob"),
+        ("mysql", "8.4", "longblob"),
+        ("postgresql", "15", "bytea"),
+        ("postgresql", "16", "bytea"),
+        ("postgresql", "17", "bytea"),
+    ] {
+        let sink_connector = SinkRegistry.find(kind, version).unwrap();
+        let target_build = ServerBuildIdentity::new(kind, "test", version, "test-build");
+        let mut sink = source.clone();
+        sink.engine = if kind == "mysql" {
+            "InnoDB"
+        } else {
+            "PostgreSQL"
+        }
+        .into();
+        sink.columns[1].column_type = native_type.into();
+        let manifest = sink_connector.structured_manifest(target_build.clone());
+        let carrier = manifest
+            .capabilities
+            .iter()
+            .find(|capability| {
+                capability
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("source_representation")
+            })
+            .expect("every sink offers a source representation carrier");
+        assert_eq!(carrier.target.native_type, native_type);
+        let probe = TargetCapabilityProbe::new(
+            target_build.clone(),
+            "application",
+            "carrier_test",
+            "payload",
+            TargetColumnMetadata::new(catalog_fingerprint(&sink)).with_native_type(native_type),
+            [CapabilityProbeEntry::new(
+                &carrier.code,
+                CapabilityProbeStatus::Qualified,
+            )],
+            [],
+            TargetSessionProfile::new("test-session", std::iter::empty::<(String, String)>()),
+        );
+        let plan = |parameters: &BTreeMap<String, String>, confirmations: &[RiskConfirmation]| {
+            field_compatibility_with_source_evidence_and_target_probe(
+                source_connector,
+                sink_connector,
+                &source,
+                &sink,
+                &source.columns[1],
+                &sink.columns[1],
+                "draft-raw-carrier-test",
+                "draft-raw-carrier-test:r1",
+                Some(source_build.clone()),
+                Some(target_build.clone()),
+                Some(&catalog),
+                None,
+                parameters,
+                confirmations,
+                Some(&probe),
+            )
+            .expect("qualified target probe must allow Raw planning")
+        };
+        let discovery = plan(&BTreeMap::new(), &[]);
+        assert_eq!(
+            discovery.status,
+            CompatibilityStatus::NeedsConfiguration,
+            "{kind} {version}: {} ({})",
+            discovery.reason_code,
+            discovery.explanation
+        );
+        assert!(discovery.plan.is_none());
+        assert!(
+            discovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate.rule.id == carrier.rule.id)
+        );
+        let selection = BTreeMap::from([
+            ("__rule_id".into(), carrier.rule.id.clone()),
+            ("__rule_version".into(), carrier.rule.version.clone()),
+        ]);
+        let unconfirmed = plan(&selection, &[]);
+        assert_eq!(unconfirmed.status, CompatibilityStatus::NeedsConfirmation);
+        let pending = unconfirmed
+            .plan
+            .expect("risk preview includes the Raw carrier plan");
+        assert_eq!(
+            pending
+                .target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str),
+            Some("source_representation")
+        );
+        let confirmation = RiskConfirmation {
+            source_field_lineage: pending.source_field.lineage_id.clone(),
+            target_field_lineage: pending.target_field.lineage_id.clone(),
+            rule: pending.rule.clone(),
+            plan_digest: pending.plan_digest.clone(),
+            actor: "test".into(),
+            confirmed_at: "2026-09-28T00:00:00Z".into(),
+            reason: Some("source representation limitations acknowledged".into()),
+        };
+        let confirmed = plan(&selection, &[confirmation]);
+        assert_eq!(confirmed.status, CompatibilityStatus::Compatible);
+        assert_eq!(confirmed.plan.unwrap().plan_digest, pending.plan_digest);
+    }
+}

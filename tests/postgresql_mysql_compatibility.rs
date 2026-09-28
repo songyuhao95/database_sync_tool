@@ -243,7 +243,11 @@ fn arrays_and_unbounded_or_wrong_encoding_fail_at_planning() {
         &manifest,
         options(),
     );
-    assert_eq!(result.status, CompatibilityStatus::Unsupported);
+    assert_ne!(result.status, CompatibilityStatus::Compatible);
+    assert!(
+        result.plan.is_none(),
+        "unqualified array mapping must not auto-activate"
+    );
 
     let latin1 = mysql_5_7::source_type_mapping("text", Some("latin1"), None).unwrap();
     let latin1_field = field("mysql-latin1", "text", latin1.logical_type.clone(), None);
@@ -257,5 +261,9 @@ fn arrays_and_unbounded_or_wrong_encoding_fail_at_planning() {
         None,
     );
     let result = plan(latin1_field, target, latin1, &manifest, options());
-    assert_eq!(result.status, CompatibilityStatus::Unsupported);
+    assert_eq!(result.status, CompatibilityStatus::NeedsConfiguration);
+    assert!(
+        result.plan.is_none(),
+        "wrong-encoding text cannot be selected silently"
+    );
 }

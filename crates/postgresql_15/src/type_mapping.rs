@@ -255,6 +255,10 @@ pub struct SourceTypeDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceTypeDefinitionKind {
+    /// PostgreSQL protocol/catalog helper type that cannot be stored in a
+    /// table column. Kept only so composite catalog definitions can preserve
+    /// complete dependency evidence.
+    Pseudo,
     Builtin {
         native_type: String,
     },
@@ -297,6 +301,23 @@ pub struct SourceTypeField {
 }
 
 impl SourceTypeDefinition {
+    pub fn pseudo(
+        oid: u32,
+        schema: impl Into<String>,
+        name: impl Into<String>,
+        collation: Option<String>,
+    ) -> Self {
+        Self {
+            oid,
+            schema: schema.into(),
+            name: name.into(),
+            kind: SourceTypeDefinitionKind::Pseudo,
+            collation,
+            definition_digest: String::new(),
+        }
+        .finalized()
+    }
+
     pub fn builtin(oid: u32, schema: impl Into<String>, name: impl Into<String>) -> Self {
         let name = name.into();
         Self {
@@ -646,11 +667,28 @@ pub fn source_type_mapping_with_catalog_for_version(
     let base = base_name(&native_type).to_ascii_lowercase();
     let mapping_version = mapping_version(version);
     let mapping_id = format!("postgresql{version}.source-type.{base}");
+    let mut value_representation = BTreeMap::new();
+    if let LogicalType::BitString { length } = &logical_type {
+        value_representation.insert("bit_order".into(), "msb_first".into());
+        value_representation.insert(
+            "bit_padding".into(),
+            if length.is_multiple_of(8) {
+                "none"
+            } else {
+                "zero"
+            }
+            .into(),
+        );
+    } else if matches!(logical_type, LogicalType::VariableBitString { .. }) {
+        value_representation.insert("bit_order".into(), "msb_first".into());
+        value_representation.insert("bit_padding".into(), "variable".into());
+    }
     let evidence_digest = evidence_digest(
         &mapping_version,
         &native_type,
         &logical_type,
         &catalog.digest(),
+        &value_representation,
     );
     let source_representation_evidence =
         source_representation_evidence(&source_native_type, &logical_type, catalog, version)?;
@@ -665,6 +703,7 @@ pub fn source_type_mapping_with_catalog_for_version(
         source_build: None,
         environment_fingerprint: None,
         source_representation_evidence,
+        value_representation,
     })
 }
 
@@ -866,6 +905,12 @@ fn logical_type_with_catalog(
             members: enum_members(native_type, version)?,
         });
     }
+    // Parse the declared SQL shape before resolving its catalog alias. The
+    // catalog name (for example bpchar/varbit/float4) can discard a column's
+    // typmod or SQL alias semantics if it is resolved first.
+    if let Some(logical) = logical_type_from_builtin(native_type, version)? {
+        return Ok(logical);
+    }
     if let Some(canonical_builtin) = builtin_catalog_name(native_type) {
         if let Some(logical) = logical_type_from_builtin(canonical_builtin, version)? {
             return Ok(logical);
@@ -876,10 +921,33 @@ fn logical_type_with_catalog(
             return logical_type_from_definition(definition, catalog, version, &mut Vec::new());
         }
     }
-    if let Some(logical) = logical_type_from_builtin(native_type, version)? {
-        return Ok(logical);
-    }
     let definition = find_definition(native_type, catalog, version)?;
+    match &definition.kind {
+        SourceTypeDefinitionKind::Pseudo => {
+            return Err(SourceTypeMappingError::invalid(
+                version,
+                format!(
+                    "PostgreSQL pseudo-type {}.{} is not storable",
+                    definition.schema, definition.name
+                ),
+            ));
+        }
+        SourceTypeDefinitionKind::Array { element_oid, .. }
+            if catalog.types.iter().any(|element| {
+                element.oid == *element_oid
+                    && matches!(element.kind, SourceTypeDefinitionKind::Pseudo)
+            }) =>
+        {
+            return Err(SourceTypeMappingError::invalid(
+                version,
+                format!(
+                    "PostgreSQL array {}.{} has a pseudo-type element and is not storable",
+                    definition.schema, definition.name
+                ),
+            ));
+        }
+        _ => {}
+    }
     if !has_semantic_codec(catalog, definition.oid)
         && !matches!(definition.kind, SourceTypeDefinitionKind::Extension { .. })
     {
@@ -912,11 +980,10 @@ fn array_definition_for_element<'a>(
         return Ok(None);
     };
     Ok(catalog.types.iter().find(|definition| {
-        definition.schema == "pg_catalog"
-            && matches!(
-                definition.kind,
-                SourceTypeDefinitionKind::Array { element_oid: known, .. } if known == element_definition.oid
-            )
+        matches!(
+            definition.kind,
+            SourceTypeDefinitionKind::Array { element_oid: known, .. } if known == element_definition.oid
+        )
     }))
 }
 
@@ -1003,14 +1070,14 @@ fn logical_type_from_builtin(
     version: &str,
 ) -> Result<Option<LogicalType>, SourceTypeMappingError> {
     let logical = match native_type {
-        "boolean" => Ok(LogicalType::boolean()),
+        "boolean" | "bool" => Ok(LogicalType::boolean()),
         "smallint" => Ok(LogicalType::integer(true, 16)),
         "integer" | "int" => Ok(LogicalType::integer(true, 32)),
         "bigint" => Ok(LogicalType::integer(true, 64)),
         "oid" | "xid" | "cid" => Ok(LogicalType::integer(false, 32)),
         "xid8" => Ok(LogicalType::integer(false, 64)),
-        "real" => Ok(LogicalType::float(32)),
-        "double precision" => Ok(LogicalType::float(64)),
+        "real" | "float4" => Ok(LogicalType::float(32)),
+        "double precision" | "float8" => Ok(LogicalType::float(64)),
         "text" | "character" | "char" | "\"char\"" | "name" | "character varying" | "varchar" => {
             Ok(LogicalType::Text {
                 charset: "UTF8".into(),
@@ -1035,8 +1102,8 @@ fn logical_type_from_builtin(
                 duplicate_keys: DuplicateKeyPolicy::PreserveLast,
             },
         }),
-        "inet" => Ok(LogicalType::network("inet", false)),
-        "cidr" => Ok(LogicalType::network("inet", true)),
+        "inet" => Ok(LogicalType::network("ip", false)),
+        "cidr" => Ok(LogicalType::network("ip", true)),
         "macaddr" | "macaddr8" => Ok(LogicalType::network(native_type, false)),
         "xml" => Ok(LogicalType::xml()),
         "interval" => interval(native_type, version),
@@ -1073,7 +1140,7 @@ fn logical_type_from_builtin(
                     "bit varying length must be positive and bounded",
                 ));
             }
-            Ok(LogicalType::bit_string(length))
+            Ok(LogicalType::variable_bit_string(Some(length)))
         }
         _ if native_type.starts_with("varbit(") => {
             let length = parenthesized_u64(native_type, "varbit", version)?;
@@ -1083,7 +1150,7 @@ fn logical_type_from_builtin(
                     "varbit length must be positive and bounded",
                 ));
             }
-            Ok(LogicalType::bit_string(length))
+            Ok(LogicalType::variable_bit_string(Some(length)))
         }
         _ if native_type.starts_with("geometry(") => spatial(native_type, version),
         _ if native_type.starts_with("character varying(")
@@ -1233,6 +1300,7 @@ pub(crate) fn has_semantic_codec(catalog: &SourceTypeCatalog, oid: u32) -> bool 
         };
         stack.push(oid);
         let result = match &definition.kind {
+            SourceTypeDefinitionKind::Pseudo => false,
             SourceTypeDefinitionKind::Builtin { .. } => crate::types::supported(oid),
             SourceTypeDefinitionKind::Enum { .. } => true,
             SourceTypeDefinitionKind::Domain { base_oid, .. } => visit(catalog, *base_oid, stack),
@@ -1270,6 +1338,14 @@ pub(crate) fn has_semantic_codec(catalog: &SourceTypeCatalog, oid: u32) -> bool 
     visit(catalog, oid, &mut Vec::new())
 }
 
+pub(crate) fn captures_source_representation(
+    catalog: &SourceTypeCatalog,
+    oid: u32,
+    logical_type: &LogicalType,
+) -> bool {
+    matches!(logical_type, LogicalType::Raw { .. }) || !has_semantic_codec(catalog, oid)
+}
+
 fn logical_type_from_definition(
     definition: &SourceTypeDefinition,
     catalog: &SourceTypeCatalog,
@@ -1287,6 +1363,13 @@ fn logical_type_from_definition(
     }
     stack.push(definition.oid);
     let result = match &definition.kind {
+        SourceTypeDefinitionKind::Pseudo => Err(SourceTypeMappingError::invalid(
+            version,
+            format!(
+                "PostgreSQL pseudo-type {}.{} is not storable",
+                definition.schema, definition.name
+            ),
+        )),
         SourceTypeDefinitionKind::Builtin { native_type } => {
             if let Some(logical_type) =
                 logical_type_for_catalog_builtin(definition.oid, native_type, version)?
@@ -1300,7 +1383,17 @@ fn logical_type_from_definition(
                     "UTF-8",
                 ))
             } else {
-                Err(SourceTypeMappingError::unsupported(version, native_type))
+                // PostgreSQL base types can be supplied by applications or
+                // extensions. Without a qualified semantic codec, preserve
+                // the pgoutput text representation bound to this catalog
+                // definition so the value can still be copied losslessly to
+                // an explicit bytea/blob representation carrier.
+                Ok(LogicalType::raw(
+                    "postgresql.pgoutput.text-envelope.v1",
+                    format!("{}.{}", definition.schema, definition.name),
+                    definition_digest(definition, version)?,
+                    "UTF-8",
+                ))
             }
         }
         SourceTypeDefinitionKind::Enum { labels } => {
@@ -1830,9 +1923,16 @@ fn evidence_digest(
     native_type: &str,
     logical_type: &LogicalType,
     catalog_digest: &str,
+    value_representation: &BTreeMap<String, String>,
 ) -> String {
-    let bytes = serde_json::to_vec(&(mapping_version, native_type, logical_type, catalog_digest))
-        .expect("PostgreSQL SourceTypeMapping evidence is serializable");
+    let bytes = serde_json::to_vec(&(
+        mapping_version,
+        native_type,
+        logical_type,
+        catalog_digest,
+        value_representation,
+    ))
+    .expect("PostgreSQL SourceTypeMapping evidence is serializable");
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1868,6 +1968,99 @@ mod tests {
                 collation: None,
             }
         );
+    }
+
+    #[test]
+    fn aliases_and_typmods_match_the_semantic_decoder() {
+        assert_eq!(
+            source_type_mapping("bool").unwrap().logical_type,
+            LogicalType::boolean()
+        );
+        assert_eq!(
+            source_type_mapping("float4").unwrap().logical_type,
+            LogicalType::float(32)
+        );
+        assert_eq!(
+            source_type_mapping("float8").unwrap().logical_type,
+            LogicalType::float(64)
+        );
+        assert_eq!(
+            source_type_mapping("character(8)").unwrap().logical_type,
+            LogicalType::Text {
+                charset: "UTF8".into(),
+                max_length: Some(8),
+                length_unit: LengthUnit::Characters,
+                collation: None,
+            }
+        );
+        assert_eq!(
+            source_type_mapping("bit varying(64)").unwrap().logical_type,
+            LogicalType::variable_bit_string(Some(64))
+        );
+    }
+
+    #[test]
+    fn variable_bit_string_accepts_shorter_values_but_enforces_its_declared_maximum() {
+        let mapping = source_type_mapping("bit varying(64)").unwrap();
+        let value = |bit_length| change_event::LogicalValue::BitString {
+            bytes_base64url: "AA".into(),
+            bit_length,
+            padding: change_event::BitPadding::Zero,
+            bit_order: change_event::BitOrder::MsbFirst,
+        };
+
+        assert!(mapping.logical_type.matches_value(&value(3)));
+        assert!(!mapping.logical_type.matches_value(&value(65)));
+        assert!(
+            !source_type_mapping("bit(64)")
+                .unwrap()
+                .logical_type
+                .matches_value(&value(3))
+        );
+    }
+
+    #[test]
+    fn inet_and_cidr_preserve_address_family_and_prefix_semantics() {
+        let network =
+            |family: &str, address: &str, prefix_length| change_event::LogicalValue::Network {
+                family: family.into(),
+                address: address.into(),
+                prefix_length,
+            };
+        let inet = source_type_mapping("inet").unwrap().logical_type;
+        let cidr = source_type_mapping("cidr").unwrap().logical_type;
+
+        assert!(inet.matches_value(&network("ipv4", "192.0.2.1", Some(24))));
+        assert!(inet.matches_value(&network("ipv6", "2001:db8::1", Some(64))));
+        assert!(inet.matches_value(&network("ipv4", "192.0.2.1", None)));
+        assert!(cidr.matches_value(&network("ipv4", "192.0.2.0", Some(24))));
+        assert!(cidr.matches_value(&network("ipv6", "2001:db8::", Some(64))));
+        assert!(!cidr.matches_value(&network("ipv4", "192.0.2.0", None)));
+        assert!(!inet.matches_value(&network("macaddr", "08:00:2b:01:02:03", None)));
+    }
+
+    #[test]
+    fn raw_column_mapping_uses_representation_capture_even_if_a_codec_exists() {
+        let catalog =
+            SourceTypeCatalog::new([SourceTypeDefinition::builtin(1562, "pg_catalog", "varbit")]);
+        let unbounded = source_type_mapping_with_catalog("varbit", &catalog).unwrap();
+        assert!(matches!(unbounded.logical_type, LogicalType::Raw { .. }));
+        assert!(captures_source_representation(
+            &catalog,
+            1562,
+            &unbounded.logical_type
+        ));
+
+        let bounded = source_type_mapping_with_catalog("varbit(64)", &catalog).unwrap();
+        assert_eq!(
+            bounded.logical_type,
+            LogicalType::variable_bit_string(Some(64))
+        );
+        assert!(!captures_source_representation(
+            &catalog,
+            1562,
+            &bounded.logical_type
+        ));
     }
 
     #[test]
@@ -1937,7 +2130,7 @@ mod tests {
         assert!(source_type_mapping("enum('a','a')").is_err());
         assert_eq!(
             source_type_mapping("bit varying(12)").unwrap().logical_type,
-            LogicalType::bit_string(12)
+            LogicalType::variable_bit_string(Some(12))
         );
         assert_eq!(
             source_type_mapping("geometry(point,4326)")
@@ -2040,6 +2233,79 @@ mod tests {
                 .logical_type,
             LogicalType::MultiRange { element } if *element == LogicalType::integer(true, 32)
         ));
+    }
+
+    #[test]
+    fn user_defined_base_types_without_semantic_codecs_use_bound_pgoutput_text_envelopes() {
+        let catalog = SourceTypeCatalog::new([
+            SourceTypeDefinition::builtin(90_001, "application", "invoice_code"),
+            SourceTypeDefinition::array(90_002, "application", "_invoice_code", 90_001),
+        ]);
+
+        for version in ["15", "16", "17"] {
+            let mapping = source_type_mapping_with_catalog_for_version(
+                version,
+                "application.invoice_code",
+                &catalog,
+            )
+            .unwrap_or_else(|error| panic!("PostgreSQL {version}: {error}"));
+            assert!(matches!(
+                mapping.logical_type,
+                LogicalType::Raw { ref codec_identity, ref native_type, .. }
+                    if codec_identity == "postgresql.pgoutput.text-envelope.v1"
+                        && native_type == "application.invoice_code"
+            ));
+            let representation = mapping
+                .source_representation_evidence
+                .expect("custom base mapping must bind a raw text envelope to its catalog type");
+            assert_eq!(representation.protocol, "pgoutput.v1");
+            assert_eq!(representation.format, SourceRepresentationFormat::Text);
+            assert_eq!(
+                representation.source_type_identity,
+                "postgresql.pg_type.v1:90001:application.invoice_code"
+            );
+            assert_eq!(
+                representation.type_metadata["type_definition_digest"],
+                format!("sha256:{}", catalog.types[0].definition_digest)
+            );
+
+            let array = source_type_mapping_with_catalog_for_version(
+                version,
+                "application.invoice_code[]",
+                &catalog,
+            )
+            .unwrap_or_else(|error| panic!("PostgreSQL {version} array: {error}"));
+            assert!(matches!(
+                array.logical_type,
+                LogicalType::Raw { ref codec_identity, ref native_type, .. }
+                    if codec_identity == "postgresql.pgoutput.text-envelope.v1"
+                        && native_type == "application._invoice_code"
+            ));
+            assert!(array.source_representation_evidence.is_some());
+        }
+    }
+
+    #[test]
+    fn catalog_retains_pseudotype_dependencies_but_refuses_them_as_stored_values() {
+        let pseudo = SourceTypeDefinition::pseudo(90_101, "pg_catalog", "anyelement", None);
+        let pseudo_array =
+            SourceTypeDefinition::array(90_102, "pg_catalog", "_anyelement", pseudo.oid);
+        let dependent_composite = SourceTypeDefinition::composite(
+            90_103,
+            "pg_catalog",
+            "catalog_record",
+            [SourceTypeField::new("payload", pseudo.oid, true)],
+        );
+        let catalog = SourceTypeCatalog::new([pseudo, pseudo_array, dependent_composite]);
+
+        assert!(source_type_mapping_with_catalog("pg_catalog.anyelement", &catalog).is_err());
+        assert!(source_type_mapping_with_catalog("pg_catalog._anyelement", &catalog).is_err());
+        let mapping = source_type_mapping_with_catalog("pg_catalog.catalog_record", &catalog)
+            .expect(
+                "catalog composite can be represented opaquely with a complete dependency closure",
+            );
+        assert!(matches!(mapping.logical_type, LogicalType::Raw { .. }));
+        assert!(mapping.source_representation_evidence.is_some());
     }
 
     #[test]

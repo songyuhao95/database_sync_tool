@@ -188,7 +188,7 @@ fn integer_range_plan_gates_confirmation_and_rejects_both_signs_of_overflow() {
     }
     validate_datum_against_plan(&plan, &Datum::Null).unwrap();
     validate_datum_against_plan(&plan, &Datum::Unchanged).unwrap();
-    assert!(validate_datum_against_plan(&plan, &Datum::Unavailable).is_err());
+    validate_datum_against_plan(&plan, &Datum::Unavailable).unwrap();
 }
 
 #[test]

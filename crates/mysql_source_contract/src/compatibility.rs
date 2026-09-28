@@ -44,19 +44,32 @@ pub fn capability_manifest(
                 code_prefix,
                 connector_version,
             );
-            // MySQL commonly reports an integer display width (for example
-            // `int(11) unsigned`). It does not change the numeric domain, so
-            // the Sink manifest qualifies that catalog spelling explicitly.
+            // MySQL 5.7 reports a type-specific default display width in
+            // INFORMATION_SCHEMA. It is formatting metadata, not part of the
+            // integer range, but the exact catalog spelling still needs a
+            // versioned capability entry for preflight to qualify it.
+            let display_width = match (bits, signed) {
+                (8, true) => 4,
+                (8, false) => 3,
+                (16, true) => 6,
+                (16, false) => 5,
+                (24, true) => 9,
+                (24, false) => 8,
+                (32, true) => 11,
+                (32, false) => 10,
+                (64, _) => 20,
+                _ => unreachable!("the manifest lists native MySQL integer widths"),
+            };
             add_exact(
                 &mut capabilities,
                 LogicalType::integer(signed, bits),
                 if signed {
-                    format!("{native}(11)")
+                    format!("{native}({display_width})")
                 } else {
-                    format!("{native}(11) unsigned")
+                    format!("{native}({display_width}) unsigned")
                 },
                 format!(
-                    "integer.{bits}.{}.display_width_11",
+                    "integer.{bits}.{}.display_width_{display_width}",
                     if signed { "signed" } else { "unsigned" }
                 ),
                 code_prefix,
@@ -113,7 +126,7 @@ pub fn capability_manifest(
     }
     add_range_checked_float(&mut capabilities, "float", code_prefix, connector_version);
 
-    for charset in ["utf8mb4", "utf8", "UTF8"] {
+    for charset in ["utf8mb4", "utf8", "UTF8", "latin1", "ascii"] {
         for max_length in text_lengths() {
             add_exact(
                 &mut capabilities,
@@ -134,7 +147,7 @@ pub fn capability_manifest(
     // VARCHAR, but its declared character bound is preserved so an exact
     // CHAR-to-CHAR binding remains distinguishable from an explicit
     // fixed-width-to-variable-width conversion.
-    for charset in ["utf8mb4", "utf8", "UTF8"] {
+    for charset in ["utf8mb4", "utf8", "UTF8", "latin1", "ascii"] {
         for max_length in 1..=255 {
             add_exact(
                 &mut capabilities,
@@ -157,7 +170,7 @@ pub fn capability_manifest(
         (16_777_215, "mediumtext"),
         (4_294_967_295, "longtext"),
     ] {
-        for charset in ["utf8mb4", "utf8"] {
+        for charset in ["utf8mb4", "utf8", "latin1", "ascii"] {
             add_exact(
                 &mut capabilities,
                 LogicalType::Text {
@@ -353,6 +366,15 @@ pub fn capability_manifest(
         code_prefix,
         connector_version,
     );
+    // MySQL 5.7 exposes the default YEAR display width in its catalog.
+    add_exact(
+        &mut capabilities,
+        LogicalType::year(),
+        "year(4)".into(),
+        "year.display_width_4".into(),
+        code_prefix,
+        connector_version,
+    );
     add_structured_json(
         &mut capabilities,
         "json".into(),
@@ -432,7 +454,7 @@ fn add_exact_bit_string(
         .insert("bit_length_unit".into(), "bits".into());
     target
         .parameters
-        .insert("target_bit_order".into(), "msb_first".into());
+        .insert("target_bit_order".into(), "lsb_first".into());
     target.parameters.insert(
         "target_padding".into(),
         if length.is_multiple_of(8) {
@@ -643,6 +665,7 @@ fn add_logical_value_json_carrier(
             PresenceState::Value,
             PresenceState::Null,
             PresenceState::Unchanged,
+            PresenceState::Unavailable,
         ],
     });
 }
@@ -672,6 +695,7 @@ fn add_source_representation_carrier(
         PresenceState::SourceRepresentation,
         PresenceState::Null,
         PresenceState::Unchanged,
+        PresenceState::Unavailable,
     ];
     let mut rule = explicit_rule(
         &code,

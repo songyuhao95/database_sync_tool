@@ -2,7 +2,7 @@ use super::{instance_input, store};
 use crate::{
     Error, Store,
     model::NewUser,
-    tasks::{TableMapping, TaskInput},
+    tasks::{FieldPreviewInput, TableMapping, TaskInput},
 };
 use mysql_driver::{Conn, OptsBuilder, prelude::Queryable};
 use sqlx::{
@@ -10,10 +10,375 @@ use sqlx::{
     postgres::{PgConnectOptions, PgSslMode},
 };
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[path = "../../../tests/support/type_qualification_evidence.rs"]
+mod type_qualification_evidence;
+
+#[test]
+#[ignore = "requires live MySQL 5.7 and PostgreSQL 15; isolated tables and local SQLite"]
+fn live_web_explicit_carrier_preview_create_start_and_readback() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let table = format!("web_carrier_{nonce}");
+    let carrier_fields = [
+        ("payload", "mysql.json"),
+        ("enum_value", "mysql.enum"),
+        ("set_value", "mysql.set"),
+        ("bit_value", "mysql.bit"),
+    ];
+    let mysql_host = std::env::var("CDC_MYSQL_HOST").unwrap();
+    let mysql_port = std::env::var("CDC_MYSQL57_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let mysql_reader_password = std::env::var("CDC_MYSQL_READER_PASSWORD").unwrap();
+    let mysql_writer_password = std::env::var("CDC_MYSQL_WRITER_PASSWORD").unwrap();
+    let pg_host = std::env::var("PG_CDC_HOST").unwrap();
+    let pg_port = std::env::var("PG_CDC_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let pg_password = std::env::var("PG_CDC_TEST_PASSWORD").unwrap();
+    let pg_admin = std::env::var("PG_CDC_ADMIN_USER").unwrap();
+    let pg_reader = std::env::var("PG_CDC_READER_USER").unwrap();
+    let pg_writer = std::env::var("PG_CDC_WRITER_USER").unwrap();
+    let mut source = Conn::new(
+        OptsBuilder::new()
+            .ip_or_hostname(Some(mysql_host.clone()))
+            .tcp_port(mysql_port)
+            .user(Some(std::env::var("CDC_MYSQL_WRITER_USER").unwrap()))
+            .pass(Some(mysql_writer_password.clone())),
+    )
+    .unwrap();
+    source
+        .query_drop("CREATE DATABASE IF NOT EXISTS CDC_test")
+        .unwrap();
+    source
+        .query_drop(format!(
+            "CREATE TABLE CDC_test.{table}(
+                id BIGINT PRIMARY KEY,
+                payload JSON NULL,
+                enum_value ENUM('alpha','beta') NULL,
+                set_value SET('a','b') NULL,
+                bit_value BIT(8) NULL
+             ) ENGINE=InnoDB"
+        ))
+        .unwrap();
+    let pg_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let options = PgConnectOptions::new()
+        .host(&pg_host)
+        .port(pg_port)
+        .database("CDC_test")
+        .username(&pg_admin)
+        .password(&pg_password)
+        .ssl_mode(PgSslMode::Prefer);
+    let mut target = pg_runtime
+        .block_on(PgConnection::connect_with(&options))
+        .unwrap();
+    pg_runtime
+        .block_on(async {
+            target
+                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "CREATE SCHEMA IF NOT EXISTS \"CDC_test\" AUTHORIZATION {pg_writer};
+                     GRANT USAGE ON SCHEMA \"CDC_test\" TO {pg_writer};
+                     CREATE SCHEMA IF NOT EXISTS cdc AUTHORIZATION {pg_writer};
+                     GRANT USAGE,CREATE ON SCHEMA cdc TO {pg_writer};
+                     CREATE TABLE \"CDC_test\".\"{table}\"(
+                         id bigint PRIMARY KEY,
+                         payload text,
+                         enum_value text,
+                         set_value text,
+                         bit_value text
+                     );
+                     GRANT SELECT,INSERT,UPDATE,DELETE ON \"CDC_test\".\"{table}\" TO {pg_writer}"
+                ))))
+                .await
+        })
+        .unwrap();
+    let (dir, store) = store();
+    let admin = store.login("admin", "admin", None).unwrap().session.user.id;
+    let mut source_input = instance_input();
+    source_input.name = format!("carrier-source-{nonce}");
+    source_input.host = mysql_host;
+    source_input.port = mysql_port;
+    source_input.version = "5.7".into();
+    source_input.reader_password = Some(mysql_reader_password);
+    source_input.writer_password = Some(mysql_writer_password);
+    let source_instance = store.save_instance(admin, None, source_input).unwrap();
+    let mut sink_input = instance_input();
+    sink_input.name = format!("carrier-target-{nonce}");
+    sink_input.host = pg_host;
+    sink_input.port = pg_port;
+    sink_input.kind = "postgresql".into();
+    sink_input.version = "15".into();
+    sink_input.database = "CDC_test".into();
+    sink_input.reader_username = pg_reader;
+    sink_input.reader_password = Some(pg_password.clone());
+    sink_input.writer_username = pg_writer;
+    sink_input.writer_password = Some(pg_password);
+    let sink_instance = store.save_instance(admin, None, sink_input).unwrap();
+    let draft_id = format!("carrier-{nonce}");
+    let preview_input =
+        |column: &str, parameters: BTreeMap<String, String>, confirmations| FieldPreviewInput {
+            draft_id: draft_id.clone(),
+            source_id: source_instance.id.clone(),
+            sink_id: sink_instance.id.clone(),
+            source_database: String::new(),
+            sink_database: "CDC_test".into(),
+            source_revision: 1,
+            sink_revision: 1,
+            schema: "CDC_test".into(),
+            table: table.clone(),
+            column: column.into(),
+            parameters,
+            confirmations,
+        };
+    let mut conversion_options = BTreeMap::new();
+    let mut confirmations = Vec::new();
+    let mut confirmed_plans = Vec::new();
+    for (column, type_id) in carrier_fields {
+        eprintln!("WEB_CARRIER_PHASE preview {type_id}");
+        let discovery = store
+            .preview_field(admin, preview_input(column, BTreeMap::new(), vec![]))
+            .unwrap();
+        let candidate = discovery
+            .available_candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("logical_value_json")
+            })
+            .unwrap_or_else(|| panic!("Web must offer the {type_id} value carrier"));
+        let parameters = BTreeMap::from([
+            ("__rule_id".into(), candidate.rule.id.clone()),
+            ("__rule_version".into(), candidate.rule.version.clone()),
+        ]);
+        let unconfirmed = store
+            .preview_field(admin, preview_input(column, parameters.clone(), vec![]))
+            .unwrap();
+        let pending = unconfirmed.result.unwrap();
+        assert_eq!(
+            pending.status,
+            change_event::CompatibilityStatus::NeedsConfirmation,
+            "{type_id} must require explicit risk acknowledgement"
+        );
+        let pending_plan = pending.plan.unwrap();
+        let confirmation = change_event::RiskConfirmation {
+            source_field_lineage: pending_plan.source_field.lineage_id.clone(),
+            target_field_lineage: pending_plan.target_field.lineage_id.clone(),
+            rule: pending_plan.rule.clone(),
+            plan_digest: pending_plan.plan_digest.clone(),
+            actor: "admin".into(),
+            confirmed_at: "2026-09-28T00:00:00Z".into(),
+            reason: Some("value carrier does not preserve the native target type".into()),
+        };
+        let confirmed = store
+            .preview_field(
+                admin,
+                preview_input(column, parameters.clone(), vec![confirmation.clone()]),
+            )
+            .unwrap();
+        let confirmed_result = confirmed.result.unwrap();
+        assert_eq!(
+            confirmed_result.status,
+            change_event::CompatibilityStatus::Compatible,
+            "{type_id} must become usable after confirmation"
+        );
+        conversion_options.insert(column.to_owned(), parameters);
+        confirmations.push(confirmation);
+        confirmed_plans.push((type_id, confirmed_result.plan.unwrap()));
+    }
+    let task_input = |confirmations| TaskInput {
+        draft_id: Some(draft_id.clone()),
+        name: format!("live Web carrier {nonce}"),
+        source_id: source_instance.id.clone(),
+        sink_id: sink_instance.id.clone(),
+        source_database: String::new(),
+        sink_database: "CDC_test".into(),
+        source_revision: 1,
+        sink_revision: 1,
+        start_mode: "auto".into(),
+        mappings: vec![TableMapping {
+            source_schema: "CDC_test".into(),
+            source_table: table.clone(),
+            sink_schema: "CDC_test".into(),
+            sink_table: table.clone(),
+            columns: std::iter::once("id".to_owned())
+                .chain(
+                    carrier_fields
+                        .iter()
+                        .map(|(column, _)| (*column).to_owned()),
+                )
+                .collect(),
+            conversion_options: conversion_options.clone(),
+        }],
+        confirmations,
+    };
+    assert!(store.create_task(admin, task_input(vec![])).is_err());
+    let task = store.create_task(admin, task_input(confirmations)).unwrap();
+    eprintln!("WEB_CARRIER_PHASE created");
+    assert_eq!(task.plan_status, "valid");
+    for (type_id, confirmed_plan) in &confirmed_plans {
+        assert!(
+            task.plans
+                .iter()
+                .any(|plan| plan.plan_digest == confirmed_plan.plan_digest),
+            "{type_id} plan must be persisted"
+        );
+        assert!(task.risk_confirmations.iter().any(|confirmation| {
+            confirmation.plan_digest == confirmed_plan.plan_digest && confirmation.actor == "admin"
+        }));
+    }
+    let start = store.start_task(admin, task.id.clone());
+    assert!(
+        start.is_ok(),
+        "start gate: {:?}; plan reason: {:?}",
+        start.as_ref().err(),
+        store.task(&task.id).unwrap().plan_invalid_reason
+    );
+    eprintln!("WEB_CARRIER_PHASE started");
+    wait_for(&store, &task.id, |task| task.status == "running");
+    source
+        .query_drop(format!(
+            "INSERT INTO CDC_test.{table}(id,payload,enum_value,set_value,bit_value)
+             VALUES(1,'{{\"message\":\"carrier\"}}','alpha','a,b',b'10100101')"
+        ))
+        .unwrap();
+    wait_for(&store, &task.id, |task| task.runtime.applied_rows >= 1);
+    let payload: String = pg_runtime
+        .block_on(
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT payload FROM \"CDC_test\".\"{table}\" WHERE id=1"
+            )))
+            .fetch_one(&mut target),
+        )
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<change_event::LogicalValue>(&payload).unwrap(),
+        change_event::LogicalValue::Json { .. }
+    ));
+    for column in ["enum_value", "set_value", "bit_value"] {
+        let stored: String = pg_runtime
+            .block_on(
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT {column} FROM \"CDC_test\".\"{table}\" WHERE id=1"
+                )))
+                .fetch_one(&mut target),
+            )
+            .unwrap();
+        let value: change_event::LogicalValue = serde_json::from_str(&stored).unwrap();
+        match (column, value) {
+            ("enum_value", change_event::LogicalValue::Enum { label }) => {
+                assert_eq!(label, "alpha");
+            }
+            ("set_value", change_event::LogicalValue::Set { members }) => {
+                assert_eq!(members, ["a", "b"]);
+            }
+            ("bit_value", change_event::LogicalValue::BitString { bit_length: 8, .. }) => {}
+            (_, other) => panic!("{column} read back as the wrong value variant: {other:?}"),
+        }
+    }
+    source
+        .query_drop(format!(
+            "UPDATE CDC_test.{table}
+             SET payload='{{\"message\":\"carrier-updated\"}}',
+                 enum_value='beta',set_value='b',bit_value=b'00000001'
+             WHERE id=1"
+        ))
+        .unwrap();
+    wait_for(&store, &task.id, |task| task.runtime.applied_rows >= 2);
+    let updated: String = pg_runtime
+        .block_on(
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT payload FROM \"CDC_test\".\"{table}\" WHERE id=1"
+            )))
+            .fetch_one(&mut target),
+        )
+        .unwrap();
+    assert!(updated.contains("carrier-updated"));
+    store.stop_task(admin, &task.id).unwrap();
+    store.shutdown_tasks();
+    assert_eq!(store.task(&task.id).unwrap().status, "stopped");
+    source
+        .query_drop(format!(
+            "INSERT INTO CDC_test.{table}(id,payload,enum_value,set_value,bit_value)
+             VALUES(2,'{{\"message\":\"after-restart\"}}','beta','b',b'00000001')"
+        ))
+        .unwrap();
+    drop(store);
+    let reopened = Arc::new(Store::open(dir.path().join("web.sqlite"), [7; 32]).unwrap());
+    reopened.start_task(admin, task.id.clone()).unwrap();
+    wait_for(&reopened, &task.id, |task| task.runtime.applied_rows >= 3);
+    let resumed: String = pg_runtime
+        .block_on(
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT payload FROM \"CDC_test\".\"{table}\" WHERE id=2"
+            )))
+            .fetch_one(&mut target),
+        )
+        .unwrap();
+    assert!(resumed.contains("after-restart"));
+    source
+        .query_drop(format!("DELETE FROM CDC_test.{table} WHERE id=1"))
+        .unwrap();
+    wait_for(&reopened, &task.id, |task| task.runtime.applied_rows >= 4);
+    let deleted: Option<String> = pg_runtime
+        .block_on(
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT payload FROM \"CDC_test\".\"{table}\" WHERE id=1"
+            )))
+            .fetch_optional(&mut target),
+        )
+        .unwrap();
+    assert!(deleted.is_none());
+    assert!(
+        reopened
+            .task(&task.id)
+            .unwrap()
+            .runtime
+            .checkpoint
+            .is_some()
+    );
+    reopened.stop_task(admin, &task.id).unwrap();
+    reopened.shutdown_tasks();
+    source
+        .query_drop(format!("DROP TABLE CDC_test.{table}"))
+        .unwrap();
+    pg_runtime
+        .block_on(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP TABLE \"CDC_test\".\"{table}\""
+            )))
+            .execute(&mut target),
+        )
+        .unwrap();
+    for (type_id, plan) in &confirmed_plans {
+        type_qualification_evidence::record_web_plan_evidence(
+            "mysql_5_7",
+            "postgresql_15",
+            "web_ui.mysql57_multitype_to_pg15_text_carrier_live",
+            type_id,
+            plan,
+            "logical_value_json_carrier",
+            true,
+        )
+        .unwrap();
+    }
+}
 
 #[test]
 fn runtime_permissions_conflicts_and_restart_state() {
@@ -109,10 +474,13 @@ fn wait_for(store: &Store, id: &str, predicate: impl Fn(&crate::tasks::Replicati
         }
         assert!(
             Instant::now() < limit,
-            "timed out: state={} rows={} error={:?}",
+            "timed out: state={} rows={} error={:?}; logs={:?}",
             task.status,
             task.runtime.applied_rows,
-            task.runtime.last_error
+            task.runtime.last_error,
+            store
+                .task_logs(id, 0)
+                .map(|logs| logs.into_iter().map(|log| log.message).collect::<Vec<_>>())
         );
         thread::sleep(Duration::from_millis(50));
     }

@@ -222,6 +222,10 @@ fn decode_catalog_value(
         .find(|definition| definition.oid == oid)
         .ok_or_else(|| invalid(format!("PostgreSQL type catalog is missing OID {oid}")))?;
     match &definition.kind {
+        SourceTypeDefinitionKind::Pseudo => Err(invalid(format!(
+            "PostgreSQL pseudo-type {}.{} cannot appear as a stored row value",
+            definition.schema, definition.name
+        ))),
         SourceTypeDefinitionKind::Builtin { .. } => {
             decode_column_for_version(version, oid, native_type, bytes)
         }

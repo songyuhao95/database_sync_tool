@@ -109,7 +109,7 @@ The Logical Value union does not coerce database values to generic strings or JS
 - text carries source bytes, charset identity, and encoding-validity state, while binary carries bytes directly;
 - date, time of day, duration, local datetime, instant, zoned timestamp, interval, and year have separate structured representations;
 - JSON uses a typed tree whose number union distinguishes signed integer, unsigned integer, decimal, and exact double bits; arrays remain ordered and object entries are canonically ordered by key bytes;
-- enum carries label and native ordinal, set carries labels and native bitmap, and bit strings carry bit length and bytes;
+- enum carries label and native ordinal, set carries labels and native bitmap, and bit strings carry actual bit length and bytes. The Logical Type distinguishes fixed `bit(n)`, whose value length must equal `n`, from variable `varbit(n)`, whose value length may be shorter but cannot exceed `n`;
 - spatial values carry standard WKB or EWKB plus SRID;
 - opaque values carry source type identity, format version, and bytes and require an explicit Sink mapping.
 

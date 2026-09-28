@@ -1,10 +1,1156 @@
 //! Live protocol + decoder tests. Nonblocking bounded replay, no snapshot/global locks.
 #[path = "support/mysql_contract.rs"]
 mod contract;
+#[path = "support/postgres_env.rs"]
+mod postgres_env;
+#[path = "support/type_qualification_evidence.rs"]
+mod type_qualification_evidence;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use change_event::{Datum, LogicalValue, Operation, validate};
+use change_event::{
+    ConnectorIdentity, Datum, DefinitionReference, FieldCompatibilityInput, FieldDefinition,
+    LogicalValue, Operation, PresenceState, RiskConfirmation, RouteOptions, ServerBuildIdentity,
+    SourceTypeMapping, validate,
+};
 use contract::*;
 use mysql::prelude::Queryable;
+use sqlx::{Connection, Row};
+
+fn mysql_type_token(native_type: &str) -> String {
+    let normalized = native_type.trim().to_ascii_lowercase();
+    let token = normalized
+        .split(['(', ' ', '\t'])
+        .next()
+        .unwrap_or_default();
+    match token {
+        "integer" => "int".into(),
+        "dec" | "fixed" | "numeric" => "decimal".into(),
+        other => other.into(),
+    }
+}
+
+fn assert_mysql_inventory_types_are_live_captured(
+    connector_id: &str,
+    image: &[change_event::ColumnDatum],
+) -> Vec<String> {
+    let inventory: serde_json::Value =
+        serde_json::from_str(include_str!("../scripts/type-inventory.json"))
+            .expect("native type inventory is valid JSON");
+    let mut captured = std::collections::BTreeSet::new();
+    for column in image {
+        captured.insert(mysql_type_token(&column.native_type));
+        if let Datum::Value(LogicalValue::Spatial { geometry_type, .. }) = &column.datum {
+            captured.insert(mysql_type_token(geometry_type));
+        }
+    }
+
+    let mut missing = Vec::new();
+    let mut matched = Vec::new();
+    for type_entry in inventory["types"].as_array().expect("type list") {
+        let profile_id = type_entry["declaration_profile"]
+            .as_str()
+            .expect("native declaration profile");
+        let profile = &inventory["native_declaration_profiles"][profile_id];
+        let connectors = profile["connectors"].as_array().expect("connectors");
+        if !connectors.iter().any(|connector| connector == connector_id) {
+            continue;
+        }
+        let examples = profile["examples"].as_array().expect("native examples");
+        let represented = examples.iter().any(|example| {
+            example
+                .as_str()
+                .is_some_and(|declaration| captured.contains(&mysql_type_token(declaration)))
+        });
+        if !represented {
+            missing.push(type_entry["id"].as_str().unwrap_or(profile_id).to_owned());
+        } else {
+            matched.push(type_entry["id"].as_str().unwrap().to_owned());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{connector_id} BinlogStream fixture did not capture inventory native types: {}",
+        missing.join(", ")
+    );
+    matched
+}
+
+fn assert_mysql_snapshot_equals_event(
+    expected: &[change_event::ColumnDatum],
+    actual: &[change_event::ColumnDatum],
+    route: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "{route} column count");
+    for (expected, actual) in expected.iter().zip(actual) {
+        assert_eq!(actual.name, expected.name, "{route} column order");
+        assert_eq!(
+            actual.datum, expected.datum,
+            "{route} value for {}",
+            expected.name
+        );
+    }
+}
+
+#[derive(Clone)]
+struct MysqlCatalogColumn {
+    name: String,
+    native_type: String,
+    charset: Option<String>,
+    collation: Option<String>,
+    nullable: bool,
+    generated: bool,
+    ordinal: usize,
+}
+
+type MysqlCatalogRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    u64,
+);
+
+fn mysql_catalog_columns(port: u16, table: &str) -> Vec<MysqlCatalogColumn> {
+    let mut conn = connection(port, false);
+    let rows: Vec<MysqlCatalogRow> = conn
+        .exec(
+            "SELECT COLUMN_NAME, COLUMN_TYPE, CHARACTER_SET_NAME, COLLATION_NAME, IS_NULLABLE, EXTRA, ORDINAL_POSITION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='CDC_test' AND TABLE_NAME=? ORDER BY ORDINAL_POSITION",
+            (table,),
+        )
+        .expect("read all-types catalog metadata");
+    rows.into_iter()
+        .map(
+            |(name, native_type, charset, collation, nullable, extra, ordinal)| {
+                MysqlCatalogColumn {
+                    name,
+                    native_type,
+                    charset,
+                    collation,
+                    nullable: nullable.eq_ignore_ascii_case("YES"),
+                    generated: extra.to_ascii_lowercase().contains("generated"),
+                    ordinal: usize::try_from(ordinal - 1).expect("column ordinal fits usize"),
+                }
+            },
+        )
+        .collect()
+}
+
+fn mysql_build(port: u16) -> ServerBuildIdentity {
+    let mut conn = connection(port, false);
+    let (version, distribution): (String, String) = conn
+        .query_first("SELECT VERSION(), @@version_comment")
+        .expect("read MySQL build")
+        .expect("MySQL returned its build identity");
+    ServerBuildIdentity::new(
+        "mysql",
+        if distribution.trim().is_empty() {
+            "oracle"
+        } else {
+            distribution.trim()
+        },
+        version.clone(),
+        format!("mysql-{version}"),
+    )
+}
+
+fn mysql_source_mapping(
+    connector: &str,
+    native_type: &str,
+    charset: Option<&str>,
+    collation: Option<&str>,
+) -> SourceTypeMapping {
+    let result = match connector {
+        "mysql_5_7" | "5.7" => ::mysql_5_7::source_type_mapping(native_type, charset, collation)
+            .map_err(|error| error.to_string()),
+        "mysql_8_0" | "8.0" => ::mysql_8_0::source_type_mapping(native_type, charset, collation),
+        "mysql_8_4" | "8.4" => ::mysql_8_4::source_type_mapping(native_type, charset, collation),
+        other => panic!("unknown MySQL source connector {other}"),
+    };
+    result.unwrap_or_else(|error| panic!("map native type {native_type}: {error}"))
+}
+
+fn qualify_mysql_visible_catalog_types(connector: &str, port: u16) {
+    let mut conn = connection(port, true);
+    let rows: Vec<(String, Option<String>, Option<String>)> = conn
+        .query(
+            "SELECT DISTINCT COLUMN_TYPE, CHARACTER_SET_NAME, COLLATION_NAME
+               FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')
+              ORDER BY COLUMN_TYPE, CHARACTER_SET_NAME, COLLATION_NAME",
+        )
+        .expect("enumerate reader-visible MySQL user column declarations");
+    assert!(
+        !rows.is_empty(),
+        "{connector} exposed no user column declarations for live type qualification"
+    );
+
+    let mut mapped_profiles = std::collections::BTreeSet::new();
+    for (native_type, charset, collation) in rows {
+        let mapping = mysql_source_mapping(
+            connector,
+            &native_type,
+            charset.as_deref(),
+            collation.as_deref(),
+        );
+        mapped_profiles.insert((
+            native_type,
+            charset.unwrap_or_default(),
+            collation.unwrap_or_default(),
+            mapping.mapping_id,
+            mapping.evidence_digest.unwrap_or_default(),
+        ));
+    }
+    let catalog_digest = change_event::stable_digest(&mapped_profiles);
+    type_qualification_evidence::record_catalog_type_mapping_evidence(
+        connector,
+        "mysql.plugin_or_engine_types",
+        &format!("{connector}.visible_user_column_type_mappings"),
+        mapped_profiles.len(),
+        0,
+        "all reader-visible information_schema.COLUMNS outside MySQL system schemas",
+        &catalog_digest,
+    )
+    .expect("write MySQL visible catalog type mapping evidence");
+}
+
+fn mysql_catalog_fingerprint(column: &MysqlCatalogColumn) -> String {
+    change_event::stable_digest(&(
+        &column.name,
+        &column.native_type,
+        &column.charset,
+        &column.collation,
+        column.nullable,
+        column.generated,
+        column.ordinal,
+    ))
+}
+
+fn mysql_field(
+    column: &MysqlCatalogColumn,
+    mapping: &SourceTypeMapping,
+    lineage: String,
+    fingerprint: String,
+) -> FieldDefinition {
+    let key_ordinal = column.name.eq_ignore_ascii_case("id").then_some(0);
+    FieldDefinition {
+        reference: DefinitionReference::new(lineage, fingerprint),
+        ordinal: column.ordinal,
+        name: column.name.clone(),
+        native_type: column.native_type.clone(),
+        logical_type: mapping.logical_type.clone(),
+        nullable: column.nullable,
+        collation: column.collation.clone(),
+        generated: column.generated,
+        primary_key_ordinal: key_ordinal,
+        unique: key_ordinal.is_some(),
+        row_locator: key_ordinal.is_some(),
+    }
+}
+
+fn plan_mysql_native_route(
+    source_connector: &str,
+    source_port: u16,
+    source_table: &str,
+    target_port: u16,
+    target_table: &str,
+    target_build: ServerBuildIdentity,
+    target_manifest: change_event::TargetCapabilityManifest,
+) -> Vec<change_event::ColumnConversionPlan> {
+    let source_build = mysql_build(source_port);
+    let source_columns = mysql_catalog_columns(source_port, source_table);
+    let target_columns = mysql_catalog_columns(target_port, target_table);
+    assert_eq!(source_columns.len(), target_columns.len());
+
+    source_columns
+        .iter()
+        .zip(&target_columns)
+        .map(|(source, target)| {
+            assert_eq!(source.name, target.name);
+            assert_eq!(source.ordinal, target.ordinal);
+            let source_mapping = mysql_source_mapping(
+                source_connector,
+                &source.native_type,
+                source.charset.as_deref(),
+                source.collation.as_deref(),
+            );
+            let target_mapping = mysql_source_mapping(
+                &target_manifest.connector.version,
+                &target.native_type,
+                target.charset.as_deref(),
+                target.collation.as_deref(),
+            );
+            let source_lineage = format!("catalog:CDC_test.{target_table}.{}", source.name);
+            let target_lineage = format!("target:CDC_test.{target_table}.{}", target.name);
+            let source_field = mysql_field(
+                source,
+                &source_mapping,
+                source_lineage,
+                mysql_catalog_fingerprint(source),
+            );
+            let target_field = mysql_field(
+                target,
+                &target_mapping,
+                target_lineage,
+                mysql_catalog_fingerprint(target),
+            );
+            let mut options = RouteOptions {
+                route_id: format!(
+                    "{source_connector}-to-{}-all-types",
+                    target_manifest.connector.version
+                ),
+                configuration_revision: "live-qualification:r1".into(),
+                ..RouteOptions::default()
+            };
+            let plan_field = |options: RouteOptions| {
+                change_event::plan_field_compatibility(FieldCompatibilityInput {
+                    source_field: source_field.clone(),
+                    target_field: target_field.clone(),
+                    source_type_mapping: source_mapping.clone(),
+                    source_connector: ConnectorIdentity::new(
+                        "mysql",
+                        source_manifest_version(source_connector),
+                    ),
+                    sink_connector: target_manifest.connector.clone(),
+                    source_build: Some(source_build.clone()),
+                    target_build: Some(target_build.clone()),
+                    manifest: &target_manifest,
+                    operations: vec![Operation::Insert, Operation::Update, Operation::Delete],
+                    presences: vec![
+                        PresenceState::Value,
+                        PresenceState::Null,
+                        PresenceState::Unchanged,
+                    ],
+                    source_has_primary_key: true,
+                    options,
+                })
+            };
+            let mut result = plan_field(options.clone()).unwrap_or_else(|error| {
+                panic!(
+                    "{source_connector} -> mysql {} {} compatibility planning failed: {error}",
+                    target_manifest.connector.version, source.name
+                )
+            });
+            if result.status == change_event::CompatibilityStatus::NeedsConfirmation {
+                let pending = result.plan.as_ref().expect("confirmation plan");
+                options.confirmations.push(RiskConfirmation {
+                    source_field_lineage: pending.source_field.lineage_id.clone(),
+                    target_field_lineage: pending.target_field.lineage_id.clone(),
+                    rule: pending.rule.clone(),
+                    plan_digest: pending.plan_digest.clone(),
+                    actor: "qualification-test".into(),
+                    confirmed_at: "2026-09-27T00:00:00Z".into(),
+                    reason: Some("explicitly qualify the declared native-type route".into()),
+                });
+                result = plan_field(options).unwrap_or_else(|error| {
+                    panic!("replan {} after test confirmation: {error}", source.name)
+                });
+            }
+            assert_eq!(
+                result.status,
+                change_event::CompatibilityStatus::Compatible,
+                "{}: {} -> {} ({}); source semantic={:?}, target semantic={:?}, nullable={}/{}, generated={}/{}, collation={:?}/{:?}, source representation={:?}",
+                source.name,
+                source.native_type,
+                target.native_type,
+                result.explanation,
+                source_field.logical_type,
+                target_field.logical_type,
+                source_field.nullable,
+                target_field.nullable,
+                source_field.generated,
+                target_field.generated,
+                source_field.collation,
+                target_field.collation,
+                source_mapping.value_representation,
+            );
+            result.plan.expect("qualified native-type plan")
+        })
+        .collect()
+}
+
+fn source_manifest_version(connector: &str) -> &'static str {
+    match connector {
+        "mysql_5_7" => "5.7",
+        "mysql_8_0" => "8.0",
+        "mysql_8_4" => "8.4",
+        other => panic!("unknown MySQL source connector {other}"),
+    }
+}
+
+#[test]
+fn mysql_cross_version_timestamp_declarations_have_exact_sink_plans() {
+    let source_mapping = ::mysql_5_7::source_type_mapping("timestamp(6)", None, None).unwrap();
+    let field = |mapping: &SourceTypeMapping, lineage: &str, nullable: bool| FieldDefinition {
+        reference: DefinitionReference::new(lineage, "timestamp-fingerprint"),
+        ordinal: 0,
+        name: "timestamp_value".into(),
+        native_type: "timestamp(6)".into(),
+        logical_type: mapping.logical_type.clone(),
+        nullable,
+        collation: None,
+        generated: false,
+        primary_key_ordinal: None,
+        unique: false,
+        row_locator: false,
+    };
+    for target_version in ["5.7", "8.0", "8.4"] {
+        let target_mapping = mysql_source_mapping(target_version, "timestamp(6)", None, None);
+        assert_eq!(source_mapping.logical_type, target_mapping.logical_type);
+        let target_build = ServerBuildIdentity::new(
+            "mysql",
+            "oracle",
+            format!("{target_version}.test"),
+            format!("mysql-{target_version}-test"),
+        );
+        let manifest = match target_version {
+            "5.7" => ::mysql_5_7::compatibility_manifest(target_build.clone()),
+            "8.0" => ::mysql_8_0::compatibility_manifest(target_build.clone()),
+            "8.4" => ::mysql_8_4::compatibility_manifest(target_build.clone()),
+            _ => unreachable!(),
+        };
+        let result = change_event::plan_field_compatibility(FieldCompatibilityInput {
+            source_field: field(&source_mapping, "catalog:CDC_test.t.timestamp_value", false),
+            target_field: field(&target_mapping, "target:CDC_test.t.timestamp_value", true),
+            source_type_mapping: source_mapping.clone(),
+            source_connector: ConnectorIdentity::new("mysql", "5.7"),
+            sink_connector: manifest.connector.clone(),
+            source_build: None,
+            target_build: Some(target_build),
+            manifest: &manifest,
+            operations: vec![Operation::Insert, Operation::Update, Operation::Delete],
+            presences: vec![
+                PresenceState::Value,
+                PresenceState::Null,
+                PresenceState::Unchanged,
+            ],
+            source_has_primary_key: true,
+            options: RouteOptions {
+                route_id: format!("mysql-timestamp-to-{target_version}"),
+                configuration_revision: "test:r1".into(),
+                ..RouteOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            result.status,
+            change_event::CompatibilityStatus::Compatible,
+            "target {target_version}: {result:?}"
+        );
+    }
+}
+
+fn apply_all_mysql_type_transactions_to_sinks(
+    source_connector: &str,
+    source_port: u16,
+    source_table_name: &str,
+    transactions: &[change_event::ValidatedTransaction],
+    source_type_ids: &[String],
+) {
+    apply_all_mysql_type_transactions_to_postgresql_sinks(
+        source_connector,
+        source_port,
+        source_table_name,
+        transactions,
+        source_type_ids,
+    );
+    if std::env::var_os("CDC_TEST_POSTGRES_SINKS_ONLY").is_some() {
+        return;
+    }
+
+    macro_rules! apply_to_sink {
+        ($sink:ident, $port_key:literal, $port_default:literal, $sink_tag:literal, $sink_id:literal) => {{
+            let target_port = port($port_key, $port_default);
+            let target_table_name = format!("{source_table_name}_sink_{}", $sink_tag);
+            let mut target_table = AllMysqlTypesTable::create_sink_named(
+                connection(target_port, false),
+                target_table_name.clone(),
+            );
+            let host = setting("CDC_MYSQL_HOST", "192.168.0.10");
+            let mut target_config = ::$sink::TargetConfig::new(
+                host.clone(),
+                setting("CDC_MYSQL_WRITER_USER", "mysql_writer"),
+                password("WRITER"),
+            );
+            target_config.port = target_port;
+            let target_build = mysql_build(target_port);
+            let target_manifest = ::$sink::compatibility_manifest(target_build.clone());
+            let plans = plan_mysql_native_route(
+                source_connector,
+                source_port,
+                source_table_name,
+                target_port,
+                &target_table_name,
+                target_build,
+                target_manifest,
+            );
+
+            for captured in transactions {
+                let mut transaction = captured.transaction().clone();
+                for change in &mut transaction.changes {
+                    change.table.clone_from(&target_table_name);
+                }
+                let transaction = validate(transaction).unwrap_or_else(|error| {
+                    panic!("{source_connector} -> {} ChangeEvent validation: {error}", $sink_tag)
+                });
+                let plan = ::$sink::sql_with_plans(&transaction, &plans).unwrap_or_else(|error| {
+                    panic!("{source_connector} -> {} SQL plan: {error}", $sink_tag)
+                });
+                ::$sink::execute(&target_config, &plan).unwrap_or_else(|error| {
+                    panic!("{source_connector} -> {} target apply: {error}", $sink_tag)
+                });
+
+                let change = &transaction.transaction().changes[0];
+                match change.operation {
+                    Operation::Insert | Operation::Update => {
+                        let expected = change.after.as_ref().expect("after row image");
+                        let snapshot_config = ::$sink::BinlogConfig::new(
+                            host.clone(),
+                            target_port,
+                            setting("CDC_MYSQL_READER_USER", "mysql_reader"),
+                            password("READER"),
+                        );
+                        let mut snapshot = ::$sink::snapshot(
+                            snapshot_config,
+                            vec![change_event::SnapshotTable {
+                                schema: "CDC_test".into(),
+                                table: target_table_name.clone(),
+                                columns: Vec::new(),
+                            }],
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{source_connector} -> {} target snapshot: {error}", $sink_tag)
+                        });
+                        let batch = snapshot
+                            .next()
+                            .expect("snapshot batch")
+                            .unwrap_or_else(|error| {
+                                panic!("{source_connector} -> {} snapshot read: {error}", $sink_tag)
+                            });
+                        assert_eq!(batch.rows.len(), 1, "target row after {:?}", change.operation);
+                        assert_mysql_snapshot_equals_event(
+                            expected,
+                            &batch.rows[0],
+                            &format!("{source_connector} -> {} {:?}", $sink_tag, change.operation),
+                        );
+                        drop(snapshot);
+                    }
+                    Operation::Delete => {
+                        let count: Option<u64> = target_table
+                            .conn
+                            .query_first(format!(
+                                "SELECT COUNT(*) FROM CDC_test.{target_table_name}"
+                            ))
+                            .unwrap_or_else(|error| {
+                                panic!("{source_connector} -> {} delete verification: {error}", $sink_tag)
+                            });
+                        assert_eq!(count, Some(0), "target should be empty after DELETE");
+                    }
+                }
+            }
+            println!(
+                "PASS {source_connector} -> mysql_{}: ChangeEvent INSERT/UPDATE/DELETE preserved all 61 native values",
+                $sink_tag
+            );
+            type_qualification_evidence::record_sink_type_evidence(
+                source_connector,
+                $sink_id,
+                &format!("{source_connector}.all_types_to_{}", $sink_tag),
+                source_type_ids.iter().cloned(),
+                "VALUE_PRESERVED",
+                "native_target_column",
+            )
+            .expect("write per-native-type MySQL sink evidence");
+            target_table.cleanup();
+        }};
+    }
+
+    apply_to_sink!(mysql_5_7, "CDC_MYSQL57_PORT", 33061, "5_7", "mysql_5_7");
+    apply_to_sink!(mysql_8_0, "CDC_MYSQL80_PORT", 33062, "8_0", "mysql_8_0");
+    apply_to_sink!(mysql_8_4, "CDC_MYSQL84_PORT", 33063, "8_4", "mysql_8_4");
+}
+
+fn apply_all_mysql_type_transactions_to_postgresql_sinks(
+    source_connector: &str,
+    source_port: u16,
+    source_table_name: &str,
+    transactions: &[change_event::ValidatedTransaction],
+    source_type_ids: &[String],
+) {
+    for target_version in ["15", "16", "17"] {
+        let source_columns = mysql_catalog_columns(source_port, source_table_name);
+        let representation_declarations = source_columns
+            .iter()
+            .filter(|column| {
+                matches!(
+                    mysql_source_mapping(
+                        source_connector,
+                        &column.native_type,
+                        column.charset.as_deref(),
+                        column.collation.as_deref()
+                    )
+                    .logical_type,
+                    change_event::LogicalType::Raw { .. }
+                )
+            })
+            .map(|column| column.native_type.clone())
+            .collect::<Vec<_>>();
+        let representation_type_ids = type_qualification_evidence::source_native_type_ids(
+            source_connector,
+            representation_declarations,
+        );
+        let representation_set = representation_type_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let semantic_type_ids = source_type_ids
+            .iter()
+            .filter(|type_id| !representation_set.contains(*type_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let source_build = mysql_build(source_port);
+        let source_identity =
+            ConnectorIdentity::new("mysql", source_manifest_version(source_connector));
+        let admin_user = postgres_env::setting(target_version, "ADMIN_USER", "postgres");
+        let writer_user = postgres_env::setting(target_version, "WRITER_USER", "postgresql_writer");
+        let test_password = std::env::var(postgres_env::env_name(target_version, "TEST_PASSWORD"))
+            .expect("set the PostgreSQL live qualification test password");
+        let host = postgres_env::setting(target_version, "HOST", "192.168.0.10");
+        let target_port: u16 = postgres_env::setting(
+            target_version,
+            "PORT",
+            match target_version {
+                "15" => "54321",
+                "16" => "54322",
+                "17" => "54323",
+                _ => unreachable!(),
+            },
+        )
+        .parse()
+        .expect("valid PostgreSQL port");
+        let target_table_name = format!(
+            "cdc_mysql_{}_{}_{}",
+            target_version,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        );
+        let config =
+            postgresql_15::TargetConfig::new(host, "CDC_test", writer_user, test_password.clone())
+                .with_port(target_port);
+
+        let runtime =
+            tokio::runtime::Runtime::new().expect("create PostgreSQL qualification runtime");
+        runtime.block_on(async {
+            let mut admin = sqlx::PgConnection::connect_with(&postgres_env::options(
+                target_version,
+                &admin_user,
+                &test_password,
+            ))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("connect to PostgreSQL {target_version} test instance: {error}")
+            });
+            let server_version: String = sqlx::query_scalar("SHOW server_version")
+                .fetch_one(&mut admin)
+                .await
+                .expect("read PostgreSQL target version");
+            assert_eq!(
+                server_version.split('.').next(),
+                Some(target_version),
+                "test endpoint must be PostgreSQL {target_version}"
+            );
+            let version_text: String = sqlx::query_scalar("SELECT version()")
+                .fetch_one(&mut admin)
+                .await
+                .expect("read PostgreSQL target build identity");
+            let target_build = ServerBuildIdentity::new(
+                "postgresql",
+                "community",
+                server_version.clone(),
+                version_text,
+            );
+            let full_target_manifest = postgresql_15::compatibility_manifest_for_version(
+                target_build.clone(),
+                target_version,
+            );
+            let target_manifest = postgresql_carrier_manifest(&full_target_manifest);
+            let quoted_table = quote_postgres_identifier(&target_table_name);
+            sqlx::query("CREATE SCHEMA IF NOT EXISTS \"CDC_test\"")
+                .execute(&mut admin)
+                .await
+                .expect("ensure PostgreSQL qualification schema");
+
+            let mut plans = Vec::with_capacity(source_columns.len());
+            let mut definitions = Vec::with_capacity(source_columns.len());
+            for source_column in &source_columns {
+                let mapping = mysql_source_mapping(
+                    source_connector,
+                    &source_column.native_type,
+                    source_column.charset.as_deref(),
+                    source_column.collation.as_deref(),
+                );
+                let is_key = source_column.name.eq_ignore_ascii_case("id");
+                let is_raw = matches!(mapping.logical_type, change_event::LogicalType::Raw { .. });
+                let conversion_kind = if is_key {
+                    None
+                } else if is_raw {
+                    Some("source_representation")
+                } else {
+                    Some("logical_value_json")
+                };
+                if conversion_kind == Some("source_representation") {
+                    assert!(
+                        mapping.source_representation_evidence.is_some(),
+                        "MySQL {} raw type {} must carry representation evidence",
+                        source_connector,
+                        source_column.native_type
+                    );
+                }
+                let (target_native, target_logical) = match conversion_kind {
+                    None if matches!(
+                        mapping.logical_type,
+                        change_event::LogicalType::Integer {
+                            signed: false,
+                            bits: 64
+                        }
+                    ) => ("numeric(20,0)", mapping.logical_type.clone()),
+                    None => ("bigint", change_event::LogicalType::integer(true, 64)),
+                    Some("logical_value_json") => {
+                        ("text", change_event::LogicalType::text("UTF8", None))
+                    }
+                    Some("source_representation") => (
+                        "bytea",
+                        change_event::LogicalType::binary(Some(1_073_741_823)),
+                    ),
+                    _ => unreachable!(),
+                };
+                definitions.push(format!(
+                    "{} {}{}",
+                    quote_postgres_identifier(&source_column.name),
+                    target_native.to_ascii_uppercase(),
+                    if is_key { " NOT NULL PRIMARY KEY" } else { "" }
+                ));
+                let source_lineage = format!(
+                    "catalog:CDC_test.{target_table_name}.{}",
+                    source_column.name
+                );
+                let target_lineage =
+                    format!("target:CDC_test.{target_table_name}.{}", source_column.name);
+                let source_field = mysql_field(
+                    source_column,
+                    &mapping,
+                    source_lineage,
+                    mysql_catalog_fingerprint(source_column),
+                );
+                let target_field = FieldDefinition {
+                    reference: DefinitionReference::new(
+                        target_lineage,
+                        change_event::stable_digest(&(&source_column.name, target_native, is_key)),
+                    ),
+                    ordinal: source_column.ordinal,
+                    name: source_column.name.clone(),
+                    native_type: target_native.into(),
+                    logical_type: target_logical,
+                    nullable: !is_key,
+                    collation: None,
+                    generated: false,
+                    primary_key_ordinal: is_key.then_some(0),
+                    unique: is_key,
+                    row_locator: is_key,
+                };
+                let selected_rule = conversion_kind.map(|kind| {
+                    let capability = target_manifest
+                        .capabilities
+                        .iter()
+                        .find(|entry| {
+                            entry
+                                .target
+                                .parameters
+                                .get("conversion_kind")
+                                .map(String::as_str)
+                                == Some(kind)
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("PostgreSQL {target_version} lacks {kind} carrier")
+                        });
+                    change_event::RuleReference {
+                        id: capability.rule.id.clone(),
+                        version: capability.rule.version.clone(),
+                    }
+                });
+                let presences = match conversion_kind {
+                    None => vec![PresenceState::Value, PresenceState::Unchanged],
+                    Some("logical_value_json") => vec![
+                        PresenceState::Value,
+                        PresenceState::Null,
+                        PresenceState::Unchanged,
+                    ],
+                    Some("source_representation") => vec![
+                        PresenceState::SourceRepresentation,
+                        PresenceState::Null,
+                        PresenceState::Unchanged,
+                    ],
+                    _ => unreachable!(),
+                };
+                let plan_field = |confirmations| {
+                    change_event::plan_field_compatibility(FieldCompatibilityInput {
+                        source_field: source_field.clone(),
+                        target_field: target_field.clone(),
+                        source_type_mapping: mapping.clone(),
+                        source_connector: source_identity.clone(),
+                        sink_connector: target_manifest.connector.clone(),
+                        source_build: Some(source_build.clone()),
+                        target_build: Some(target_build.clone()),
+                        manifest: &target_manifest,
+                        operations: vec![Operation::Insert, Operation::Update, Operation::Delete],
+                        presences: presences.clone(),
+                        source_has_primary_key: true,
+                        options: RouteOptions {
+                            route_id: format!(
+                                "{source_connector}-to-postgresql-{target_version}-all-types"
+                            ),
+                            configuration_revision: "live-all-types:r1".into(),
+                            selected_rule: selected_rule.clone(),
+                            confirmations,
+                            ..RouteOptions::default()
+                        },
+                    })
+                };
+                let initial = plan_field(Vec::new()).unwrap_or_else(|error| {
+                    panic!(
+                        "plan MySQL {} {} to PostgreSQL {target_version}: {error}",
+                        source_column.native_type, source_column.name
+                    )
+                });
+                let mut plan = initial.plan.clone().unwrap_or_else(|| {
+                    panic!(
+                        "MySQL {} {} to PostgreSQL {target_version} did not produce a plan: {initial:?}",
+                        source_column.native_type,
+                        source_column.name
+                    )
+                });
+                if plan.confirmation == change_event::PlanConfirmationState::Required {
+                    let confirmation = RiskConfirmation {
+                        source_field_lineage: plan.source_field.lineage_id.clone(),
+                        target_field_lineage: plan.target_field.lineage_id.clone(),
+                        rule: plan.rule.clone(),
+                        plan_digest: plan.plan_digest.clone(),
+                        actor: "live-type-qualification".into(),
+                        confirmed_at: "2026-09-28T00:00:00Z".into(),
+                        reason: Some(
+                            "qualify the explicit tagged LogicalValue carrier for this native type"
+                                .into(),
+                        ),
+                    };
+                    let confirmed = plan_field(vec![confirmation]).unwrap_or_else(|error| {
+                        panic!("confirm MySQL {} plan: {error}", source_column.native_type)
+                    });
+                    assert_eq!(
+                        confirmed.status,
+                        change_event::CompatibilityStatus::Compatible,
+                        "MySQL {} to PostgreSQL {target_version}: {confirmed:?}",
+                        source_column.native_type
+                    );
+                    plan = confirmed.plan.expect("confirmed plan");
+                } else {
+                    assert_eq!(
+                        initial.status,
+                        change_event::CompatibilityStatus::Compatible,
+                        "MySQL {} to PostgreSQL {target_version}: {initial:?}",
+                        source_column.native_type
+                    );
+                }
+                plans.push(plan);
+            }
+
+            let create_sql = format!(
+                "CREATE TABLE \"CDC_test\".{quoted_table} ({})",
+                definitions.join(", ")
+            );
+            sqlx::query(sqlx::AssertSqlSafe(create_sql.as_str()))
+                .execute(&mut admin)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("create PostgreSQL {target_version} carrier table: {error}")
+                });
+
+            for captured in transactions {
+                let mut transaction = captured.transaction().clone();
+                for change in &mut transaction.changes {
+                    change.table.clone_from(&target_table_name);
+                }
+                let transaction = validate(transaction).unwrap_or_else(|error| {
+                    panic!("validate MySQL -> PostgreSQL ChangeEvent: {error}")
+                });
+                for change in &transaction.transaction().changes {
+                    for image in [&change.before, &change.after].into_iter().flatten() {
+                        for column in image {
+                            if let (Some("logical_value_json"), Datum::Value(value)) = (
+                                plans
+                                    .iter()
+                                    .find(|plan| {
+                                        plan.source_field.lineage_id.rsplit('.').next()
+                                            == Some(column.name.as_str())
+                                    })
+                                    .and_then(|plan| {
+                                        plan.target
+                                            .parameters
+                                            .get("conversion_kind")
+                                            .map(String::as_str)
+                                    }),
+                                &column.datum,
+                            ) {
+                                change_event::validate_value_against_plan(
+                                    plans
+                                        .iter()
+                                        .find(|plan| {
+                                            plan.source_field.lineage_id.rsplit('.').next()
+                                                == Some(column.name.as_str())
+                                        })
+                                        .expect("field plan"),
+                                    value,
+                                )
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "MySQL {} native type {} column {} value {:?} fails its tagged carrier contract: {}",
+                                        source_connector,
+                                        column.native_type,
+                                        column.name,
+                                        value,
+                                        error
+                                    )
+                                });
+                            }
+                        }
+                    }
+                }
+                let plan = match target_version {
+                    "15" => postgresql_15::sql_with_plans(&transaction, &plans),
+                    "16" => postgresql_16::sql_with_plans(&transaction, &plans),
+                    "17" => postgresql_17::sql_with_plans(&transaction, &plans),
+                    _ => unreachable!(),
+                }
+                .unwrap_or_else(|error| {
+                    panic!("MySQL -> PostgreSQL {target_version} SQL plan: {error}")
+                });
+                match target_version {
+                    "15" => postgresql_15::execute(&config, &plan).await,
+                    "16" => postgresql_16::execute(&config, &plan).await,
+                    "17" => postgresql_17::execute(&config, &plan).await,
+                    _ => unreachable!(),
+                }
+                .unwrap_or_else(|error| {
+                    panic!("MySQL -> PostgreSQL {target_version} apply: {error}")
+                });
+
+                let change = &transaction.transaction().changes[0];
+                match change.operation {
+                    Operation::Insert | Operation::Update => {
+                        let expected = change.after.as_deref().expect("after image");
+                        assert_postgres_carrier_readback(
+                            &mut admin,
+                            &target_table_name,
+                            expected,
+                            &plans,
+                            target_version,
+                        )
+                        .await;
+                    }
+                    Operation::Delete => {
+                        let count_sql = format!("SELECT count(*) FROM \"CDC_test\".{quoted_table}");
+                        let count: i64 =
+                            sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql.as_str()))
+                                .fetch_one(&mut admin)
+                                .await
+                                .expect("verify PostgreSQL delete");
+                        assert_eq!(count, 0, "PostgreSQL {target_version} DELETE applied");
+                    }
+                }
+            }
+
+            let drop_sql = format!("DROP TABLE \"CDC_test\".{quoted_table}");
+            sqlx::query(sqlx::AssertSqlSafe(drop_sql.as_str()))
+                .execute(&mut admin)
+                .await
+                .expect("drop PostgreSQL qualification table");
+            admin
+                .close()
+                .await
+                .expect("close PostgreSQL admin connection");
+        });
+
+        if !semantic_type_ids.is_empty() {
+            type_qualification_evidence::record_sink_type_evidence(
+                source_connector,
+                &format!("postgresql_{target_version}"),
+                &format!("{source_connector}.all_types_to_postgresql_{target_version}"),
+                semantic_type_ids.iter().cloned(),
+                "VALUE_PRESERVED",
+                "logical_value_json_carrier",
+            )
+            .expect("write per-native-type PostgreSQL sink evidence");
+        }
+        if !representation_type_ids.is_empty() {
+            type_qualification_evidence::record_sink_type_evidence(
+                source_connector,
+                &format!("postgresql_{target_version}"),
+                &format!(
+                    "{source_connector}.all_types_to_postgresql_{target_version}_representation"
+                ),
+                representation_type_ids,
+                "SOURCE_REPRESENTATION_PRESERVED",
+                "source_representation_blob_carrier",
+            )
+            .expect("write per-native-type PostgreSQL representation evidence");
+        }
+        println!(
+            "PASS {source_connector} -> postgresql_{target_version}: ChangeEvent INSERT/UPDATE/DELETE preserved all captured MySQL native values"
+        );
+    }
+}
+
+fn quote_postgres_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn postgresql_carrier_manifest(
+    full: &change_event::TargetCapabilityManifest,
+) -> change_event::TargetCapabilityManifest {
+    let unsigned_bigint = change_event::LogicalType::integer(false, 64);
+    let capabilities = full
+        .capabilities
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str),
+                Some("logical_value_json" | "source_representation")
+            ) || (entry.source_logical_type == unsigned_bigint
+                && entry
+                    .target
+                    .native_type
+                    .eq_ignore_ascii_case("numeric(20,0)")
+                && entry.rule.qualification == change_event::QualificationLevel::Exact)
+        })
+        .cloned()
+        .collect();
+    change_event::TargetCapabilityManifest::new(
+        full.connector.clone(),
+        full.target_build.clone(),
+        capabilities,
+        full.requires_primary_key,
+    )
+}
+
+async fn assert_postgres_carrier_readback(
+    admin: &mut sqlx::PgConnection,
+    table: &str,
+    expected: &[change_event::ColumnDatum],
+    plans: &[change_event::ColumnConversionPlan],
+    target_version: &str,
+) {
+    let key = expected
+        .iter()
+        .find(|column| column.primary_key_ordinal == Some(0))
+        .expect("source event has primary key");
+    let key_value = match &key.datum {
+        Datum::Value(LogicalValue::Integer { value, .. }) => value
+            .parse::<i64>()
+            .expect("test primary key fits PostgreSQL bigint"),
+        other => panic!("unexpected MySQL test key value: {other:?}"),
+    };
+    let projection = expected
+        .iter()
+        .map(|column| quote_postgres_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {projection} FROM \"CDC_test\".{} WHERE {}=$1",
+        quote_postgres_identifier(table),
+        quote_postgres_identifier(&key.name)
+    );
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+        .bind(key_value)
+        .fetch_optional(&mut *admin)
+        .await
+        .unwrap_or_else(|error| panic!("read PostgreSQL {target_version} carrier row: {error}"))
+        .unwrap_or_else(|| panic!("PostgreSQL {target_version} row should exist after DML"));
+    for (index, column) in expected.iter().enumerate() {
+        if column.primary_key_ordinal.is_some() {
+            continue;
+        }
+        let plan = plans
+            .iter()
+            .find(|plan| {
+                plan.source_field.lineage_id.rsplit('.').next() == Some(column.name.as_str())
+            })
+            .expect("every source column has a conversion plan");
+        let conversion = plan
+            .target
+            .parameters
+            .get("conversion_kind")
+            .map(String::as_str);
+        match (conversion, &column.datum) {
+            (Some("logical_value_json"), Datum::Value(expected_value)) => {
+                let actual: Option<String> = row
+                    .try_get(index)
+                    .unwrap_or_else(|error| panic!("read tagged value {}: {error}", column.name));
+                let actual = actual.unwrap_or_else(|| {
+                    panic!(
+                        "PostgreSQL {target_version} value {} is unexpectedly NULL",
+                        column.name
+                    )
+                });
+                let actual: LogicalValue = serde_json::from_str(&actual).unwrap_or_else(|error| {
+                    panic!("decode PostgreSQL tagged value {}: {error}", column.name)
+                });
+                assert_eq!(
+                    &actual, expected_value,
+                    "PostgreSQL {target_version} carrier value for {}",
+                    column.name
+                );
+            }
+            (Some("logical_value_json"), Datum::Null) => {
+                let actual: Option<String> = row
+                    .try_get(index)
+                    .unwrap_or_else(|error| panic!("read null value {}: {error}", column.name));
+                assert!(actual.is_none(), "PostgreSQL NULL for {}", column.name);
+            }
+            (Some("source_representation"), Datum::SourceRepresentationEnvelope(expected)) => {
+                let actual: Option<Vec<u8>> = row
+                    .try_get(index)
+                    .unwrap_or_else(|error| panic!("read raw value {}: {error}", column.name));
+                assert_eq!(
+                    actual,
+                    Some(serde_json::to_vec(expected).expect("serialize source envelope")),
+                    "PostgreSQL {target_version} raw representation for {}",
+                    column.name
+                );
+            }
+            (Some("source_representation"), Datum::Null) => {
+                let actual: Option<Vec<u8>> = row
+                    .try_get(index)
+                    .unwrap_or_else(|error| panic!("read raw null {}: {error}", column.name));
+                assert!(
+                    actual.is_none(),
+                    "PostgreSQL raw carrier NULL for {}",
+                    column.name
+                );
+            }
+            (_, Datum::Unchanged | Datum::Unavailable) => {}
+            (conversion, datum) => panic!(
+                "PostgreSQL {target_version} carrier kind {conversion:?} cannot qualify {} with {datum:?}",
+                column.name
+            ),
+        }
+    }
+}
 
 fn inspect(transactions: &[change_event::ValidatedTransaction], version: &str) {
     assert_eq!(
@@ -377,6 +1523,10 @@ macro_rules! capture_tests {
                     }
                 }
                 let insert_image = changes[0].after.as_ref().unwrap();
+                let qualified_source_types = assert_mysql_inventory_types_are_live_captured(
+                    stringify!($adapter),
+                    insert_image,
+                );
                 assert_eq!(insert_image.len(), columns.len());
                 for ((column, (expected_name, expected_kind)), ordinal) in
                     insert_image.iter().zip(columns).zip(0_usize..)
@@ -521,6 +1671,21 @@ macro_rules! capture_tests {
                         change_event::json(transaction).unwrap()
                     );
                 }
+                apply_all_mysql_type_transactions_to_sinks(
+                    stringify!($adapter),
+                    port,
+                    &table.name,
+                    &transactions,
+                    &qualified_source_types,
+                );
+                qualify_mysql_visible_catalog_types(stringify!($adapter), port);
+                type_qualification_evidence::record_source_type_evidence(
+                    stringify!($adapter),
+                    concat!(stringify!($adapter), ".all_types_capture"),
+                    qualified_source_types,
+                    Vec::new(),
+                )
+                .expect("write per-native-type MySQL source evidence");
                 println!(
                     "PASS {}: {} native columns; typed INSERT/UPDATE/DELETE, NULL, full before/after presence and JSON replay",
                     stringify!($adapter),

@@ -694,6 +694,18 @@ pub(crate) fn computed_plan_set_digest(task: &ReplicationTask) -> String {
         })
         .collect::<Vec<_>>();
     let rule_summary_digest = digest_serialized(&rule_summary);
+    let confirmation_bindings = task
+        .risk_confirmations
+        .iter()
+        .map(|confirmation| {
+            (
+                &confirmation.source_field_lineage,
+                &confirmation.target_field_lineage,
+                &confirmation.rule,
+                &confirmation.plan_digest,
+            )
+        })
+        .collect::<Vec<_>>();
     digest_serialized(&(
         TASK_PLAN_VERSION,
         &task.id,
@@ -704,7 +716,7 @@ pub(crate) fn computed_plan_set_digest(task: &ReplicationTask) -> String {
         &task.capability_summary_json,
         &rule_summary_digest,
         &plan_digests,
-        &task.risk_confirmations,
+        &confirmation_bindings,
     ))
 }
 
@@ -801,6 +813,20 @@ fn plan_snapshot(
         .iter()
         .map(|plan| plan.plan_digest.clone())
         .collect::<Vec<_>>();
+    // Server attribution and timestamp are audit metadata, regenerated on
+    // every preflight. The activation digest binds the confirmed field/rule/
+    // plan identities; otherwise an unchanged plan goes stale on first start.
+    let confirmation_bindings = confirmations
+        .iter()
+        .map(|confirmation| {
+            (
+                &confirmation.source_field_lineage,
+                &confirmation.target_field_lineage,
+                &confirmation.rule,
+                &confirmation.plan_digest,
+            )
+        })
+        .collect::<Vec<_>>();
     let plan_set_digest = digest_serialized(&(
         TASK_PLAN_VERSION,
         route_id,
@@ -811,7 +837,7 @@ fn plan_snapshot(
         &capability_summary_json,
         &rule_summary_digest,
         &plan_digests,
-        confirmations,
+        &confirmation_bindings,
     ));
     Ok(TaskPlanSnapshot {
         plan_version: TASK_PLAN_VERSION.into(),
@@ -820,7 +846,7 @@ fn plan_snapshot(
         sink_metadata_fingerprint,
         connector_summary_json,
         capability_summary_json,
-        capability_manifest_digest: manifest.digest,
+        capability_manifest_digest: manifest.digest.clone(),
         rule_summary_digest,
         plan_set_digest,
         plans,
@@ -1711,19 +1737,48 @@ impl Store {
                 ));
             }
         };
-        let matches = task.source_metadata_fingerprint.as_deref()
-            == Some(current.source_metadata_fingerprint.as_str())
-            && task.sink_metadata_fingerprint.as_deref()
-                == Some(current.sink_metadata_fingerprint.as_str())
-            && task.capability_manifest_digest.as_deref()
-                == Some(current.capability_manifest_digest.as_str())
-            && task.rule_summary_digest.as_deref() == Some(current.rule_summary_digest.as_str())
-            && task.plan_set_digest.as_deref() == Some(current.plan_set_digest.as_str())
-            && task.connector_summary_json == current.connector_summary_json
-            && task.capability_summary_json == current.capability_summary_json
-            && task.plans == current.plans;
-        if !matches {
-            self.mark_plan_stale(&task.id, "源/目的元数据、连接器、能力清单或转换规则已变化")?;
+        let changed = [
+            (
+                "源端元数据",
+                task.source_metadata_fingerprint.as_deref()
+                    != Some(current.source_metadata_fingerprint.as_str()),
+            ),
+            (
+                "目的端元数据或探针",
+                task.sink_metadata_fingerprint.as_deref()
+                    != Some(current.sink_metadata_fingerprint.as_str()),
+            ),
+            (
+                "目标能力清单",
+                task.capability_manifest_digest.as_deref()
+                    != Some(current.capability_manifest_digest.as_str()),
+            ),
+            (
+                "转换规则摘要",
+                task.rule_summary_digest.as_deref() != Some(current.rule_summary_digest.as_str()),
+            ),
+            (
+                "计划集合摘要",
+                task.plan_set_digest.as_deref() != Some(current.plan_set_digest.as_str()),
+            ),
+            (
+                "连接器身份",
+                task.connector_summary_json != current.connector_summary_json,
+            ),
+            (
+                "能力清单内容",
+                task.capability_summary_json != current.capability_summary_json,
+            ),
+            ("字段转换计划", task.plans != current.plans),
+        ]
+        .into_iter()
+        .filter_map(|(name, changed)| changed.then_some(name))
+        .collect::<Vec<_>>();
+        if !changed.is_empty() {
+            self.mark_plan_stale(
+                &task.id,
+                &format!("重新预检发现变化：{}", changed.join("、")),
+            )?;
             return Err(Error::Conflict(
                 "任务元数据或能力输入已变化，请重新预检并确认",
             ));

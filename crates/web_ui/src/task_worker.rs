@@ -1024,7 +1024,9 @@ fn apply_with_recovery_using(
 pub(crate) fn run(store: &Store, actor: i64, id: &str, stop: &Arc<AtomicBool>) -> Result<()> {
     let task = store.task(id)?;
     store.log_task(id, "info", "正在检查库表与目的端 CDC.log_info")?;
-    store.ensure_saved_plan_current(actor, &task)?;
+    // start_task validated the saved plan before atomically activating this
+    // configuration revision. Active tasks cannot be requalified, so repeating
+    // the remote catalog/probe preflight here only delays worker startup.
     let source = store.endpoint_for_database(
         &task.source_id,
         task.source_revision,

@@ -214,6 +214,24 @@ if ((@($sourceSpecs | ForEach-Object { $_.database }) -join ',') -ne ($roster -j
 }
 
 $suiteDefinitions = @($legacy.suites)
+foreach ($sourceSpec in $sourceSpecs) {
+    $suiteIds = @([string]$sourceSpec.suite)
+    if ($null -ne $sourceSpec.additional_suites) {
+        $suiteIds += @($sourceSpec.additional_suites | ForEach-Object { [string]$_ })
+    }
+    foreach ($suiteId in $suiteIds) {
+        $sourceSuite = $suiteDefinitions | Where-Object { $_.id -eq $suiteId } | Select-Object -First 1
+        if ($null -eq $sourceSuite -or [string]$sourceSuite.mode -ne 'Live' -or
+            [string]$sourceSuite.category -ne 'source' -or
+            -not (@($sourceSuite.databases) -contains [string]$sourceSpec.database)) {
+            throw "Source suite $suiteId must be a live source suite for $($sourceSpec.database)."
+        }
+        if ($suiteId -ne [string]$sourceSpec.suite -and
+            -not [bool]$sourceSuite.required_for_live_qualified) {
+            throw "Additional source suite $suiteId must be required for live qualification."
+        }
+    }
+}
 foreach ($suiteId in $capabilityInvalidationSpecs) {
     $suite = $suiteDefinitions | Where-Object { $_.id -eq $suiteId } | Select-Object -First 1
     if ($null -eq $suite -or [string]$suite.mode -ne 'Live' -or
@@ -270,6 +288,7 @@ try {
     Set-RunEnvironment 'CDC_QUALIFICATION_REPORT' $typePath
     Set-RunEnvironment 'CDC_QUALIFICATION_RECOVERY_REPORT' $recoveryPath
     Set-RunEnvironment 'CDC_TEST_ARTIFACT_DIR' $out
+    Set-RunEnvironment 'CDC_TYPE_QUALIFICATION_ARTIFACT_DIR' (Join-Path $out 'type-evidence')
 
     # The workspace run provides the complete offline matrix and regression
     # evidence. It never supplies live source/sink evidence.
@@ -286,6 +305,18 @@ try {
         $execute = ([string]$suite.mode -eq 'Recovery') -or $Live
         Run-Suite $suite (Add-DatabaseEnvironment $suite) $execute
     }
+
+    $typeEvidenceReportSuite = [pscustomobject]@{
+        id = 'type-inventory.live-evidence-report'
+        mode = 'Offline'
+        category = 'offline'
+        args = @('test', '--locked', '-p', 'cdc-binlog-tail', '--test', 'qualification_matrix', 'type_inventory_live_evidence_report', '--', '--exact', '--nocapture', '--test-threads=1')
+        required_env = @()
+        required_for_live_qualified = $false
+        databases = @()
+        source_fixtures = @()
+    }
+    Run-Suite $typeEvidenceReportSuite @() $true
 
     $passwordScan = Protect-ReportArtifacts $out
 
@@ -328,7 +359,20 @@ try {
 
             $sourceSpec = $sourceSpecs | Where-Object { $_.database -eq $source } | Select-Object -First 1
             $sinkSpec = $sinkSpecs | Where-Object { $_.database -eq $sink } | Select-Object -First 1
-            $sourceEvidence = if ($null -ne $sourceSpec) { Get-SuiteResult $sourceSpec.suite } else { $null }
+            $sourceSuiteIds = if ($null -ne $sourceSpec) { @([string]$sourceSpec.suite) } else { @() }
+            if ($null -ne $sourceSpec -and $null -ne $sourceSpec.additional_suites) {
+                $sourceSuiteIds += @($sourceSpec.additional_suites | ForEach-Object { [string]$_ })
+            }
+            $sourceEvidence = @($sourceSuiteIds | ForEach-Object { Get-SuiteResult $_ })
+            $sourceEvidenceStatus = if ($sourceEvidence.Count -eq 0) {
+                'REQUIRES_LIVE'
+            } elseif (@($sourceEvidence | Where-Object status -eq 'FAIL').Count -gt 0) {
+                'FAIL'
+            } elseif (@($sourceEvidence | Where-Object status -ne 'PASS').Count -eq 0) {
+                'PASS'
+            } else {
+                'REQUIRES_LIVE'
+            }
             $sinkEvidence = if ($null -ne $sinkSpec) { Get-SuiteResult $sinkSpec.suite } else { $null }
             if ($unsupported) {
                 $liveStatus = 'UNSUPPORTED'
@@ -336,13 +380,13 @@ try {
             } elseif ($roleBlocked) {
                 $liveStatus = 'BLOCKED'
                 $liveReason = 'sink_adapter_not_registered'
-            } elseif ($null -eq $sourceEvidence -or $null -eq $sinkEvidence) {
-                $liveStatus = 'REQUIRES_LIVE'
-                $liveReason = 'source_or_sink_component_not_registered'
-            } elseif ($sourceEvidence.status -eq 'FAIL' -or $sinkEvidence.status -eq 'FAIL') {
+            } elseif ($sourceEvidenceStatus -eq 'FAIL' -or $sinkEvidence.status -eq 'FAIL') {
                 $liveStatus = 'FAIL'
                 $liveReason = 'source_or_sink_component_failed'
-            } elseif ($sourceEvidence.status -eq 'PASS' -and $sinkEvidence.status -eq 'PASS') {
+            } elseif ($sourceEvidenceStatus -ne 'PASS' -or $null -eq $sinkEvidence) {
+                $liveStatus = 'REQUIRES_LIVE'
+                $liveReason = 'source_or_sink_component_not_registered'
+            } elseif ($sinkEvidence.status -eq 'PASS') {
                 $liveStatus = 'PASS'
                 $liveReason = 'source_and_sink_component_evidence'
             } else {
@@ -394,7 +438,10 @@ try {
                 live = $liveStatus
                 live_reason = $liveReason
                 live_evidence = if ($unsupported) { @() } else {
-                    @([ordered]@{ source_suite = $sourceSpec.suite; sink_suite = $sinkSpec.suite })
+                    @([ordered]@{
+                        source_suites = $sourceSuiteIds
+                        sink_suites = @([string]$sinkSpec.suite) + @($sinkSpec.additional_suites)
+                    })
                 }
                 qualification_counts = $counts
                 qualification_outcomes = $outcomes
@@ -406,14 +453,38 @@ try {
     })
 
     $sourceQualification = @($sourceSpecs | ForEach-Object {
-        $result = Get-SuiteResult $_.suite
+        $spec = $_
+        $suiteIds = @([string]$spec.suite)
+        if ($null -ne $spec.additional_suites) {
+            $suiteIds += @($spec.additional_suites | ForEach-Object { [string]$_ })
+        }
+        $suiteEvidence = @($suiteIds | ForEach-Object {
+            $suiteId = [string]$_
+            $result = Get-SuiteResult $suiteId
+            [ordered]@{
+                suite = $suiteId
+                status = if ($null -ne $result) { $result.status } else { 'REQUIRES_LIVE' }
+                log = if ($null -ne $result) { $result.log } else { $null }
+                reason = if ($null -ne $result) { $null } else { 'live_suite_not_registered' }
+            }
+        })
+        $statuses = @($suiteEvidence | ForEach-Object { [string]$_.status })
+        $status = if ($statuses -contains 'FAIL') {
+            'FAIL'
+        } elseif ($statuses.Count -gt 0 -and @($statuses | Where-Object { $_ -ne 'PASS' }).Count -eq 0) {
+            'PASS'
+        } else {
+            'REQUIRES_LIVE'
+        }
         [ordered]@{
-            database = $_.database
-            suite = $_.suite
-            status = if ($null -ne $result) { $result.status } else { 'REQUIRES_LIVE' }
-            log = if ($null -ne $result) { $result.log } else { $null }
-            reason = if ($null -ne $result) { $null } else { 'live_suite_not_registered' }
-            evidence_scope = 'live_source_adapter'
+            database = $spec.database
+            suite = $spec.suite
+            additional_suites = @($spec.additional_suites)
+            suites = $suiteEvidence
+            status = $status
+            log = if ($suiteEvidence.Count -gt 0) { $suiteEvidence[0].log } else { $null }
+            reason = if ($status -eq 'REQUIRES_LIVE') { 'one_or_more_live_source_suites_not_registered' } else { $null }
+            evidence_scope = 'live_source_adapter_and_native_type_fixtures'
         }
     })
     $sinkQualification = @($sinkSpecs | ForEach-Object {
@@ -622,6 +693,11 @@ try {
         Write-Output "Native type inventory: $($typeInventoryEvidence.status)"
         Write-Output "Native types: $($typeInventoryEvidence.native_type_count); source declarations: $($typeInventoryEvidence.source_declaration_count); source mapping gaps: $($typeInventoryEvidence.source_mapping_gaps)"
         Write-Output "Types without a qualification fixture: $($typeInventoryEvidence.types_without_qualification_fixture)"
+        if ($null -ne $typeInventoryEvidence.per_type_web_sink_total_pairs) {
+            $webTotal = [int]$typeInventoryEvidence.per_type_web_sink_total_pairs
+            $webGaps = [int]$typeInventoryEvidence.per_type_web_sink_plan_gaps
+            Write-Output "Verified per-type Web plans: $($webTotal - $webGaps)/$webTotal"
+        }
     } else {
         Write-Output 'Native type inventory: MISSING_TEST'
     }

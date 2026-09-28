@@ -87,7 +87,7 @@ pub(crate) async fn load(
                         "{schema}.{name}: catalog is missing type OID {oid}"
                     ))
                 })?;
-            crate::type_mapping::source_type_mapping_with_catalog_for_version(
+            let mapping = crate::type_mapping::source_type_mapping_with_catalog_for_version(
                 &version.to_string(),
                 &native_type,
                 &type_catalog,
@@ -98,7 +98,11 @@ pub(crate) async fn load(
                     column_name
                 ))
             })?;
-            let semantic_codec = crate::type_mapping::has_semantic_codec(&type_catalog, oid);
+            let semantic_codec = !crate::type_mapping::captures_source_representation(
+                &type_catalog,
+                oid,
+                &mapping.logical_type,
+            );
             let representation_capture_allowed = !semantic_codec;
             let closure = type_catalog
                 .definition_closure(oid)
@@ -193,7 +197,8 @@ pub async fn source_type_catalog(conn: &mut PgConnection) -> Result<crate::Sourc
                 AND d.deptype='e'
            LEFT JOIN pg_extension x ON x.oid=d.refobjid
            LEFT JOIN pg_collation coll ON coll.oid=t.typcollation
-          WHERE t.typtype IN ('b','e','d','c','r','m')
+          WHERE t.typisdefined
+            AND t.typtype IN ('b','e','d','c','r','m','p')
             AND n.nspname NOT LIKE 'pg_toast%'
           ORDER BY t.oid",
     )
@@ -209,6 +214,7 @@ pub async fn source_type_catalog(conn: &mut PgConnection) -> Result<crate::Sourc
         let element_oid = u32::try_from(row.try_get::<i64, _>("elem_oid")?)?;
         let extension: Option<String> = row.try_get("extname")?;
         let definition = match kind.as_str() {
+            "p" => SourceTypeDefinition::pseudo(oid, &schema, &name, row.try_get("collation")?),
             "b" if is_array && element_oid != 0 => SourceTypeDefinition::array_with_delimiter(
                 oid,
                 &schema,

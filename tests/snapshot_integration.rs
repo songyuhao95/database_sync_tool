@@ -5,6 +5,10 @@ use std::{
     env,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[path = "support/mysql_contract.rs"]
+mod mysql_contract;
+use mysql_contract::AllMysqlTypesTable;
 fn writer(port: u16) -> Conn {
     let mut conn = Conn::new(
         OptsBuilder::new()
@@ -118,6 +122,129 @@ fn snapshot_handoff_types_composite_keys_and_concurrent_dml() {
             }
         }};
     }
+    run!(mysql_5_7, 33061, mysql_8_0, 33062);
+    run!(mysql_8_0, 33062, mysql_8_4, 33063);
+    run!(mysql_8_4, 33063, mysql_5_7, 33061);
+}
+
+fn assert_rows_exact(source: &[Row], sink: &[Row], route: &str) {
+    if source.len() != sink.len() {
+        panic!(
+            "{route}: source and sink row counts differ: {} vs {}",
+            source.len(),
+            sink.len()
+        );
+    }
+    for (row_index, (source_row, sink_row)) in source.iter().zip(sink).enumerate() {
+        assert_eq!(
+            source_row.columns_ref().len(),
+            sink_row.columns_ref().len(),
+            "{route}: snapshot column count differs at row {row_index}"
+        );
+        for (column_index, (source_column, _sink_column)) in source_row
+            .columns_ref()
+            .iter()
+            .zip(sink_row.columns_ref())
+            .enumerate()
+        {
+            let source_value = source_row.as_ref(column_index).unwrap();
+            let sink_value = sink_row.as_ref(column_index).unwrap();
+            if source_value != sink_value {
+                let render = |value: &mysql::Value| match value {
+                    mysql::Value::Bytes(bytes) => format!(
+                        "Bytes(len={},hex={})",
+                        bytes.len(),
+                        bytes
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    ),
+                    other => format!("{other:?}"),
+                };
+                panic!(
+                    "{route}: snapshot mismatch at row {row_index}, column {}: source={}, sink={}",
+                    source_column.name_str(),
+                    render(source_row.as_ref(column_index).unwrap()),
+                    render(sink_row.as_ref(column_index).unwrap()),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires reader RELOAD permission and writer access on all three MySQL test instances"]
+fn snapshot_all_mysql_native_types_round_trip() {
+    macro_rules! run {
+        ($source:ident, $source_port:expr, $sink:ident, $sink_port:expr) => {{
+            let mut source_table = AllMysqlTypesTable::create($source_port);
+            let mut sink_table = AllMysqlTypesTable::create_named(
+                mysql_contract::connection($sink_port, false),
+                source_table.name.clone(),
+            );
+            source_table.populate();
+
+            let tables = vec![SnapshotTable {
+                schema: "CDC_test".into(),
+                table: source_table.name.clone(),
+                columns: Vec::new(),
+            }];
+            let source_password = env::var("CDC_MYSQL_READER_PASSWORD").unwrap();
+            let mut config = $source::BinlogConfig::new(
+                "192.168.0.10",
+                $source_port,
+                "mysql_reader",
+                source_password,
+            );
+            config.start_mode = $source::BinlogStartMode::Gtid;
+            let mut snapshot = $source::snapshot(config, tables.clone()).unwrap();
+            let boundary = snapshot.boundary().clone();
+            let task = format!("all-types-snapshot-{}", source_table.name);
+            let target = $sink::TargetConfig {
+                host: "192.168.0.10".into(),
+                port: $sink_port,
+                user: "mysql_writer".into(),
+                password: env::var("CDC_MYSQL_WRITER_PASSWORD").unwrap(),
+            };
+            let mut writer = $sink::CheckpointWriter::open(
+                &target,
+                &task,
+                &boundary.source.id,
+                &"a".repeat(64),
+            )
+            .unwrap();
+            writer.prepare_snapshot(&boundary).unwrap();
+            let checkpoint = writer
+                .copy_snapshot(&tables, &mut snapshot, &mut |_, _| Ok(()))
+                .unwrap();
+            assert_eq!(checkpoint.phase, "incremental");
+            assert_eq!(checkpoint.snapshot_rows, 1);
+            drop(snapshot);
+
+            let source_rows = rows(&mut source_table.conn, &source_table.name);
+            let sink_rows = rows(&mut sink_table.conn, &sink_table.name);
+            assert_rows_exact(
+                &source_rows,
+                &sink_rows,
+                &format!("{} -> {}", stringify!($source), stringify!($sink)),
+            );
+
+            drop(writer);
+            sink_table
+                .conn
+                .exec_drop("DELETE FROM CDC.log_info WHERE task_id=?", (&task,))
+                .unwrap();
+            sink_table.cleanup();
+            source_table.cleanup();
+            println!(
+                "PASS {} -> {}: full snapshot preserved all {} native MySQL columns, including BIT(64), ENUM/SET, JSON, zero dates, and spatial values",
+                stringify!($source),
+                stringify!($sink),
+                61
+            );
+        }};
+    }
+
     run!(mysql_5_7, 33061, mysql_8_0, 33062);
     run!(mysql_8_0, 33062, mysql_8_4, 33063);
     run!(mysql_8_4, 33063, mysql_5_7, 33061);

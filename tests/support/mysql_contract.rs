@@ -154,15 +154,52 @@ pub struct AllMysqlTypesTable {
 
 impl AllMysqlTypesTable {
     pub fn create(port: u16) -> Self {
-        let mut conn = connection(port, false);
+        let conn = connection(port, false);
         let tag = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let name = format!("cdc_all_types_{}_{tag}", std::process::id());
+        Self::create_named(conn, name)
+    }
+
+    pub fn create_named(mut conn: Conn, name: String) -> Self {
         conn.query_drop("CREATE DATABASE IF NOT EXISTS CDC_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
             .unwrap();
-        conn.query_drop(format!(
+        conn.query_drop(Self::create_statement(&name)).unwrap();
+        Self {
+            conn,
+            name,
+            cleaned: false,
+        }
+    }
+
+    pub fn create_sink_named(mut conn: Conn, name: String) -> Self {
+        conn.query_drop("CREATE DATABASE IF NOT EXISTS CDC_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            .unwrap();
+        let statement = Self::create_statement(&name)
+            .replace("DECIMAL(12,2) UNSIGNED", "DECIMAL(12,2)")
+            // MySQL 5.7 may implicitly make the first TIMESTAMP NOT NULL;
+            // keep target fixtures nullable so every source version can
+            // write its full declared NULL domain.
+            .replace(
+                "timestamp_value TIMESTAMP(6)",
+                "timestamp_value TIMESTAMP(6) NULL",
+            )
+            .replace("FLOAT(7,4)", "FLOAT")
+            .replace("FLOAT(23)", "FLOAT")
+            .replace("FLOAT(24)", "FLOAT")
+            .replace("DOUBLE PRECISION(12,2)", "DOUBLE");
+        conn.query_drop(statement).unwrap();
+        Self {
+            conn,
+            name,
+            cleaned: false,
+        }
+    }
+
+    pub fn create_statement(name: &str) -> String {
+        format!(
             "CREATE TABLE CDC_test.{name} (
                 id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
                 tiny_signed TINYINT,
@@ -193,20 +230,20 @@ impl AllMysqlTypesTable {
                 timestamp_value TIMESTAMP(6),
                 time_value TIME(6),
                 year_value YEAR,
-                char_value CHAR(255),
-                varchar_value VARCHAR(255),
-                tinytext_value TINYTEXT,
-                text_value TEXT,
-                mediumtext_value MEDIUMTEXT,
-                longtext_value LONGTEXT,
+                char_value CHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                varchar_value VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                tinytext_value TINYTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                text_value TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                mediumtext_value MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                longtext_value LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
                 binary_value BINARY(4),
                 varbinary_value VARBINARY(32),
                 tinyblob_value TINYBLOB,
                 blob_value BLOB,
                 mediumblob_value MEDIUMBLOB,
                 longblob_value LONGBLOB,
-                enum_value ENUM('alpha','beta','gamma'),
-                set_value SET('a','b','c'),
+                enum_value ENUM('alpha','beta','gamma') CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                set_value SET('a','b','c') CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
                 json_value JSON,
                 geometry_value GEOMETRY,
                 point_value POINT,
@@ -226,13 +263,35 @@ impl AllMysqlTypesTable {
                 latin1_value CHAR(2) CHARACTER SET latin1 COLLATE latin1_bin,
                 binary_padding BINARY(4)
             ) ENGINE=InnoDB"
-        ))
-        .unwrap();
-        Self {
-            conn,
-            name,
-            cleaned: false,
-        }
+        )
+    }
+
+    pub fn populate(&mut self) {
+        self.conn.query_drop("SET SESSION sql_mode = ''").unwrap();
+        self.conn.query_drop(format!(
+            "INSERT INTO CDC_test.{} VALUES (
+                1, -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295, -9223372036854775808, 18446744073709551615,
+                1234567890, 1234567890, 12345678901234567890.123456, 123456789.12, 123456789.123,
+                1.25, 1.5, 1.75, 12.3456, 1.125, 12.34,
+                b'1', b'1010010110100101101001011010010110100101101001011010010110100101',
+                '2024-02-29', '2024-02-29 12:34:56.123456', '2024-02-29 12:34:56.123456', '838:59:58.999999', 2024,
+                'fixed', 'base', 'tiny text', 'text value', 'medium text', 'long text',
+                X'01020304', X'00FF', X'01', X'0203', X'040506', X'070809',
+                'beta', 'a,c', JSON_OBJECT('kind','mysql','value',1),
+                ST_GeomFromText('POINT(1 2)'), ST_GeomFromText('POINT(1 2)'),
+                ST_GeomFromText('LINESTRING(0 0,1 1)'), ST_GeomFromText('POLYGON((0 0,1 0,1 1,0 0))'),
+                ST_GeomFromText('MULTIPOINT((1 1),(2 2))'),
+                ST_GeomFromText('MULTILINESTRING((0 0,1 1),(2 2,3 3))'),
+                ST_GeomFromText('MULTIPOLYGON(((0 0,1 0,1 1,0 0)))'),
+                ST_GeomFromText('GEOMETRYCOLLECTION(POINT(1 1),LINESTRING(0 0,1 1))'),
+                NULL,
+                99999999999999999999999999999999999.999999999999999999999999999999,
+                -0e0, -0e0,
+                '0000-00-00', '0000-00-00 00:00:00.000000', '0000-00-00 00:00:00.000000',
+                'é', X'01'
+            )",
+            self.name
+        )).unwrap();
     }
 
     pub fn cleanup(&mut self) {

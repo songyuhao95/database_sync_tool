@@ -489,6 +489,173 @@ async fn postgres15_writes_sql_transaction() -> postgresql_15::Result<()> {
     writes_sql_transaction_for_version("15").await
 }
 
+async fn writes_native_type_values_for_version(
+    target_version: &'static str,
+) -> postgresql_15::Result<()> {
+    let password = env::var(postgres_env::env_name(target_version, "TEST_PASSWORD"))?;
+    let writer = postgres_env::setting(target_version, "WRITER_USER", "postgresql_writer");
+    let admin = postgres_env::setting(target_version, "ADMIN_USER", "postgres");
+    let tag = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let table = format!("cdc_native_sink_pg{target_version}_{tag}");
+    let mut setup =
+        PgConnection::connect_with(&postgres_env::options(target_version, &admin, &password))
+            .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE public.\"{table}\" (
+            id bigint PRIMARY KEY,
+            flag boolean,
+            token uuid,
+            amount numeric(30,6),
+            ratio double precision,
+            payload bytea,
+            day date,
+            local_time timestamp(6) without time zone,
+            observed_at timestamp(6) with time zone,
+            metadata jsonb,
+            note text
+        )"
+    )))
+    .execute(&mut setup)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON public.\"{table}\" TO \"{}\"",
+        writer.replace('"', "\"\"")
+    )))
+    .execute(&mut setup)
+    .await?;
+
+    let result = async {
+        let mut insert = all_types_fixture().transaction().clone();
+        insert.changes[0].table.clone_from(&table);
+        let insert = validate(insert)?;
+        let config = TargetConfig::new(
+            postgres_env::setting(target_version, "HOST", "192.168.0.10"),
+            "CDC_test",
+            writer,
+            password,
+        )
+        .with_port(
+            postgres_env::setting(target_version, "PORT", "54321")
+                .parse()
+                .expect("invalid PostgreSQL test port"),
+        );
+        let sink = SinkAdapter::new_for_version(target_version);
+        let applied = execute(&config, &sink.plan(&insert)?).await?;
+        assert_eq!(applied.statements_executed, 1);
+
+        let mut verify = PgConnection::connect_with(&postgres_env::options(
+            target_version,
+            &admin,
+            &config.password,
+        ))
+        .await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT id, flag, token::text AS token, amount::text AS amount,
+                    ratio, payload, day::text AS day, local_time::text AS local_time,
+                    extract(epoch FROM observed_at)::numeric::text AS observed_epoch,
+                    metadata->>'n' AS json_number, note
+             FROM public.\"{table}\""
+        )))
+        .fetch_one(&mut verify)
+        .await?;
+        assert_eq!(row.try_get::<i64, _>("id")?, 1);
+        assert!(row.try_get::<bool, _>("flag")?);
+        assert_eq!(
+            row.try_get::<String, _>("token")?,
+            "12345678-1234-1234-1234-123456789abc"
+        );
+        assert_eq!(row.try_get::<String, _>("amount")?, "-0.000001");
+        assert_eq!(row.try_get::<f64, _>("ratio")?, 1.25);
+        assert_eq!(row.try_get::<Vec<u8>, _>("payload")?, [0, 255]);
+        assert_eq!(row.try_get::<String, _>("day")?, "2026-09-14");
+        assert_eq!(
+            row.try_get::<String, _>("local_time")?,
+            "2026-09-14 01:02:03.123456"
+        );
+        assert_eq!(
+            row.try_get::<String, _>("observed_epoch")?,
+            "1700000000.123456"
+        );
+        assert_eq!(
+            row.try_get::<String, _>("json_number")?,
+            "12345678901234567890.123456"
+        );
+        assert!(row.try_get::<Option<String>, _>("note")?.is_none());
+
+        let mut update = insert.transaction().clone();
+        let change = &mut update.changes[0];
+        change.operation = Operation::Update;
+        change.before = change.after.clone();
+        let mut after = change.before.clone().expect("insert image");
+        after
+            .iter_mut()
+            .find(|column| column.name == "note")
+            .expect("note field")
+            .datum = text("updated");
+        change.after = Some(after);
+        let update = validate(update)?;
+        assert_eq!(
+            execute(&config, &sink.plan(&update)?)
+                .await?
+                .statements_executed,
+            1
+        );
+        let note: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT note FROM public.\"{table}\" WHERE id=1"
+        )))
+        .fetch_one(&mut verify)
+        .await?;
+        assert_eq!(note.as_deref(), Some("updated"));
+
+        let mut delete = insert.transaction().clone();
+        let change = &mut delete.changes[0];
+        change.operation = Operation::Delete;
+        change.before = change.after.clone();
+        change.after = None;
+        let delete = validate(delete)?;
+        assert_eq!(
+            execute(&config, &sink.plan(&delete)?)
+                .await?
+                .statements_executed,
+            1
+        );
+        let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM public.\"{table}\""
+        )))
+        .fetch_one(&mut verify)
+        .await?;
+        assert_eq!(remaining, 0);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS public.\"{table}\""
+    )))
+    .execute(&mut setup)
+    .await?;
+    result?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 15 test database"]
+async fn postgres15_writes_native_type_values() -> postgresql_15::Result<()> {
+    writes_native_type_values_for_version("15").await
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 16 test database"]
+async fn postgres16_writes_native_type_values() -> postgresql_15::Result<()> {
+    writes_native_type_values_for_version("16").await
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 17 test database"]
+async fn postgres17_writes_native_type_values() -> postgresql_15::Result<()> {
+    writes_native_type_values_for_version("17").await
+}
+
 async fn checkpoint_and_dml_for_version(target_version: &'static str) -> postgresql_15::Result<()> {
     let password = env::var(postgres_env::env_name(target_version, "TEST_PASSWORD"))?;
     let writer_name = postgres_env::setting(target_version, "WRITER_USER", "postgresql_writer");

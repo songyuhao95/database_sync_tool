@@ -457,6 +457,11 @@ fn value_placeholder_for_key(
     column: &ColumnDatum,
     plans: &[ColumnConversionPlan],
 ) -> String {
+    if let Datum::Value(LogicalValue::Text { charset, .. }) = &column.datum
+        && let Ok(charset) = mysql_charset_name(charset)
+    {
+        return format!("CONVERT(CAST(? AS BINARY) USING {charset})");
+    }
     let Some(plan) = column_plan(schema, table, column, plans) else {
         return "?".into();
     };
@@ -1242,6 +1247,18 @@ fn bind_columns(row: &[&ColumnDatum]) -> io::Result<Vec<Value>> {
     row.iter().map(|column| bind_datum(&column.datum)).collect()
 }
 
+fn bind_snapshot_columns(row: &[&ColumnDatum]) -> io::Result<Vec<Value>> {
+    row.iter()
+        .map(|column| match &column.datum {
+            Datum::Value(value @ LogicalValue::Spatial { .. }) => mysql_spatial_value(value),
+            Datum::Value(LogicalValue::Text {
+                bytes_base64url, ..
+            }) => Ok(Value::Bytes(decode_bytes(bytes_base64url)?)),
+            datum => bind_datum(datum),
+        })
+        .collect()
+}
+
 fn bind_column_with_plan(
     change: &RowChange,
     column: &ColumnDatum,
@@ -1269,9 +1286,22 @@ fn bind_datum_with_plan(
                     .parameters
                     .get("conversion_kind")
                     .map(String::as_str)
-                    == Some("spatial") =>
+                    .is_some_and(|kind| matches!(kind, "recursive" | "logical_value_json")) =>
             {
-                mysql_spatial_value(value)
+                change_event::validate_value_against_plan(plan, value).map_err(io::Error::other)?;
+                Ok(Value::Bytes(logical_value_json(value)?.into_bytes()))
+            }
+            Some(_) if matches!(value, LogicalValue::Text { .. }) => {
+                let LogicalValue::Text {
+                    charset,
+                    bytes_base64url,
+                    ..
+                } = value
+                else {
+                    unreachable!("guarded text LogicalValue")
+                };
+                mysql_charset_name(charset)?;
+                Ok(Value::Bytes(decode_bytes(bytes_base64url)?))
             }
             Some(plan)
                 if plan
@@ -1279,10 +1309,9 @@ fn bind_datum_with_plan(
                     .parameters
                     .get("conversion_kind")
                     .map(String::as_str)
-                    .is_some_and(|kind| matches!(kind, "recursive" | "logical_value_json")) =>
+                    == Some("spatial") =>
             {
-                change_event::validate_value_against_plan(plan, value).map_err(io::Error::other)?;
-                Ok(Value::Bytes(logical_value_json(value)?.into_bytes()))
+                mysql_spatial_value(value)
             }
             _ => bind_logical_value(value),
         },
@@ -1388,6 +1417,9 @@ fn ensure_supported_image_with_plans(
         return Err(capability_failure("row has no primary key"));
     }
     for column in image.iter().filter(|column| !column.generated) {
+        if matches!(&column.datum, Datum::Unavailable | Datum::Unchanged) {
+            continue;
+        }
         let plan = column_plan(&change.schema, &change.table, column, plans);
         let kind = plan.and_then(|plan| {
             plan.target
@@ -1399,6 +1431,7 @@ fn ensure_supported_image_with_plans(
             kind,
             Some("recursive" | "logical_value_json" | "source_representation" | "spatial")
         ) || matches!(&column.datum, Datum::SourceRepresentationEnvelope(_))
+            || matches!(&column.datum, Datum::Value(LogicalValue::Text { .. }))
         {
             bind_column_with_plan(change, column, plans)?;
         } else if let Datum::Value(value) = &column.datum {
@@ -1442,6 +1475,46 @@ fn mysql_spatial_value(value: &LogicalValue) -> io::Result<Value> {
     };
     bytes.extend_from_slice(&wkb);
     Ok(Value::Bytes(bytes))
+}
+
+fn mysql_invalid_temporal_value(kind: &str, raw: &str) -> io::Result<Value> {
+    let separators: &[(usize, u8)] = match kind {
+        "mysql.date" => &[(4, b'-'), (7, b'-')],
+        "mysql.datetime" | "mysql.timestamp" => &[
+            (4, b'-'),
+            (7, b'-'),
+            (10, b' '),
+            (13, b':'),
+            (16, b':'),
+            (19, b'.'),
+        ],
+        _ => return Err(capability_failure("unqualified invalid temporal kind")),
+    };
+    let expected_len = if kind == "mysql.date" { 10 } else { 26 };
+    if raw.len() != expected_len
+        || !raw.bytes().enumerate().all(|(index, byte)| {
+            separators
+                .iter()
+                .find(|(position, _)| *position == index)
+                .map_or(byte.is_ascii_digit(), |(_, separator)| byte == *separator)
+        })
+    {
+        return Err(capability_failure(
+            "invalid temporal raw spelling is outside the MySQL qualified format",
+        ));
+    }
+    Ok(Value::Bytes(raw.as_bytes().to_vec()))
+}
+
+fn mysql_charset_name(charset: &str) -> io::Result<&str> {
+    if charset.is_empty()
+        || !charset
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(capability_failure("invalid MySQL charset identifier"));
+    }
+    Ok(charset)
 }
 
 fn bind_datum(datum: &Datum) -> io::Result<Value> {
@@ -1593,6 +1666,7 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
                 capability_failure("negative YEAR is unsupported")
             })?))
         }
+        LogicalValue::InvalidTemporal { kind, raw } => mysql_invalid_temporal_value(kind, raw),
         LogicalValue::Enum { label } => Ok(Value::Bytes(label.as_bytes().to_vec())),
         LogicalValue::Set { members } => Ok(Value::Bytes(members.join(",").into_bytes())),
         LogicalValue::Spatial { .. }
@@ -1603,7 +1677,6 @@ fn bind_logical_value(value: &LogicalValue) -> io::Result<Value> {
         | LogicalValue::Range { .. }
         | LogicalValue::MultiRange { .. }
         | LogicalValue::Null
-        | LogicalValue::InvalidTemporal { .. }
         | LogicalValue::OffsetTime { .. }
         | LogicalValue::CalendarInterval { .. }
         | LogicalValue::TemporalInfinity { .. }
@@ -1822,6 +1895,39 @@ fn ensure_supported_image(image: &[ColumnDatum]) -> io::Result<()> {
     Ok(())
 }
 
+fn ensure_supported_snapshot_image(image: &[ColumnDatum]) -> io::Result<()> {
+    if !image
+        .iter()
+        .any(|column| column.primary_key_ordinal.is_some())
+    {
+        return Err(capability_failure("row has no primary key"));
+    }
+    for column in image.iter().filter(|column| !column.generated) {
+        if let Datum::Value(value) = &column.datum {
+            ensure_source_value_type(&column.native_type, value, column.primary_key_ordinal)?;
+            match value {
+                LogicalValue::Text {
+                    charset,
+                    bytes_base64url,
+                    ..
+                } => {
+                    mysql_charset_name(charset)?;
+                    decode_bytes(bytes_base64url)?;
+                }
+                LogicalValue::Spatial { .. } => {
+                    mysql_spatial_value(value)?;
+                }
+                _ => {
+                    bind_logical_value(value).map_err(|error| {
+                        capability_failure(format!("column {}: {error}", column.name))
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_source_value_type(
     native_type: &str,
     value: &LogicalValue,
@@ -1893,17 +1999,33 @@ pub fn snapshot_sql(validated: &change_event::ValidatedSnapshotBatch) -> io::Res
     let mut statements = Vec::new();
     let mut parameters = Vec::new();
     for row in &batch.rows {
-        ensure_supported_image(row)?;
+        ensure_supported_snapshot_image(row)?;
         let writable = writable_columns(row);
         if writable.is_empty() {
             return Err(capability_failure("snapshot has no writable columns"));
         }
+        let placeholders = writable
+            .iter()
+            .map(|column| match &column.datum {
+                Datum::Value(LogicalValue::Spatial { srid, .. }) if TARGET_VERSION != "5.7" => {
+                    Ok(srid.map_or_else(
+                        || "ST_GeomFromWKB(?)".into(),
+                        |srid| format!("ST_GeomFromWKB(?, {srid})"),
+                    ))
+                }
+                Datum::Value(LogicalValue::Text { charset, .. }) => Ok(format!(
+                    "CONVERT(CAST(? AS BINARY) USING {})",
+                    mysql_charset_name(charset)?
+                )),
+                _ => Ok("?".into()),
+            })
+            .collect::<io::Result<Vec<String>>>()?
+            .join(", ");
         statements.push(format!(
-            "INSERT INTO {table} ({}) VALUES ({});",
-            column_list(&writable),
-            placeholders(writable.len())
+            "INSERT INTO {table} ({}) VALUES ({placeholders});",
+            column_list(&writable)
         ));
-        parameters.push(bind_columns(&writable)?);
+        parameters.push(bind_snapshot_columns(&writable)?);
     }
     Ok(SnapshotSql {
         statements,

@@ -227,7 +227,7 @@ fn text_explicit_plan_is_configured_confirmed_and_strictly_encoded() {
     assert_eq!(text.as_deref(), Some("你好"));
     change_event::validate_datum_against_plan(&plan, &Datum::Null).unwrap();
     change_event::validate_datum_against_plan(&plan, &Datum::Unchanged).unwrap();
-    assert!(change_event::validate_datum_against_plan(&plan, &Datum::Unavailable).is_err());
+    change_event::validate_datum_against_plan(&plan, &Datum::Unavailable).unwrap();
 
     let emoji = LogicalValue::Text {
         charset: "utf8mb4".into(),

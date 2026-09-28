@@ -438,6 +438,13 @@ pub enum LogicalType {
     BitString {
         length: u64,
     },
+    /// A variable-width bit string, optionally bounded by its declared maximum.
+    /// Unlike `BitString`, values may use any bit length from zero through the
+    /// maximum because the declaration does not pad them to a fixed width.
+    VariableBitString {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_length: Option<u64>,
+    },
     Date,
     LocalTime {
         fractional_precision: u8,
@@ -566,6 +573,10 @@ impl LogicalType {
 
     pub fn bit_string(length: u64) -> Self {
         Self::BitString { length }
+    }
+
+    pub fn variable_bit_string(max_length: Option<u64>) -> Self {
+        Self::VariableBitString { max_length }
     }
 
     pub fn spatial(subtype: impl Into<String>, srid: Option<i32>, dimensions: u8) -> Self {
@@ -739,6 +750,11 @@ impl LogicalType {
             Self::BitString { length } if *length == 0 => Err(LogicalTypeValidationError(
                 "bit string length must be positive".into(),
             )),
+            Self::VariableBitString {
+                max_length: Some(max_length),
+            } if *max_length == 0 => Err(LogicalTypeValidationError(
+                "variable bit string maximum length must be positive".into(),
+            )),
             Self::Spatial {
                 subtype,
                 dimensions,
@@ -848,7 +864,7 @@ impl LogicalType {
             Self::Float { .. } => "float",
             Self::Text { .. } => "text",
             Self::Binary { .. } => "binary",
-            Self::BitString { .. } => "bit_string",
+            Self::BitString { .. } | Self::VariableBitString { .. } => "bit_string",
             Self::Date => "date",
             Self::LocalTime { .. } => "local_time",
             Self::OffsetTime { .. } => "offset_time",
@@ -883,6 +899,21 @@ impl LogicalType {
             | (Self::Date, LogicalValue::Date { .. })
             | (Self::Year, LogicalValue::Year { .. })
             | (Self::Json { .. }, LogicalValue::Json { .. }) => true,
+            (Self::Date, LogicalValue::InvalidTemporal { kind, .. })
+                if kind.eq_ignore_ascii_case("mysql.date") =>
+            {
+                true
+            }
+            (Self::LocalDatetime { .. }, LogicalValue::InvalidTemporal { kind, .. })
+                if kind.eq_ignore_ascii_case("mysql.datetime") =>
+            {
+                true
+            }
+            (Self::Instant { .. }, LogicalValue::InvalidTemporal { kind, .. })
+                if kind.eq_ignore_ascii_case("mysql.timestamp") =>
+            {
+                true
+            }
             (Self::DecimalUnbounded, LogicalValue::Decimal { .. }) => true,
             (
                 Self::Integer { signed, bits },
@@ -1024,6 +1055,10 @@ impl LogicalType {
             (Self::BitString { length }, LogicalValue::BitString { bit_length, .. }) => {
                 length == bit_length
             }
+            (
+                Self::VariableBitString { max_length },
+                LogicalValue::BitString { bit_length, .. },
+            ) => max_length.is_none_or(|maximum| bit_length <= &maximum),
             (Self::Enum { members }, LogicalValue::Enum { label }) => {
                 !members.is_empty() && members.iter().any(|member| member == label)
             }
@@ -1095,8 +1130,14 @@ impl LogicalType {
                     ..
                 },
             ) => {
-                address_family.eq_ignore_ascii_case(value_family)
-                    && (*cidr == prefix_length.is_some())
+                (address_family.eq_ignore_ascii_case(value_family)
+                    || address_family.eq_ignore_ascii_case("ip")
+                        && matches!(value_family.as_str(), "ipv4" | "ipv6"))
+                    && if *cidr {
+                        prefix_length.is_some()
+                    } else {
+                        address_family.eq_ignore_ascii_case("ip") || prefix_length.is_none()
+                    }
             }
             (Self::Xml, LogicalValue::Xml { .. }) => true,
             (Self::Array { element }, LogicalValue::Array { elements }) => elements
@@ -1291,6 +1332,11 @@ pub struct SourceTypeMapping {
     /// stable type metadata into the persisted target plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_representation_evidence: Option<SourceRepresentationTypeEvidence>,
+    /// Database-neutral details needed to interpret the source value's wire
+    /// representation (for example `bit_order=lsb_first`). These attributes
+    /// are bound into the field plan and never describe a target database.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub value_representation: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1327,7 +1373,18 @@ impl SourceTypeMapping {
             source_build: None,
             environment_fingerprint: None,
             source_representation_evidence: None,
+            value_representation: BTreeMap::new(),
         }
+    }
+
+    /// Record a stable property of the source adapter's value representation.
+    pub fn with_value_representation_parameter(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.value_representation.insert(key.into(), value.into());
+        self
     }
 
     /// Bind a mapping to the immutable source definition, exact server build,
@@ -1350,6 +1407,7 @@ impl SourceTypeMapping {
             &self.source_definition_fingerprint,
             &self.source_build,
             &self.environment_fingerprint,
+            &self.value_representation,
         )));
         self
     }
@@ -2098,9 +2156,10 @@ fn validate_decimal_special_value(
     ))
 }
 
-/// Validate a presence state against the same fixed plan.  `Unchanged` is a
-/// control instruction for an UPDATE and therefore does not cause a value
-/// conversion; `Unavailable` is never a writable value.
+/// Validate a datum against the same fixed plan. Presence states do not carry
+/// values to convert: `Unchanged` leaves the target column alone and
+/// `Unavailable` is usable only in a before image, where the source contract
+/// and Sink row-locator checks determine whether it is safe to proceed.
 #[allow(clippy::result_large_err)]
 pub fn validate_datum_against_plan(
     plan: &ColumnConversionPlan,
@@ -2112,15 +2171,10 @@ pub fn validate_datum_against_plan(
         // persisted plan stores the immutable rule reference rather than a
         // second copy of the manifest's presence list; the common event
         // validator has already checked the operation/image relationship.
-        Datum::Null | Datum::Unchanged => Ok(()),
+        Datum::Null | Datum::Unchanged | Datum::Unavailable => Ok(()),
         Datum::SourceRepresentationEnvelope(envelope) => {
             validate_source_representation_envelope_against_plan(plan, envelope)
         }
-        Datum::Unavailable => Err(plan_failure(
-            plan,
-            "target_capability.unavailable_value",
-            "an unavailable source value cannot be written by a conversion plan",
-        )),
     }
 }
 
@@ -2456,8 +2510,8 @@ fn validate_bit_string_plan_value(
             "the bit string conversion plan received another LogicalValue family",
         ));
     };
-    let expected_length = plan_parameter(plan, "target_bit_length")
-        .or_else(|| plan_parameter(plan, "target_length"))
+    let expected_length = plan_parameter(plan, "source_bit_length")
+        .or_else(|| plan_parameter(plan, "target_bit_length"))
         .ok_or_else(|| {
             plan_failure(
                 plan,
@@ -2490,25 +2544,25 @@ fn validate_bit_string_plan_value(
             "bit string length differs from the qualified source length",
         ));
     }
-    let expected_order = match plan_parameter(plan, "target_bit_order") {
+    let expected_order = match plan_parameter(plan, "source_bit_order") {
         Some("msb_first") => BitOrder::MsbFirst,
         Some("lsb_first") => BitOrder::LsbFirst,
         _ => {
             return Err(plan_failure(
                 plan,
                 "target_capability.bit_order_missing",
-                "the bit string plan must declare bit order",
+                "the bit string plan must declare source bit order",
             ));
         }
     };
     if *bit_order != expected_order {
         return Err(plan_failure(
             plan,
-            "target_capability.bit_order_mismatch",
-            "bit order differs from the qualified target representation",
+            "target_capability.source_bit_order_mismatch",
+            "bit order differs from the qualified source representation",
         ));
     }
-    let expected_padding = match plan_parameter(plan, "target_padding") {
+    let expected_padding = match plan_parameter(plan, "source_padding") {
         Some("none") => BitPadding::None,
         Some("zero") => BitPadding::Zero,
         Some("one") => BitPadding::One,
@@ -2516,7 +2570,7 @@ fn validate_bit_string_plan_value(
             return Err(plan_failure(
                 plan,
                 "target_capability.bit_padding_missing",
-                "the bit string plan must declare padding semantics",
+                "the bit string plan must declare source padding semantics",
             ));
         }
     };
@@ -2524,7 +2578,7 @@ fn validate_bit_string_plan_value(
         return Err(plan_failure(
             plan,
             "target_capability.bit_padding_mismatch",
-            "bit padding differs from the qualified target representation",
+            "bit padding differs from the qualified source representation",
         ));
     }
     let raw = URL_SAFE_NO_PAD.decode(bytes_base64url).map_err(|_| {
@@ -2566,11 +2620,102 @@ fn validate_bit_string_plan_value(
             return Err(plan_failure(
                 plan,
                 "target_capability.bit_padding_invalid",
-                "unused bit padding does not match the qualified zero/one policy",
+                "unused bit padding does not match the qualified source zero/one policy",
             ));
         }
     }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn convert_bit_string_value(
+    plan: &ColumnConversionPlan,
+    value: &LogicalValue,
+) -> Result<LogicalValue, TargetCapabilityFailure> {
+    let LogicalValue::BitString {
+        bytes_base64url,
+        bit_length,
+        bit_order: source_order,
+        ..
+    } = value
+    else {
+        return Err(plan_failure(
+            plan,
+            "target_capability.bit_string_type_mismatch",
+            "the bit string conversion plan received another LogicalValue family",
+        ));
+    };
+    let target_order = match plan_parameter(plan, "target_bit_order") {
+        Some("msb_first") => BitOrder::MsbFirst,
+        Some("lsb_first") => BitOrder::LsbFirst,
+        _ => {
+            return Err(plan_failure(
+                plan,
+                "target_capability.bit_order_missing",
+                "the bit string plan must declare target bit order",
+            ));
+        }
+    };
+    let target_padding = match plan_parameter(plan, "target_padding") {
+        Some("none") => BitPadding::None,
+        Some("zero") => BitPadding::Zero,
+        Some("one") => BitPadding::One,
+        _ => {
+            return Err(plan_failure(
+                plan,
+                "target_capability.bit_padding_missing",
+                "the bit string plan must declare target padding semantics",
+            ));
+        }
+    };
+    let source = URL_SAFE_NO_PAD.decode(bytes_base64url).map_err(|_| {
+        plan_failure(
+            plan,
+            "target_capability.bit_string_format_invalid",
+            "the bit string value is not valid base64url bytes",
+        )
+    })?;
+    let mut target = vec![0_u8; source.len()];
+    for position in 0..usize::try_from(*bit_length).map_err(|_| {
+        plan_failure(
+            plan,
+            "target_capability.bit_string_length_invalid",
+            "the bit string length does not fit this runtime",
+        )
+    })? {
+        let source_mask = bit_mask(*source_order, position);
+        if source[position / 8] & source_mask != 0 {
+            target[position / 8] |= bit_mask(target_order, position);
+        }
+    }
+    let unused = (8 - (bit_length % 8)) % 8;
+    if unused > 0 && target_padding == BitPadding::One {
+        let padding_mask = match target_order {
+            BitOrder::MsbFirst => (1_u8 << unused) - 1,
+            BitOrder::LsbFirst => u8::MAX << (8 - unused),
+        };
+        let last = target.last_mut().ok_or_else(|| {
+            plan_failure(
+                plan,
+                "target_capability.bit_string_length_invalid",
+                "a padded bit string must contain at least one byte",
+            )
+        })?;
+        *last |= padding_mask;
+    }
+    Ok(LogicalValue::BitString {
+        bytes_base64url: URL_SAFE_NO_PAD.encode(target),
+        bit_length: *bit_length,
+        padding: target_padding,
+        bit_order: target_order,
+    })
+}
+
+fn bit_mask(order: BitOrder, position: usize) -> u8 {
+    match order {
+        BitOrder::MsbFirst => 1_u8 << (7 - position % 8),
+        BitOrder::LsbFirst => 1_u8 << (position % 8),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -3988,13 +4133,7 @@ fn convert_image_with_plans(
             Datum::Value(value) => Datum::Value(convert_value_with_plan(plan, value)?),
             Datum::Null => Datum::Null,
             Datum::Unchanged => Datum::Unchanged,
-            Datum::Unavailable => {
-                return Err(plan_failure(
-                    plan,
-                    "target_capability.unavailable_value",
-                    "an unavailable source value cannot be written by a conversion plan",
-                ));
-            }
+            Datum::Unavailable => Datum::Unavailable,
             Datum::SourceRepresentationEnvelope(envelope) => {
                 validate_source_representation_envelope_against_plan(plan, envelope)?;
                 Datum::SourceRepresentationEnvelope(envelope.clone())
@@ -4017,7 +4156,8 @@ fn convert_value_with_plan(
         .map(String::as_str)
     {
         Some("binary") => convert_binary_value(plan, value),
-        Some("bit_string") | Some("spatial") | Some("recursive") => Ok(value.clone()),
+        Some("bit_string") => convert_bit_string_value(plan, value),
+        Some("spatial") | Some("recursive") => Ok(value.clone()),
         Some("text") => convert_text_value(plan, value),
         Some("json") => convert_json_value(plan, value),
         Some("enum") | Some("set") => convert_enum_set_value(plan, value),
@@ -4732,7 +4872,7 @@ pub fn explain_compatibility(
                     "target_capability.binary_representation_missing",
                     "no qualified raw-byte target exists; binary values are never silently encoded as text",
                 ),
-                LogicalType::BitString { .. } => (
+                LogicalType::BitString { .. } | LogicalType::VariableBitString { .. } => (
                     CompatibilityStatus::Unsupported,
                     "target_capability.bit_string_representation_missing",
                     "no qualified bit-string target declares length, padding, and bit order",
@@ -4784,32 +4924,45 @@ pub fn explain_compatibility(
         });
     }
 
-    if candidates.len() > 1 {
+    let preferred_native = preferred_exact_native_candidate(&candidates);
+    if (candidates.len() > 1 && preferred_native.is_none())
+        || (input.options.selected_rule.is_none()
+            && candidates.iter().all(explicit_carrier_candidate))
+    {
+        let (code, message) = if candidates.len() > 1 {
+            (
+                "target_capability.multiple_candidates",
+                "multiple qualified target representations require an explicit rule selection",
+            )
+        } else {
+            (
+                "target_capability.explicit_carrier_selection_required",
+                "the target carrier requires an explicit selection",
+            )
+        };
         return Ok(CompatibilityResult {
             source_field: input.source_field.reference.clone(),
             target_field: input.target_field.reference.clone(),
             status: CompatibilityStatus::NeedsConfiguration,
             qualification: candidates[0].qualification,
             risk: candidates[0].risk,
-            reason_code: "target_capability.multiple_candidates".to_owned(),
-            explanation:
-                "multiple qualified target representations require an explicit rule selection"
-                    .to_owned(),
+            reason_code: code.to_owned(),
+            explanation: message.to_owned(),
             requires_confirmation: false,
             rule: None,
             plan: None,
             candidates,
             failure: Some(CompatibilityFailure::new(
                 FailureClass::InvalidInput,
-                "target_capability.multiple_candidates",
+                code,
                 FailurePhase::PlanConstruction,
-                "multiple qualified target representations require an explicit rule selection",
+                message,
             )),
             summary: None,
         });
     }
 
-    let candidate = candidates.into_iter().next().expect("candidate exists");
+    let candidate = candidates.remove(preferred_native.unwrap_or(0));
     let capability = input
         .manifest
         .capabilities
@@ -5035,7 +5188,9 @@ pub fn explain_field_compatibility(
             )
         })
         .filter(|_| input.source_field.generated == input.target_field.generated)
-        .filter(|_| input.source_field.nullable == input.target_field.nullable)
+        // A nullable target safely accepts a non-null source. Reject only
+        // when the source may emit NULL but the pre-created target cannot.
+        .filter(|_| !(input.source_field.nullable && !input.target_field.nullable))
         .filter(|capability| {
             !is_range_template(capability)
                 || input.source_field.logical_type != input.target_field.logical_type
@@ -5079,7 +5234,7 @@ pub fn explain_field_compatibility(
                     "target_capability.binary_representation_missing",
                     "no qualified raw-byte target exists; binary values are never silently encoded as text",
                 ),
-                LogicalType::BitString { .. } => (
+                LogicalType::BitString { .. } | LogicalType::VariableBitString { .. } => (
                     CompatibilityStatus::Unsupported,
                     "target_capability.bit_string_representation_missing",
                     "no qualified bit-string target declares length, padding, and bit order",
@@ -5127,27 +5282,42 @@ pub fn explain_field_compatibility(
         ));
     }
 
-    if candidates.len() > 1 {
+    let preferred_native = preferred_exact_native_candidate(&candidates);
+    if (candidates.len() > 1 && preferred_native.is_none())
+        || (input.options.selected_rule.is_none()
+            && candidates.iter().all(explicit_carrier_candidate))
+    {
         let candidate = candidates[0].clone();
+        let (code, message) = if candidates.len() > 1 {
+            (
+                "target_capability.multiple_candidates",
+                "multiple qualified target representations require an explicit rule selection",
+            )
+        } else {
+            (
+                "target_capability.explicit_carrier_selection_required",
+                "the target carrier requires an explicit selection",
+            )
+        };
         return Ok(field_result(
             &input,
             CompatibilityStatus::NeedsConfiguration,
             candidate.qualification,
             candidate.risk,
-            "target_capability.multiple_candidates",
-            "multiple qualified target representations require an explicit rule selection",
+            code,
+            message,
             candidates,
             None,
             Some(CompatibilityFailure::new(
                 FailureClass::InvalidInput,
-                "target_capability.multiple_candidates",
+                code,
                 FailurePhase::PlanConstruction,
-                "multiple qualified target representations require an explicit rule selection",
+                message,
             )),
         ));
     }
 
-    let candidate = candidates.into_iter().next().expect("candidate exists");
+    let candidate = candidates.remove(preferred_native.unwrap_or(0));
     let capability = input
         .manifest
         .capabilities
@@ -5589,7 +5759,14 @@ fn plan_target_representation(
                 .get("target_padding")
                 .or_else(|| representation.parameters.get("target_padding"))
                 .cloned()
-                .unwrap_or_else(|| source_padding.clone());
+                .filter(|padding| padding != "auto")
+                .unwrap_or_else(|| {
+                    if target_length.is_multiple_of(8) {
+                        "none".into()
+                    } else {
+                        "zero".into()
+                    }
+                });
             target_repr
                 .parameters
                 .insert("conversion_kind".into(), "bit_string".into());
@@ -5902,6 +6079,7 @@ fn mysql_spatial_native_type(native_type: &str) -> bool {
             | "multilinestring"
             | "multipolygon"
             | "geometrycollection"
+            | "geomcollection"
     )
 }
 
@@ -6193,6 +6371,26 @@ fn build_field_plan(
         candidate,
     });
     let mut planning_parameters = parameters.clone();
+    if matches!(
+        input.source_field.logical_type,
+        LogicalType::BitString { .. } | LogicalType::VariableBitString { .. }
+    ) && let Some(source_order) = input
+        .source_type_mapping
+        .value_representation
+        .get("bit_order")
+    {
+        planning_parameters.insert("source_bit_order".into(), source_order.clone());
+    }
+    if matches!(
+        input.source_field.logical_type,
+        LogicalType::BitString { .. } | LogicalType::VariableBitString { .. }
+    ) && let Some(source_padding) = input
+        .source_type_mapping
+        .value_representation
+        .get("bit_padding")
+    {
+        planning_parameters.insert("source_padding".into(), source_padding.clone());
+    }
     planning_parameters.insert(
         "source_native_type".into(),
         input.source_field.native_type.clone(),
@@ -7030,6 +7228,18 @@ fn target_representation_matches_binding(
         return matches!(target.logical_type, LogicalType::Spatial { .. });
     }
     match (capability_native.as_str(), &target.logical_type) {
+        ("bit", LogicalType::BitString { .. } | LogicalType::VariableBitString { .. })
+            if capability
+                .target
+                .parameters
+                .get("target_padding")
+                .is_some_and(|padding| padding == "auto") =>
+        {
+            let native = target.native_type.trim().to_ascii_lowercase();
+            native.starts_with("bit(")
+                || native.starts_with("bit varying(")
+                || native.starts_with("varbit(")
+        }
         ("enum", LogicalType::Enum { .. }) => target
             .native_type
             .trim_start()
@@ -7049,6 +7259,17 @@ fn candidate_target(
     target: &FieldDefinition,
 ) -> TargetRepresentation {
     let mut representation = capability.target.clone();
+    if representation
+        .parameters
+        .get("target_padding")
+        .is_some_and(|padding| padding == "auto")
+        && matches!(
+            target.logical_type,
+            LogicalType::BitString { .. } | LogicalType::VariableBitString { .. }
+        )
+    {
+        representation.native_type = target.native_type.clone();
+    }
     if matches!(
         representation.native_type.to_ascii_lowercase().as_str(),
         "enum" | "set"
@@ -7082,6 +7303,29 @@ fn candidate_target(
 
 fn is_explicit_template(capability: &CapabilityEntry) -> bool {
     capability.target.parameters.contains_key("conversion_kind")
+}
+
+fn explicit_carrier_candidate(candidate: &TargetTypeCandidate) -> bool {
+    matches!(
+        candidate
+            .target
+            .parameters
+            .get("conversion_kind")
+            .map(String::as_str),
+        Some("logical_value_json" | "source_representation")
+    )
+}
+
+fn preferred_exact_native_candidate(candidates: &[TargetTypeCandidate]) -> Option<usize> {
+    let index = candidates.iter().position(|candidate| {
+        candidate.qualification == QualificationLevel::Exact
+            && !explicit_carrier_candidate(candidate)
+    })?;
+    candidates
+        .iter()
+        .enumerate()
+        .all(|(other, candidate)| other == index || explicit_carrier_candidate(candidate))
+        .then_some(index)
 }
 
 fn is_key_like(field: &FieldDefinition) -> bool {
@@ -7178,7 +7422,7 @@ fn explicit_template_matches_binding(
                     .parameters
                     .get("target_storage")
                     .is_some_and(|storage| !storage.is_empty())
-                && selected_rule.is_some_and(|rule| rule.id == capability.rule.id)
+                && selected_rule.is_none_or(|rule| rule.id == capability.rule.id)
         }
         Some("source_representation") => {
             has_source_representation_evidence
@@ -7192,7 +7436,7 @@ fn explicit_template_matches_binding(
                     .parameters
                     .get("target_storage")
                     .is_some_and(|storage| !storage.is_empty())
-                && selected_rule.is_some_and(|rule| rule.id == capability.rule.id)
+                && selected_rule.is_none_or(|rule| rule.id == capability.rule.id)
         }
         _ => false,
     }
@@ -7211,6 +7455,7 @@ fn exact_candidate_matches_binding(
             source.logical_type,
             LogicalType::Binary { .. }
                 | LogicalType::BitString { .. }
+                | LogicalType::VariableBitString { .. }
                 | LogicalType::Spatial { .. }
                 | LogicalType::Array { .. }
                 | LogicalType::Struct { .. }
@@ -7255,6 +7500,14 @@ fn exact_candidate_matches_binding(
             &target.logical_type,
             LogicalType::BitString {
                 length: target_length,
+            } if source_length == target_length
+        ),
+        LogicalType::VariableBitString {
+            max_length: source_length,
+        } => matches!(
+            &target.logical_type,
+            LogicalType::VariableBitString {
+                max_length: target_length,
             } if source_length == target_length
         ),
         LogicalType::Spatial {
@@ -7368,6 +7621,13 @@ fn capability_matches_source(capability: &CapabilityEntry, source: &LogicalType)
         (LogicalType::Float { bits: 0 }, LogicalType::Float { bits }) => {
             matches!(bits, 32 | 64)
         }
+        (LogicalType::BitString { length: u64::MAX }, LogicalType::BitString { length }) => {
+            *length > 0
+        }
+        (
+            LogicalType::BitString { length: u64::MAX },
+            LogicalType::VariableBitString { max_length },
+        ) => max_length.is_none_or(|length| length > 0),
         (
             LogicalType::Text { charset, .. },
             LogicalType::Text {
