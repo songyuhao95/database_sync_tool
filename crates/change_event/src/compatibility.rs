@@ -4783,6 +4783,11 @@ pub fn explain_compatibility(
         .capabilities
         .iter()
         .filter(|capability| {
+            input.options.selected_rule.as_ref().is_none_or(|selected| {
+                selected.id == capability.rule.id && selected.version == capability.rule.version
+            })
+        })
+        .filter(|capability| {
             capability_matches_source(capability, &input.source_field.logical_type)
                 && capability.rule.qualification != QualificationLevel::Unsupported
         })
@@ -4790,11 +4795,6 @@ pub fn explain_compatibility(
             probe_qualifies_capability(input.options.target_probe.as_ref(), capability)
         })
         .filter(|capability| target_representation_matches_binding(capability, &input.target_field))
-        .filter(|capability| {
-            input.options.selected_rule.as_ref().is_none_or(|selected| {
-                selected.id == capability.rule.id && selected.version == capability.rule.version
-            })
-        })
         .filter(|capability| {
             supports_declared(
                 &capability.supported_operations,
@@ -5145,6 +5145,11 @@ pub fn explain_field_compatibility(
         .capabilities
         .iter()
         .filter(|capability| {
+            input.options.selected_rule.as_ref().is_none_or(|selected| {
+                selected.id == capability.rule.id && selected.version == capability.rule.version
+            })
+        })
+        .filter(|capability| {
             capability_matches_source(capability, &input.source_field.logical_type)
                 && capability.rule.qualification != QualificationLevel::Unsupported
         })
@@ -5152,11 +5157,6 @@ pub fn explain_field_compatibility(
             probe_qualifies_capability(input.options.target_probe.as_ref(), capability)
         })
         .filter(|capability| target_representation_matches_binding(capability, &input.target_field))
-        .filter(|capability| {
-            input.options.selected_rule.as_ref().is_none_or(|selected| {
-                selected.id == capability.rule.id && selected.version == capability.rule.version
-            })
-        })
         .filter(|capability| {
             supports_declared(
                 &capability.supported_operations,

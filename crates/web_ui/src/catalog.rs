@@ -243,9 +243,17 @@ impl Store {
                     .block_on(PgConnection::connect_with(&options))
                     .map_err(|_| Error::Invalid("数据库连接失败，请检查实例地址和对应账号权限"))?;
                 let mut conn = conn;
-                let source_type_catalog = runtime
-                    .block_on(postgresql_15::source_type_catalog(&mut conn))
-                    .map_err(|_| Error::Invalid("读取 PostgreSQL 类型目录失败，请检查账号权限"))?;
+                let source_type_catalog = if role == EndpointRole::Source {
+                    Some(
+                        runtime
+                            .block_on(postgresql_15::source_type_catalog(&mut conn))
+                            .map_err(|_| {
+                                Error::Invalid("读取 PostgreSQL 类型目录失败，请检查账号权限")
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 Ok::<_, Error>((runtime, conn, metadata, source_type_catalog))
             })
             .join()
@@ -255,7 +263,7 @@ impl Store {
                 server_uuid: format!("postgresql:{id}"),
                 database: Some(database),
                 metadata: Metadata::Postgresql(metadata),
-                source_type_catalog: Some(source_type_catalog),
+                source_type_catalog,
                 host: probe_host,
                 port,
                 kind: probe_kind,
@@ -335,7 +343,7 @@ impl Store {
 
 impl CatalogConnection {
     pub(crate) fn probe_target(
-        &self,
+        &mut self,
         schema: &str,
         table: &str,
         column: &str,
@@ -375,26 +383,15 @@ impl CatalogConnection {
                 column,
             ),
             ("postgresql", target_version) => {
-                let database = self
-                    .database
-                    .as_deref()
-                    .ok_or(Error::Invalid("PostgreSQL 目的端缺少连接数据库"))?;
-                let config = postgresql_15::TargetConfig::new(
-                    &self.host,
-                    database,
-                    &self.username,
-                    &self.password,
-                )
-                .with_port(self.port);
-                let runtime = match &self.conn {
-                    CatalogBackend::Postgresql { runtime, .. } => {
-                        runtime.as_ref().expect("catalog runtime")
+                let (runtime, conn) = match &mut self.conn {
+                    CatalogBackend::Postgresql { runtime, conn } => {
+                        (runtime.as_ref().expect("catalog runtime"), conn)
                     }
                     CatalogBackend::Mysql(_) => return Err(Error::Internal),
                 };
                 postgres_block_on(runtime, async {
-                    postgresql_15::probe_target_for_version(
-                        &config,
+                    postgresql_15::probe_target_on_connection_for_version(
+                        conn,
                         schema,
                         table,
                         column,

@@ -22,8 +22,9 @@ pub use sql::{
     ApplyResult, CAPABILITY_MANIFEST, CAPABILITY_MANIFEST_16, CAPABILITY_MANIFEST_17, Parameter,
     SinkAdapter, SnapshotSql, SqlTransaction, TargetConfig, capability_manifest,
     capability_manifest_for_version, classify_apply_error, commit_outcome_unknown, execute,
-    execute_for_version, probe_target, probe_target_for_version, snapshot_sql, sql,
-    sql_for_version, sql_with_plans, sql_with_plans_for_version,
+    execute_for_version, probe_target, probe_target_for_version,
+    probe_target_on_connection_for_version, snapshot_sql, sql, sql_for_version, sql_with_plans,
+    sql_with_plans_for_version,
 };
 pub use type_mapping::{
     MAPPING_VERSION, MAPPING_VERSION_16, MAPPING_VERSION_17, SourceExtension, SourceTypeCatalog,

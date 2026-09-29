@@ -2169,21 +2169,55 @@ pub async fn probe_target_for_version(
     target_version: &str,
 ) -> io::Result<TargetCapabilityProbe> {
     let mut connection = connect_for_version(config, target_version).await?;
+    probe_target_on_connection_for_version(&mut connection, schema, table, column, target_version)
+        .await
+}
+
+/// Probe another column through an existing catalog connection. Keep the
+/// session profile identical to the Sink connection used for apply.
+pub async fn probe_target_on_connection_for_version(
+    connection: &mut PgConnection,
+    schema: &str,
+    table: &str,
+    column: &str,
+    target_version: &str,
+) -> io::Result<TargetCapabilityProbe> {
     let server_version: String = sqlx::query_scalar("SHOW server_version")
-        .fetch_one(&mut connection)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(io::Error::other)?;
+    if !server_version
+        .split('.')
+        .next()
+        .is_some_and(|major| major == target_version)
+    {
+        return Err(capability_failure(format!(
+            "postgresql_{target_version} cannot probe target version {server_version}"
+        )));
+    }
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(io::Error::other)?;
+    sqlx::query("SET TIME ZONE 'UTC'")
+        .execute(&mut *connection)
+        .await
+        .map_err(io::Error::other)?;
+    sqlx::query("SET standard_conforming_strings = on")
+        .execute(&mut *connection)
         .await
         .map_err(io::Error::other)?;
     let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
-        .fetch_one(&mut connection)
+        .fetch_one(&mut *connection)
         .await
         .map_err(io::Error::other)?;
     let timezone: String = sqlx::query_scalar("SHOW TIME ZONE")
-        .fetch_one(&mut connection)
+        .fetch_one(&mut *connection)
         .await
         .map_err(io::Error::other)?;
     let standard_conforming_strings: String =
         sqlx::query_scalar("SHOW standard_conforming_strings")
-            .fetch_one(&mut connection)
+            .fetch_one(&mut *connection)
             .await
             .map_err(io::Error::other)?;
     let row = sqlx::query(
@@ -2201,7 +2235,7 @@ pub async fn probe_target_for_version(
     .bind(schema)
     .bind(table)
     .bind(column)
-    .fetch_optional(&mut connection)
+    .fetch_optional(&mut *connection)
     .await
     .map_err(io::Error::other)?
     .ok_or_else(|| capability_failure("target table or column was not found"))?;
@@ -2211,7 +2245,7 @@ pub async fn probe_target_for_version(
     let type_kind: String = row.try_get("type_kind").map_err(io::Error::other)?;
     let type_schema: String = row.try_get("type_schema").map_err(io::Error::other)?;
     let extensions = sqlx::query("SELECT extname, extversion FROM pg_extension ORDER BY extname")
-        .fetch_all(&mut connection)
+        .fetch_all(&mut *connection)
         .await
         .map_err(io::Error::other)?
         .into_iter()
@@ -2303,7 +2337,7 @@ pub async fn probe_target_for_version(
     );
     Ok(TargetCapabilityProbe::new(
         target_build,
-        &config.database,
+        &database,
         table,
         column,
         metadata,

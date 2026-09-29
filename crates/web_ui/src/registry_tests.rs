@@ -14,6 +14,200 @@ use change_event::{
 use std::collections::BTreeMap;
 
 #[test]
+fn mysql57_inventory_types_can_plan_a_user_selected_carrier_for_each_sink() {
+    let inventory: serde_json::Value =
+        serde_json::from_str(include_str!("../../../scripts/type-inventory.json")).unwrap();
+    let source_connector = SourceRegistry.find("mysql", "5.7").unwrap();
+    let source_build = ServerBuildIdentity::new("mysql", "oracle", "5.7.44", "mysql-5.7.44");
+    let results = std::thread::scope(|scope| {
+        let handles = SinkRegistry
+            .all()
+            .map(|sink_connector| {
+                let inventory = &inventory;
+                let source_build = &source_build;
+                scope.spawn(move || {
+                    let sink_id = format!(
+                        "{}_{}",
+                        sink_connector.identity.kind,
+                        sink_connector.identity.version.replace('.', "_")
+                    );
+                    let target_build = ServerBuildIdentity::new(
+                        sink_connector.identity.kind,
+                        "test",
+                        sink_connector.identity.version,
+                        "test-build",
+                    );
+                    let manifest = sink_connector.structured_manifest(target_build.clone());
+                    let mut failures = Vec::new();
+                    let mut qualified = 0;
+                    for entry in inventory["types"].as_array().unwrap() {
+                        let profile = &inventory["native_declaration_profiles"]
+                            [entry["declaration_profile"].as_str().unwrap()];
+                        if !profile["connectors"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|connector| connector == "mysql_5_7")
+                        {
+                            continue;
+                        }
+                        let type_id = entry["id"].as_str().unwrap();
+                        let native_type = profile["examples"][0].as_str().unwrap();
+                        let textual = ["char", "text", "enum", "set"]
+                            .into_iter()
+                            .any(|fragment| native_type.contains(fragment));
+                        let source_column = CatalogColumn {
+                            name: "payload".into(),
+                            column_type: native_type.into(),
+                            nullable: true,
+                            extra: String::new(),
+                            collation: textual.then(|| "utf8mb4_unicode_ci".into()),
+                            default_value: None,
+                        };
+                        let source = CatalogTable {
+                            schema: "CDC_test".into(),
+                            name: "type_route".into(),
+                            engine: "InnoDB".into(),
+                            primary_key: vec!["id".into()],
+                            columns: vec![source_column.clone()],
+                        };
+                        let mut planned = false;
+                        for carrier in manifest.capabilities.iter().filter(|capability| {
+                            matches!(
+                                capability
+                                    .target
+                                    .parameters
+                                    .get("conversion_kind")
+                                    .map(String::as_str),
+                                Some("logical_value_json" | "source_representation")
+                            )
+                        }) {
+                            let target_native = carrier.target.native_type.clone();
+                            let sink_column = CatalogColumn {
+                                name: "payload".into(),
+                                column_type: target_native.clone(),
+                                nullable: true,
+                                extra: String::new(),
+                                collation: (sink_connector.identity.kind == "mysql"
+                                    && target_native.contains("text"))
+                                .then(|| "utf8mb4_unicode_ci".into()),
+                                default_value: None,
+                            };
+                            let sink = CatalogTable {
+                                schema: "CDC_test".into(),
+                                name: "type_route".into(),
+                                engine: if sink_connector.identity.kind == "mysql" {
+                                    "InnoDB"
+                                } else {
+                                    "PostgreSQL"
+                                }
+                                .into(),
+                                primary_key: vec!["id".into()],
+                                columns: vec![sink_column.clone()],
+                            };
+                            let probe = TargetCapabilityProbe::new(
+                                target_build.clone(),
+                                "CDC_test",
+                                "type_route",
+                                "payload",
+                                TargetColumnMetadata::new(catalog_fingerprint(&sink))
+                                    .with_native_type(target_native),
+                                [CapabilityProbeEntry::new(
+                                    &carrier.code,
+                                    CapabilityProbeStatus::Qualified,
+                                )],
+                                [],
+                                TargetSessionProfile::new(
+                                    "test-session",
+                                    std::iter::empty::<(String, String)>(),
+                                ),
+                            );
+                            let selection = BTreeMap::from([
+                                ("__rule_id".into(), carrier.rule.id.clone()),
+                                ("__rule_version".into(), carrier.rule.version.clone()),
+                            ]);
+                            let plan = |confirmations: &[RiskConfirmation]| {
+                                field_compatibility_with_source_evidence_and_target_probe(
+                                    source_connector,
+                                    sink_connector,
+                                    &source,
+                                    &sink,
+                                    &source_column,
+                                    &sink_column,
+                                    "inventory-route",
+                                    "inventory-route:r1",
+                                    Some(source_build.clone()),
+                                    Some(target_build.clone()),
+                                    None,
+                                    None,
+                                    &selection,
+                                    confirmations,
+                                    Some(&probe),
+                                )
+                            };
+                            let Ok(first) = plan(&[]) else { continue };
+                            let Some(pending) = first.plan.as_ref() else {
+                                continue;
+                            };
+                            let final_result = if first.status
+                                == CompatibilityStatus::NeedsConfirmation
+                            {
+                                let confirmation = RiskConfirmation {
+                                    source_field_lineage: pending.source_field.lineage_id.clone(),
+                                    target_field_lineage: pending.target_field.lineage_id.clone(),
+                                    rule: pending.rule.clone(),
+                                    plan_digest: pending.plan_digest.clone(),
+                                    actor: "qualification".into(),
+                                    confirmed_at: "2026-09-28T00:00:00Z".into(),
+                                    reason: Some("carrier limitations acknowledged".into()),
+                                };
+                                plan(&[confirmation]).ok()
+                            } else {
+                                Some(first)
+                            };
+                            if final_result.is_some_and(|result| {
+                                result.status == CompatibilityStatus::Compatible
+                                    && result.plan.is_some_and(|plan| plan.verify_digest())
+                            }) {
+                                planned = true;
+                                break;
+                            }
+                        }
+                        if planned {
+                            qualified += 1;
+                        } else {
+                            failures.push(format!("{type_id}@mysql_5_7>{sink_id} ({native_type})"));
+                        }
+                    }
+                    eprintln!(
+                        "{sink_id}: {qualified} qualified, {} missing",
+                        failures.len()
+                    );
+                    (qualified, failures)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("sink qualification thread"))
+            .collect::<Vec<_>>()
+    });
+    let qualified = results
+        .iter()
+        .map(|(qualified, _)| qualified)
+        .sum::<usize>();
+    let failures = results
+        .into_iter()
+        .flat_map(|(_, failures)| failures)
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "{qualified} carrier paths qualified; missing: {}",
+        failures.join(", ")
+    );
+}
+
+#[test]
 fn source_and_sink_registries_publish_independent_connector_catalogs() {
     let sources = SourceRegistry;
     let sinks = SinkRegistry;
