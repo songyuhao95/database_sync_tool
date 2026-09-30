@@ -846,22 +846,60 @@ fn mapping_version(version: &str) -> String {
 
 fn normalize(native_type: &str, version: &str) -> Result<String, SourceTypeMappingError> {
     let raw = native_type.trim();
-    let lower = raw.to_ascii_lowercase();
-    if raw.is_empty() || raw.contains(';') || raw.contains('\0') {
+    if raw.is_empty() || raw.contains('\0') {
         return Err(SourceTypeMappingError::invalid(
             version,
             "native type declaration is empty or contains forbidden syntax",
         ));
     }
-    if lower.starts_with("enum(") {
+    if raw.to_ascii_lowercase().starts_with("enum(") {
         return Ok(raw.to_owned());
     }
-    Ok(lower
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace("[ ]", "[]")
-        .replace(" []", "[]"))
+    let mut normalized = String::new();
+    let mut characters = raw.chars().peekable();
+    let mut quoted = false;
+    let mut pending_space = false;
+    while let Some(character) = characters.next() {
+        if character == '"' {
+            if pending_space && !normalized.is_empty() && !normalized.ends_with(['.', '(']) {
+                normalized.push(' ');
+            }
+            pending_space = false;
+            normalized.push('"');
+            if quoted && characters.peek() == Some(&'"') {
+                normalized.push('"');
+                characters.next();
+            } else {
+                quoted = !quoted;
+            }
+        } else if quoted {
+            normalized.push(character);
+        } else if character == ';' {
+            return Err(SourceTypeMappingError::invalid(
+                version,
+                "native type declaration contains forbidden syntax",
+            ));
+        } else if character.is_ascii_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space
+                && !normalized.is_empty()
+                && !matches!(character, '.' | ')' | '[' | ']' | ',')
+                && !normalized.ends_with(['.', '(', '['])
+            {
+                normalized.push(' ');
+            }
+            pending_space = false;
+            normalized.push(character.to_ascii_lowercase());
+        }
+    }
+    if quoted {
+        return Err(SourceTypeMappingError::invalid(
+            version,
+            "native type declaration has an unterminated quoted identifier",
+        ));
+    }
+    Ok(normalized)
 }
 
 fn base_name(native_type: &str) -> &str {
@@ -1215,19 +1253,79 @@ fn array_declaration(native_type: &str) -> Option<(&str, u8)> {
     (dimensions > 0).then_some((base, dimensions))
 }
 
+fn catalog_identifier(raw: &str, version: &str) -> Result<String, SourceTypeMappingError> {
+    let raw = raw.trim();
+    if let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        if inner.is_empty() || inner.replace("\"\"", "").contains('"') {
+            return Err(SourceTypeMappingError::invalid(
+                version,
+                "PostgreSQL type contains a malformed quoted identifier",
+            ));
+        }
+        Ok(inner.replace("\"\"", "\""))
+    } else if raw.is_empty() || raw.contains('"') || raw.chars().any(char::is_whitespace) {
+        Err(SourceTypeMappingError::invalid(
+            version,
+            "PostgreSQL type contains a malformed identifier",
+        ))
+    } else {
+        Ok(raw.to_owned())
+    }
+}
+
 fn find_definition<'a>(
     native_type: &str,
     catalog: &'a SourceTypeCatalog,
     version: &str,
 ) -> Result<&'a SourceTypeDefinition, SourceTypeMappingError> {
-    let (schema, name) = native_type
-        .split_once('.')
-        .map_or((None, native_type), |(schema, name)| (Some(schema), name));
-    let matches = catalog.types.iter().filter(|definition| {
-        definition.name.eq_ignore_ascii_case(name)
-            && schema.is_none_or(|schema| definition.schema.eq_ignore_ascii_case(schema))
-    });
-    let mut matches = matches.peekable();
+    // A quoted identifier may contain dots and preserve mixed case. Split
+    // only at an unquoted separator, then match catalog names exactly: an
+    // unquoted SQL identifier was already folded to lower case by normalize.
+    let mut parts = vec![String::new()];
+    let mut characters = native_type.chars().peekable();
+    let mut quoted = false;
+    while let Some(character) = characters.next() {
+        if character == '"' {
+            parts.last_mut().expect("one part").push('"');
+            if quoted && characters.peek() == Some(&'"') {
+                parts.last_mut().expect("one part").push('"');
+                characters.next();
+            } else {
+                quoted = !quoted;
+            }
+        } else if character == '.' && !quoted {
+            parts.push(String::new());
+        } else {
+            parts.last_mut().expect("one part").push(character);
+        }
+    }
+    if quoted || parts.len() > 2 {
+        return Err(SourceTypeMappingError::invalid(
+            version,
+            "PostgreSQL type has an invalid qualified name",
+        ));
+    }
+    let (schema, name) = if parts.len() == 2 {
+        (
+            Some(catalog_identifier(&parts[0], version)?),
+            catalog_identifier(&parts[1], version)?,
+        )
+    } else {
+        (None, catalog_identifier(&parts[0], version)?)
+    };
+    let mut matches = catalog
+        .types
+        .iter()
+        .filter(|definition| {
+            definition.name == name
+                && schema
+                    .as_ref()
+                    .is_none_or(|schema| &definition.schema == schema)
+        })
+        .peekable();
     let Some(definition) = matches.next() else {
         return Err(SourceTypeMappingError::missing_catalog(
             version,
@@ -2164,6 +2262,51 @@ mod tests {
             Some("environment-1")
         );
         assert!(qualified.source_definition_fingerprint.is_some());
+    }
+
+    #[test]
+    fn quoted_catalog_names_preserve_case_dots_and_escaped_quotes() {
+        let catalog = SourceTypeCatalog::new([
+            SourceTypeDefinition::enum_type(8_100, "CDC_test", "CamelMood", ["ready"]),
+            SourceTypeDefinition::array(8_101, "CDC_test", "_CamelMood", 8_100),
+            SourceTypeDefinition::enum_type(8_102, "CDC.test", "mood.dot", ["ready"]),
+            SourceTypeDefinition::enum_type(8_103, "we\"ird", "Name\"Quoted", ["ready"]),
+            SourceTypeDefinition::enum_type(8_104, "public", "mood", ["ready"]),
+        ]);
+        for declaration in [
+            "\"CDC_test\".\"CamelMood\"",
+            "\"CDC.test\".\"mood.dot\"",
+            "\"we\"\"ird\".\"Name\"\"Quoted\"",
+            "PUBLIC.MOOD",
+        ] {
+            assert!(
+                matches!(
+                    source_type_mapping_with_catalog(declaration, &catalog)
+                        .unwrap()
+                        .logical_type,
+                    LogicalType::Enum { .. }
+                ),
+                "{declaration}"
+            );
+        }
+        assert!(matches!(
+            source_type_mapping_with_catalog("\"CDC_test\".\"CamelMood\"[]", &catalog)
+                .unwrap()
+                .logical_type,
+            LogicalType::Array { .. }
+        ));
+        for invalid in [
+            "CDC_test.CamelMood",
+            "\"cdc_test\".\"CamelMood\"",
+            "\"CDC_test\".\"camelmood\"",
+            "\"CDC_test\".\"CamelMood",
+            "\"CDC_test\".\"CamelMood\"; DROP TABLE events",
+        ] {
+            assert!(
+                source_type_mapping_with_catalog(invalid, &catalog).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

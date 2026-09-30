@@ -915,6 +915,45 @@ fn verified_web_plan_evidence(evidence: &Value) -> bool {
             || evidence["risk_confirmation_verified"] == true)
 }
 
+fn dynamic_web_plan_coverage(
+    evidence_registry: &Value,
+    type_id: &str,
+    source_id: &str,
+    sink_ids: &[String],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut qualified = Vec::new();
+    let mut missing = Vec::new();
+    let mut evidence = Vec::new();
+    for sink_id in sink_ids {
+        let ids = evidence_registry["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|record| {
+                record["type_id"] == type_id
+                    && record["source_connector_id"] == source_id
+                    && record["sink_connector_id"] == sink_id.as_str()
+                    && record["axis"] == "web.plan"
+            })
+            .filter_map(|record| record["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        if evidence_axis_pass(
+            &json!({"status": "PASS", "evidence": ids}),
+            evidence_registry,
+            type_id,
+            source_id,
+            Some(sink_id),
+            "web.plan",
+        ) {
+            qualified.push(sink_id.clone());
+            evidence.extend(ids);
+        } else {
+            missing.push(sink_id.clone());
+        }
+    }
+    (qualified, missing, evidence)
+}
+
 fn merge_live_type_evidence_from_directory(
     inventory: &mut Value,
     directory: &Path,
@@ -2168,10 +2207,22 @@ fn type_inventory_coverage() -> Value {
             } else {
                 "REQUIRES_DYNAMIC_TYPE_SINK_QUALIFICATION"
             };
+            let (web_plan_qualified_sinks, web_plan_missing_sinks, web_plan_evidence) =
+                dynamic_web_plan_coverage(
+                    evidence_registry,
+                    &dynamic_type_id,
+                    connector_id,
+                    &versions(),
+                );
+            let web_qualification_status = if web_plan_missing_sinks.is_empty() {
+                "PASS"
+            } else {
+                "REQUIRES_DYNAMIC_TYPE_WEB_QUALIFICATION"
+            };
             let class_status = if is_catalog_mapping_class && has_catalog_mapping {
                 "PASS"
             } else if fixture_status == "PASS" && sink_qualification_status == "PASS" {
-                "REQUIRES_DYNAMIC_TYPE_WEB_QUALIFICATION"
+                web_qualification_status
             } else if fixture_status == "PASS" {
                 "REQUIRES_DYNAMIC_TYPE_SINK_QUALIFICATION"
             } else {
@@ -2194,6 +2245,10 @@ fn type_inventory_coverage() -> Value {
                 "fixture_evidence": evidence_ids,
                 "sink_qualification_status": sink_qualification_status,
                 "sink_qualification_evidence": dynamic_sink_evidence,
+                "web_qualification_status": web_qualification_status,
+                "web_plan_qualified_sinks": web_plan_qualified_sinks,
+                "web_plan_missing_sinks": web_plan_missing_sinks,
+                "web_plan_evidence": web_plan_evidence,
                 "catalog_mapping_status": catalog_mapping_status,
                 "catalog_mapping_evidence": catalog_mapping_ids,
                 "catalog_mapping_receipts": catalog_mapping_receipts,
@@ -4279,6 +4334,87 @@ fn merged_sink_outcomes_use_the_qualification_gate_field_and_reject_conflicts() 
         merge_sink_outcome(&mut sink, "SOURCE_REPRESENTATION_PRESERVED");
     }));
     assert!(conflicting.is_err());
+}
+
+#[test]
+fn dynamic_type_web_gate_counts_only_verified_sink_routes() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .expect("workspace exists");
+    let directory = workspace.join("target").join(format!(
+        "dynamic-web-evidence-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact_path = directory
+        .strip_prefix(&workspace)
+        .unwrap()
+        .join("receipt.json")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let run_id = "dynamic-web-test";
+    let verified_id = format!("dynamic:postgresql.enums@postgresql_15>mysql_5_7:web.plan:{run_id}");
+    let unverified_id =
+        format!("dynamic:postgresql.enums@postgresql_15>mysql_8_0:web.plan:{run_id}");
+    let web_record = |id: String, sink: &str, verified: bool| {
+        json!({
+            "id": id,
+            "type_id": "dynamic:postgresql.enums",
+            "source_connector_id": "postgresql_15",
+            "sink_connector_id": sink,
+            "axis": "web.plan",
+            "status": "PASS",
+            "run_id": run_id,
+            "verification": if verified { "web_ui.preview_save_start_gate" } else { "synthetic" },
+            "preview_status": "COMPATIBLE",
+            "save_status": "PASS",
+            "start_gate_status": "PASS",
+            "plan_digest": "a".repeat(64),
+            "target_probe_digest": "b".repeat(64),
+            "selected_rule_id": "test-carrier",
+            "target_storage_mode": "logical_value_json_carrier",
+            "risk_confirmation_required": true,
+            "risk_confirmation_verified": true
+        })
+    };
+    let artifact = json!({
+        "schema": "cdc.type_qualification_evidence_report.v1",
+        "run_id": run_id,
+        "suite_id": "web_ui.dynamic_enum_carrier_live",
+        "artifact_path": artifact_path,
+        "assertions": ["real preview, save, start, DML and target readback"],
+        "evidence": [
+            web_record(verified_id, "mysql_5_7", true),
+            web_record(unverified_id, "mysql_8_0", false)
+        ]
+    });
+    std::fs::write(
+        directory.join("receipt.json"),
+        serde_json::to_vec_pretty(&artifact).unwrap(),
+    )
+    .unwrap();
+    let mut inventory = type_inventory();
+    merge_live_type_evidence_from_directory(&mut inventory, &directory, &workspace);
+    let registry = &inventory["per_type_qualification"]["evidence_registry"];
+    let (qualified, missing, evidence) = dynamic_web_plan_coverage(
+        registry,
+        "dynamic:postgresql.enums",
+        "postgresql_15",
+        &versions(),
+    );
+    assert_eq!(qualified, ["mysql_5_7"]);
+    assert_eq!(missing.len(), 5);
+    assert!(missing.contains(&"mysql_8_0".to_owned()));
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(
+        inventory["per_type_qualification"]["ignored_synthetic_web_evidence"],
+        1
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

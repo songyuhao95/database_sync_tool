@@ -1007,3 +1007,390 @@ fn live_postgresql15_target_schema_change_invalidates_saved_plan() {
     assert!(matches!(start_result, Err(Error::Conflict(_))));
     assert_eq!(status_after_start, "stale");
 }
+
+#[test]
+#[ignore = "requires live PostgreSQL 15 and MySQL 8.0; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql15_enum_to_mysql80_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(15, "8.0");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL 16 and MySQL 8.0; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql16_enum_to_mysql80_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(16, "8.0");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL 17 and MySQL 8.0; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql17_enum_to_mysql80_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(17, "8.0");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL 15 and MySQL 5.7; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql15_enum_to_mysql57_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(15, "5.7");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL 16 and MySQL 5.7; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql16_enum_to_mysql57_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(16, "5.7");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL 17 and MySQL 5.7; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql17_enum_to_mysql57_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(17, "5.7");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL 15 and MySQL 8.4; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql15_enum_to_mysql84_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(15, "8.4");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL 16 and MySQL 8.4; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql16_enum_to_mysql84_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(16, "8.4");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL 17 and MySQL 8.4; creates isolated type, table, publication membership, and local SQLite"]
+fn live_web_postgresql17_enum_to_mysql84_carrier() {
+    live_web_postgresql_enum_to_mysql_carrier(17, "8.4");
+}
+
+fn live_web_postgresql_enum_to_mysql_carrier(major: u16, mysql_version: &str) {
+    use sha2::{Digest, Sha256};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let table = format!("web_pg_enum_{nonce}");
+    let type_name = format!("web_mood_{nonce}");
+    let prefix = if major == 15 {
+        "PG_CDC".to_owned()
+    } else {
+        format!("PG_CDC{major}")
+    };
+    let pg_env = |suffix: &str| std::env::var(format!("{prefix}_{suffix}")).unwrap();
+    let publication_name = format!("cdc_pg{major}_demo");
+    let pg_host = pg_env("HOST");
+    let pg_port = pg_env("PORT").parse::<u16>().unwrap();
+    let pg_password = pg_env("TEST_PASSWORD");
+    let pg_admin = pg_env("ADMIN_USER");
+    let pg_reader = pg_env("READER_USER");
+    let pg_writer = pg_env("WRITER_USER");
+    let mysql_host = std::env::var("CDC_MYSQL_HOST").unwrap();
+    let mysql_port_key = match mysql_version {
+        "5.7" => "CDC_MYSQL57_PORT",
+        "8.0" => "CDC_MYSQL80_PORT",
+        "8.4" => "CDC_MYSQL84_PORT",
+        _ => panic!("unsupported test MySQL version"),
+    };
+    let mysql_port = std::env::var(mysql_port_key)
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let mysql_reader_password = std::env::var("CDC_MYSQL_READER_PASSWORD").unwrap();
+    let mysql_writer_password = std::env::var("CDC_MYSQL_WRITER_PASSWORD").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let options = PgConnectOptions::new()
+        .host(&pg_host)
+        .port(pg_port)
+        .database("CDC_test")
+        .username(&pg_admin)
+        .password(&pg_password)
+        .ssl_mode(PgSslMode::Prefer);
+    let mut pg = runtime
+        .block_on(PgConnection::connect_with(&options))
+        .unwrap();
+    runtime.block_on(async {
+        pg.execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA IF NOT EXISTS \"CDC_test\";
+             CREATE TYPE \"CDC_test\".{type_name} AS ENUM ('calm','ready');
+             CREATE TABLE \"CDC_test\".{table}(id bigint PRIMARY KEY, mood \"CDC_test\".{type_name} NOT NULL);
+             GRANT USAGE ON SCHEMA \"CDC_test\" TO {pg_reader};
+             GRANT USAGE ON TYPE \"CDC_test\".{type_name} TO {pg_reader};
+             GRANT SELECT ON \"CDC_test\".{table} TO {pg_reader}"
+        )))).await
+    }).unwrap();
+    let publication: Option<bool> = runtime
+        .block_on(
+            sqlx::query_scalar("SELECT puballtables FROM pg_publication WHERE pubname=$1")
+                .bind(&publication_name)
+                .fetch_optional(&mut pg),
+        )
+        .unwrap();
+    let created_publication = publication.is_none();
+    if created_publication {
+        runtime
+            .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE PUBLICATION {publication_name} FOR TABLE \"CDC_test\".{table}"
+            )))))
+            .unwrap();
+    } else if publication == Some(false) {
+        let already_in_publication: bool = runtime.block_on(
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_publication_tables WHERE pubname=$1 AND schemaname='CDC_test' AND tablename=$2)"
+            ).bind(&publication_name).bind(&table).fetch_one(&mut pg),
+        ).unwrap();
+        if !already_in_publication {
+            runtime
+                .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ALTER PUBLICATION {publication_name} ADD TABLE \"CDC_test\".{table}"
+                )))))
+                .unwrap();
+        }
+    }
+    let mut mysql = Conn::new(
+        OptsBuilder::new()
+            .ip_or_hostname(Some(mysql_host.clone()))
+            .tcp_port(mysql_port)
+            .user(Some(std::env::var("CDC_MYSQL_WRITER_USER").unwrap()))
+            .pass(Some(mysql_writer_password.clone())),
+    )
+    .unwrap();
+    mysql
+        .query_drop("CREATE DATABASE IF NOT EXISTS CDC_test")
+        .unwrap();
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE CDC_test.{table}(id BIGINT PRIMARY KEY, mood JSON NULL) ENGINE=InnoDB"
+        ))
+        .unwrap();
+
+    let (_dir, store) = store();
+    let admin = store.login("admin", "admin", None).unwrap().session.user.id;
+    let mut source_input = instance_input();
+    source_input.name = format!("pg-enum-source-{nonce}");
+    source_input.host = pg_host;
+    source_input.port = pg_port;
+    source_input.kind = "postgresql".into();
+    source_input.version = major.to_string();
+    source_input.database = "CDC_test".into();
+    source_input.reader_username = pg_reader;
+    source_input.reader_password = Some(pg_password.clone());
+    source_input.writer_username = pg_writer;
+    source_input.writer_password = Some(pg_password);
+    let source_instance = store.save_instance(admin, None, source_input).unwrap();
+    let mut sink_input = instance_input();
+    sink_input.name = format!("pg-enum-target-{mysql_version}-{nonce}");
+    sink_input.host = mysql_host;
+    sink_input.port = mysql_port;
+    sink_input.version = mysql_version.into();
+    sink_input.reader_password = Some(mysql_reader_password);
+    sink_input.writer_password = Some(mysql_writer_password);
+    let sink_instance = store.save_instance(admin, None, sink_input).unwrap();
+    let draft_id = format!("pg-enum-{nonce}");
+    let preview_input = |parameters: BTreeMap<String, String>, confirmations| FieldPreviewInput {
+        draft_id: draft_id.clone(),
+        source_id: source_instance.id.clone(),
+        sink_id: sink_instance.id.clone(),
+        source_database: "CDC_test".into(),
+        sink_database: String::new(),
+        source_revision: 1,
+        sink_revision: 1,
+        schema: "CDC_test".into(),
+        table: table.clone(),
+        column: "mood".into(),
+        parameters,
+        confirmations,
+    };
+    let discovered = store
+        .preview_field(admin, preview_input(BTreeMap::new(), vec![]))
+        .unwrap();
+    let candidate = discovered
+        .available_candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str)
+                == Some("logical_value_json")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "Web must offer a tagged value carrier for a PostgreSQL enum: {}",
+                serde_json::to_string_pretty(&discovered).unwrap()
+            )
+        });
+    let parameters = BTreeMap::from([
+        ("__rule_id".into(), candidate.rule.id.clone()),
+        ("__rule_version".into(), candidate.rule.version.clone()),
+    ]);
+    let pending = store
+        .preview_field(admin, preview_input(parameters.clone(), vec![]))
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(
+        pending.status,
+        change_event::CompatibilityStatus::NeedsConfirmation
+    );
+    let pending_plan = pending.plan.unwrap();
+    let confirmation = change_event::RiskConfirmation {
+        source_field_lineage: pending_plan.source_field.lineage_id.clone(),
+        target_field_lineage: pending_plan.target_field.lineage_id.clone(),
+        rule: pending_plan.rule.clone(),
+        plan_digest: pending_plan.plan_digest.clone(),
+        actor: "admin".into(),
+        confirmed_at: "2026-09-29T00:00:00Z".into(),
+        reason: Some("tagged value carrier is not a native MySQL enum".into()),
+    };
+    let confirmed = store
+        .preview_field(
+            admin,
+            preview_input(parameters.clone(), vec![confirmation.clone()]),
+        )
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(
+        confirmed.status,
+        change_event::CompatibilityStatus::Compatible
+    );
+    let plan = confirmed.plan.unwrap();
+    let task_input = |confirmations| TaskInput {
+        draft_id: Some(draft_id.clone()),
+        name: format!("live PostgreSQL {major} enum to MySQL {mysql_version} carrier {nonce}"),
+        source_id: source_instance.id.clone(),
+        sink_id: sink_instance.id.clone(),
+        source_database: "CDC_test".into(),
+        sink_database: String::new(),
+        source_revision: 1,
+        sink_revision: 1,
+        start_mode: "auto".into(),
+        mappings: vec![TableMapping {
+            source_schema: "CDC_test".into(),
+            source_table: table.clone(),
+            sink_schema: "CDC_test".into(),
+            sink_table: table.clone(),
+            columns: vec!["id".into(), "mood".into()],
+            conversion_options: BTreeMap::from([("mood".into(), parameters.clone())]),
+        }],
+        confirmations,
+    };
+    assert!(store.create_task(admin, task_input(vec![])).is_err());
+    let task = store
+        .create_task(admin, task_input(vec![confirmation]))
+        .unwrap();
+    assert_eq!(task.plan_status, "valid");
+    assert!(
+        task.plans
+            .iter()
+            .any(|saved| saved.plan_digest == plan.plan_digest)
+    );
+    store.start_task(admin, task.id.clone()).unwrap();
+    wait_for(&store, &task.id, |task| task.status == "running");
+    runtime
+        .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"CDC_test\".{table}(id,mood) VALUES(1,'calm')"
+        )))))
+        .unwrap();
+    wait_for(&store, &task.id, |task| task.runtime.applied_rows >= 1);
+    let stored: Option<String> = mysql
+        .query_first(format!("SELECT mood FROM CDC_test.{table} WHERE id=1"))
+        .unwrap();
+    let value: change_event::LogicalValue =
+        serde_json::from_str(stored.as_deref().unwrap()).unwrap();
+    assert!(matches!(value, change_event::LogicalValue::Enum { label } if label == "calm"));
+    store.stop_task(admin, &task.id).unwrap();
+    store.shutdown_tasks();
+    runtime
+        .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"CDC_test\".{table}(id,mood) VALUES(2,'ready')"
+        )))))
+        .unwrap();
+    let restart = store.start_task(admin, task.id.clone());
+    assert!(
+        restart.is_ok(),
+        "PostgreSQL source restart: {:?}; saved-plan reason: {:?}",
+        restart.err(),
+        store.task(&task.id).unwrap().plan_invalid_reason
+    );
+    wait_for(&store, &task.id, |task| task.runtime.applied_rows >= 2);
+    let resumed: Option<String> = mysql
+        .query_first(format!("SELECT mood FROM CDC_test.{table} WHERE id=2"))
+        .unwrap();
+    let value: change_event::LogicalValue =
+        serde_json::from_str(resumed.as_deref().unwrap()).unwrap();
+    assert!(matches!(value, change_event::LogicalValue::Enum { label } if label == "ready"));
+    runtime
+        .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"CDC_test\".{table} SET mood='ready' WHERE id=1"
+        )))))
+        .unwrap();
+    wait_for(&store, &task.id, |task| task.runtime.applied_rows >= 3);
+    let updated: Option<String> = mysql
+        .query_first(format!("SELECT mood FROM CDC_test.{table} WHERE id=1"))
+        .unwrap();
+    let value: change_event::LogicalValue =
+        serde_json::from_str(updated.as_deref().unwrap()).unwrap();
+    assert!(matches!(value, change_event::LogicalValue::Enum { label } if label == "ready"));
+    runtime
+        .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM \"CDC_test\".{table} WHERE id=2"
+        )))))
+        .unwrap();
+    wait_for(&store, &task.id, |task| task.runtime.applied_rows >= 4);
+    let deleted: Option<String> = mysql
+        .query_first(format!("SELECT mood FROM CDC_test.{table} WHERE id=2"))
+        .unwrap();
+    assert!(deleted.is_none());
+    assert!(store.task(&task.id).unwrap().runtime.checkpoint.is_some());
+    store.stop_task(admin, &task.id).unwrap();
+    store.shutdown_tasks();
+
+    let slot_hash = format!("{:x}", Sha256::digest(task.id.as_bytes()));
+    let slot_name = format!("cdc_web_{}", &slot_hash[..16]);
+    runtime
+        .block_on(
+            sqlx::query("SELECT pg_drop_replication_slot($1)")
+                .bind(slot_name)
+                .execute(&mut pg),
+        )
+        .unwrap();
+    mysql
+        .exec_drop("DELETE FROM CDC.log_info WHERE task_id=?", (&task.id,))
+        .unwrap();
+    mysql
+        .query_drop(format!("DROP TABLE CDC_test.{table}"))
+        .unwrap();
+    runtime
+        .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE \"CDC_test\".{table}"
+        )))))
+        .unwrap();
+    runtime
+        .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TYPE \"CDC_test\".{type_name}"
+        )))))
+        .unwrap();
+    if created_publication {
+        runtime
+            .block_on(pg.execute(sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP PUBLICATION {publication_name}"
+            )))))
+            .unwrap();
+    }
+    let mysql_connector_id = format!("mysql_{}", mysql_version.replace('.', "_"));
+    type_qualification_evidence::record_web_plan_evidence(
+        &format!("postgresql_{major}"),
+        &mysql_connector_id,
+        &format!("web_ui.pg{major}_enum_to_{mysql_connector_id}_json_carrier_live"),
+        "dynamic:postgresql.enums",
+        &plan,
+        "logical_value_json_carrier",
+        true,
+    )
+    .unwrap();
+}

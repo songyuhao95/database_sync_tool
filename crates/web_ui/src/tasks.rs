@@ -669,6 +669,49 @@ fn digest_serialized<T: Serialize>(value: &T) -> String {
         .collect()
 }
 
+fn stable_plan_metadata(metadata: &crate::model::Metadata) -> crate::model::Metadata {
+    let mut stable = metadata.clone();
+    if let crate::model::Metadata::Postgresql(pg) = &mut stable {
+        // Starting this task creates its replication slot. Slot count is a
+        // capacity observation, not an input to column conversion semantics.
+        pg.replication_slots = 0;
+    }
+    stable
+}
+
+#[cfg(test)]
+#[test]
+fn postgresql_plan_metadata_ignores_slot_count_but_retains_configuration() {
+    let mut pg = postgresql_15::Metadata {
+        server_version: "15.14".into(),
+        server_build: None,
+        database: "CDC_test".into(),
+        schemas: vec!["CDC_test".into()],
+        extensions: vec![],
+        server_encoding: "UTF8".into(),
+        wal_level: "logical".into(),
+        max_replication_slots: 10,
+        max_wal_senders: 10,
+        replication_slots: 0,
+        can_replicate: true,
+        in_recovery: false,
+        environment_fingerprint: Some("same-session-settings".into()),
+    };
+    let initial = digest_serialized(&stable_plan_metadata(&crate::model::Metadata::Postgresql(
+        pg.clone(),
+    )));
+    pg.replication_slots = 1;
+    let started = digest_serialized(&stable_plan_metadata(&crate::model::Metadata::Postgresql(
+        pg.clone(),
+    )));
+    assert_eq!(initial, started);
+    pg.wal_level = "replica".into();
+    let changed = digest_serialized(&stable_plan_metadata(&crate::model::Metadata::Postgresql(
+        pg,
+    )));
+    assert_ne!(initial, changed);
+}
+
 /// Recompute the digest that binds the runtime to one immutable plan set.
 /// Keeping this calculation next to plan persistence prevents the worker from
 /// accepting a collection whose individual plan digests are valid but whose
@@ -765,8 +808,11 @@ fn plan_snapshot(
     // mapper or the target session. Keep the complete probe metadata in the
     // snapshot so a requalification observes extension, type-directory,
     // server/environment, and target-session changes as stale inputs.
-    let source_metadata_fingerprint =
-        digest_serialized(&(source_metadata, source_type_catalog_digest, source_catalog));
+    let source_metadata_fingerprint = digest_serialized(&(
+        stable_plan_metadata(source_metadata),
+        source_type_catalog_digest,
+        source_catalog,
+    ));
     let target_probe_digests = plans
         .iter()
         .map(|plan| {
@@ -776,8 +822,11 @@ fn plan_snapshot(
             )
         })
         .collect::<Vec<_>>();
-    let sink_metadata_fingerprint =
-        digest_serialized(&(sink_metadata, sink_catalog, target_probe_digests));
+    let sink_metadata_fingerprint = digest_serialized(&(
+        stable_plan_metadata(sink_metadata),
+        sink_catalog,
+        target_probe_digests,
+    ));
     let manifest_build = plans
         .iter()
         .find_map(|plan| plan.target_build.clone())

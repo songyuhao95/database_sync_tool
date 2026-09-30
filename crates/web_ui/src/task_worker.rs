@@ -38,10 +38,20 @@ impl Iterator for PostgresqlStream {
     type Item = io::Result<ChangeTransaction>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.stop.load(Ordering::Acquire) {
-            return None;
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return None;
+            }
+            match self
+                .receiver
+                .as_ref()?
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(transaction) => return Some(transaction),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
         }
-        self.receiver.as_ref()?.recv().ok()
     }
 }
 
@@ -1394,6 +1404,26 @@ mod tests {
         RiskLevel, RowChange, RuleReference, Source, SourceCursor, TargetRepresentation,
     };
     use std::sync::Mutex;
+
+    #[test]
+    fn idle_postgresql_stream_stops_without_another_source_transaction() {
+        let (_sender, receiver) = sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut stream = PostgresqlStream {
+            receiver: Some(receiver),
+            stop: Arc::clone(&stop),
+            reader_stop: Arc::new(AtomicBool::new(false)),
+            reader: None,
+        };
+        let stopped = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            stop.store(true, Ordering::Release);
+        });
+        let start = std::time::Instant::now();
+        assert!(stream.next().is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        stopped.join().unwrap();
+    }
 
     fn test_checkpoint() -> Checkpoint {
         Checkpoint {

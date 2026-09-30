@@ -15,16 +15,88 @@ use std::collections::BTreeMap;
 
 #[test]
 fn mysql57_inventory_types_can_plan_a_user_selected_carrier_for_each_sink() {
+    inventory_types_can_plan_a_user_selected_carrier_for_each_sink("mysql", "5.7");
+}
+
+#[test]
+fn postgresql15_inventory_types_can_plan_a_user_selected_carrier_for_each_sink() {
+    inventory_types_can_plan_a_user_selected_carrier_for_each_sink("postgresql", "15");
+}
+
+fn postgresql_inventory_catalog() -> postgresql_15::SourceTypeCatalog {
+    use postgresql_15::SourceTypeDefinition as Type;
+
+    let mut types = [
+        ("int2", 21),
+        ("int4", 23),
+        ("int8", 20),
+        ("numeric", 1700),
+        ("timestamp", 1114),
+        ("timestamptz", 1184),
+        ("date", 1082),
+        ("money", 790),
+        ("point", 600),
+        ("line", 628),
+        ("lseg", 601),
+        ("box", 603),
+        ("path", 602),
+        ("polygon", 604),
+        ("circle", 718),
+        ("tsvector", 3614),
+        ("tsquery", 3615),
+        ("oidvector", 30),
+        ("int2vector", 22),
+        ("tid", 27),
+        ("pg_lsn", 3220),
+        ("pg_snapshot", 5038),
+        ("txid_snapshot", 2970),
+        ("regproc", 24),
+        ("regprocedure", 2202),
+        ("regoper", 2203),
+        ("regoperator", 2204),
+        ("regclass", 2205),
+        ("regtype", 2206),
+        ("regconfig", 3734),
+        ("regdictionary", 3769),
+        ("regnamespace", 4089),
+        ("regrole", 4096),
+        ("regcollation", 4191),
+    ]
+    .into_iter()
+    .map(|(name, oid)| Type::builtin(oid, "pg_catalog", name))
+    .collect::<Vec<_>>();
+    types.extend([
+        Type::range(3904, "pg_catalog", "int4range", 23),
+        Type::range(3926, "pg_catalog", "int8range", 20),
+        Type::range(3906, "pg_catalog", "numrange", 1700),
+        Type::range(3908, "pg_catalog", "tsrange", 1114),
+        Type::range(3910, "pg_catalog", "tstzrange", 1184),
+        Type::range(3912, "pg_catalog", "daterange", 1082),
+        Type::multi_range(4451, "pg_catalog", "int4multirange", 3904),
+        Type::multi_range(4536, "pg_catalog", "int8multirange", 3926),
+        Type::multi_range(4532, "pg_catalog", "nummultirange", 3906),
+        Type::multi_range(4533, "pg_catalog", "tsmultirange", 3908),
+        Type::multi_range(4534, "pg_catalog", "tstzmultirange", 3910),
+        Type::multi_range(4535, "pg_catalog", "datemultirange", 3912),
+    ]);
+    postgresql_15::SourceTypeCatalog::new(types)
+}
+
+fn inventory_types_can_plan_a_user_selected_carrier_for_each_sink(kind: &str, version: &str) {
     let inventory: serde_json::Value =
         serde_json::from_str(include_str!("../../../scripts/type-inventory.json")).unwrap();
-    let source_connector = SourceRegistry.find("mysql", "5.7").unwrap();
-    let source_build = ServerBuildIdentity::new("mysql", "oracle", "5.7.44", "mysql-5.7.44");
+    let source_connector = SourceRegistry.find(kind, version).unwrap();
+    let source_id = format!("{}_{}", kind, version.replace('.', "_"));
+    let source_build = ServerBuildIdentity::new(kind, "test", version, "test-build");
+    let source_catalog = (kind == "postgresql").then(postgresql_inventory_catalog);
     let results = std::thread::scope(|scope| {
         let handles = SinkRegistry
             .all()
             .map(|sink_connector| {
                 let inventory = &inventory;
                 let source_build = &source_build;
+                let source_id = source_id.clone();
+                let source_catalog = &source_catalog;
                 scope.spawn(move || {
                     let sink_id = format!(
                         "{}_{}",
@@ -47,7 +119,7 @@ fn mysql57_inventory_types_can_plan_a_user_selected_carrier_for_each_sink() {
                             .as_array()
                             .unwrap()
                             .iter()
-                            .any(|connector| connector == "mysql_5_7")
+                            .any(|connector| connector == &source_id)
                         {
                             continue;
                         }
@@ -61,26 +133,51 @@ fn mysql57_inventory_types_can_plan_a_user_selected_carrier_for_each_sink() {
                             column_type: native_type.into(),
                             nullable: true,
                             extra: String::new(),
-                            collation: textual.then(|| "utf8mb4_unicode_ci".into()),
+                            collation: (kind == "mysql" && textual)
+                                .then(|| "utf8mb4_unicode_ci".into()),
                             default_value: None,
                         };
                         let source = CatalogTable {
                             schema: "CDC_test".into(),
                             name: "type_route".into(),
-                            engine: "InnoDB".into(),
+                            engine: if kind == "mysql" {
+                                "InnoDB"
+                            } else {
+                                "PostgreSQL"
+                            }
+                            .into(),
                             primary_key: vec!["id".into()],
                             columns: vec![source_column.clone()],
                         };
+                        let source_mapping = source_connector.source_type_mapping_with_evidence(
+                            &source_column,
+                            source_catalog.as_ref(),
+                            Some(source_build.clone()),
+                            None,
+                        );
+                        let Ok(source_mapping) = source_mapping else {
+                            failures.push(format!(
+                                "{type_id}@{source_id}>{sink_id} ({native_type}): {}",
+                                source_mapping.unwrap_err()
+                            ));
+                            continue;
+                        };
+                        let required_carrier = if matches!(
+                            source_mapping.logical_type,
+                            change_event::LogicalType::Raw { .. }
+                        ) {
+                            "source_representation"
+                        } else {
+                            "logical_value_json"
+                        };
                         let mut planned = false;
                         for carrier in manifest.capabilities.iter().filter(|capability| {
-                            matches!(
-                                capability
-                                    .target
-                                    .parameters
-                                    .get("conversion_kind")
-                                    .map(String::as_str),
-                                Some("logical_value_json" | "source_representation")
-                            )
+                            capability
+                                .target
+                                .parameters
+                                .get("conversion_kind")
+                                .map(String::as_str)
+                                == Some(required_carrier)
                         }) {
                             let target_native = carrier.target.native_type.clone();
                             let sink_column = CatalogColumn {
@@ -138,7 +235,7 @@ fn mysql57_inventory_types_can_plan_a_user_selected_carrier_for_each_sink() {
                                     "inventory-route:r1",
                                     Some(source_build.clone()),
                                     Some(target_build.clone()),
-                                    None,
+                                    source_catalog.as_ref(),
                                     None,
                                     &selection,
                                     confirmations,
@@ -176,7 +273,8 @@ fn mysql57_inventory_types_can_plan_a_user_selected_carrier_for_each_sink() {
                         if planned {
                             qualified += 1;
                         } else {
-                            failures.push(format!("{type_id}@mysql_5_7>{sink_id} ({native_type})"));
+                            failures
+                                .push(format!("{type_id}@{source_id}>{sink_id} ({native_type})"));
                         }
                     }
                     eprintln!(
