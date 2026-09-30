@@ -428,11 +428,26 @@ impl CatalogConnection {
     }
 
     pub(crate) fn tables(&mut self, schema: &str) -> Result<Vec<CatalogTable>> {
+        self.tables_filtered(schema, None)
+    }
+
+    pub(crate) fn table(&mut self, schema: &str, table: &str) -> Result<Option<CatalogTable>> {
+        Ok(self
+            .tables_filtered(schema, Some(table))?
+            .into_iter()
+            .next())
+    }
+
+    fn tables_filtered(
+        &mut self,
+        schema: &str,
+        table_filter: Option<&str>,
+    ) -> Result<Vec<CatalogTable>> {
         let CatalogBackend::Mysql(conn) = &mut self.conn else {
-            return self.postgresql_tables(schema);
+            return self.postgresql_tables(schema, table_filter);
         };
         let rows: Vec<(String,String)> = conn.exec(
-            "SELECT TABLE_NAME,COALESCE(ENGINE,'') FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME", (schema,))
+            "SELECT TABLE_NAME,COALESCE(ENGINE,'') FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_TYPE='BASE TABLE' AND (? IS NULL OR TABLE_NAME=?) ORDER BY TABLE_NAME", (schema,table_filter,table_filter))
             .map_err(|_| Error::Invalid("读取表列表失败，请检查账号权限"))?;
         let mut tables: BTreeMap<String, CatalogTable> = rows
             .into_iter()
@@ -459,7 +474,7 @@ impl CatalogConnection {
             Option<String>,
         );
         let columns: Vec<ColumnRow> = conn.exec(
-            "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,EXTRA,COLLATION_NAME,COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? ORDER BY TABLE_NAME,ORDINAL_POSITION", (schema,))
+            "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,EXTRA,COLLATION_NAME,COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND (? IS NULL OR TABLE_NAME=?) ORDER BY TABLE_NAME,ORDINAL_POSITION", (schema,table_filter,table_filter))
             .map_err(|_| Error::Invalid("读取列定义失败，请检查账号权限"))?;
         for (table, name, column_type, nullable, extra, collation, default_value) in columns {
             if let Some(table) = tables.get_mut(&table) {
@@ -474,7 +489,7 @@ impl CatalogConnection {
             }
         }
         let keys: Vec<(String,String)> = conn.exec(
-            "SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=? AND INDEX_NAME='PRIMARY' ORDER BY TABLE_NAME,SEQ_IN_INDEX", (schema,))
+            "SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=? AND INDEX_NAME='PRIMARY' AND (? IS NULL OR TABLE_NAME=?) ORDER BY TABLE_NAME,SEQ_IN_INDEX", (schema,table_filter,table_filter))
             .map_err(|_| Error::Invalid("读取主键失败，请检查账号权限"))?;
         for (table, column) in keys {
             if let Some(table) = tables.get_mut(&table) {
@@ -484,7 +499,11 @@ impl CatalogConnection {
         Ok(tables.into_values().collect())
     }
 
-    fn postgresql_tables(&mut self, schema: &str) -> Result<Vec<CatalogTable>> {
+    fn postgresql_tables(
+        &mut self,
+        schema: &str,
+        table_filter: Option<&str>,
+    ) -> Result<Vec<CatalogTable>> {
         let CatalogBackend::Postgresql { runtime, conn } = &mut self.conn else {
             unreachable!()
         };
@@ -492,9 +511,11 @@ impl CatalogConnection {
             let names = sqlx::query_scalar::<_, String>(
                 "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                      WHERE n.nspname=$1 AND c.relkind='r' AND c.relpersistence='p'
+                       AND ($2::text IS NULL OR c.relname=$2)
                      ORDER BY c.relname",
             )
             .bind(schema)
+            .bind(table_filter)
             .fetch_all(&mut *conn)
             .await
             .map_err(|_| Error::Invalid("读取 PostgreSQL 表列表失败，请检查账号权限"))?;
@@ -521,9 +542,11 @@ impl CatalogConnection {
                      JOIN pg_namespace n ON n.nspname=c.table_schema
                      JOIN pg_class cl ON cl.relnamespace=n.oid AND cl.relname=c.table_name
                      JOIN pg_attribute a ON a.attrelid=cl.oid AND a.attname=c.column_name
-                     WHERE c.table_schema=$1 ORDER BY c.table_name,c.ordinal_position",
+                     WHERE c.table_schema=$1 AND ($2::text IS NULL OR c.table_name=$2)
+                     ORDER BY c.table_name,c.ordinal_position",
             )
             .bind(schema)
+            .bind(table_filter)
             .fetch_all(&mut *conn)
             .await
             .map_err(|_| Error::Invalid("读取 PostgreSQL 字段失败，请检查账号权限"))?;
@@ -557,9 +580,12 @@ impl CatalogConnection {
                      JOIN pg_namespace n ON n.oid=c.relnamespace
                      CROSS JOIN LATERAL unnest(p.conkey) WITH ORDINALITY AS k(attnum,ord)
                      JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.attnum
-                     WHERE p.contype='p' AND n.nspname=$1 ORDER BY c.relname,k.ord",
+                     WHERE p.contype='p' AND n.nspname=$1
+                       AND ($2::text IS NULL OR c.relname=$2)
+                     ORDER BY c.relname,k.ord",
             )
             .bind(schema)
+            .bind(table_filter)
             .fetch_all(&mut *conn)
             .await
             .map_err(|_| Error::Invalid("读取 PostgreSQL 主键失败，请检查账号权限"))?;

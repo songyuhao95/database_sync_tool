@@ -1136,6 +1136,29 @@ fn compatibility_manifest(
     )
 }
 
+#[test]
+fn validated_manifest_rejects_tampering_before_reuse() {
+    let mut manifest = compatibility_manifest(
+        "bigint",
+        compatibility_rule(
+            "test.integer",
+            QualificationLevel::Exact,
+            RiskLevel::None,
+            false,
+            true,
+        ),
+        true,
+    );
+    let verified = ValidatedTargetCapabilityManifest::new(std::sync::Arc::new(manifest.clone()))
+        .expect("valid manifest is accepted");
+    assert_eq!(verified.as_manifest().digest, manifest.digest);
+    manifest.capabilities[0].code = "changed-without-new-digest".into();
+    assert!(
+        ValidatedTargetCapabilityManifest::new(std::sync::Arc::new(manifest)).is_err(),
+        "the cache must not accept a modified manifest with its old digest"
+    );
+}
+
 fn compatibility_input<'a>(
     transaction: &'a ValidatedTransaction,
     source_field: FieldDefinition,

@@ -1015,6 +1015,473 @@ fn live_web_postgresql15_enum_to_mysql80_carrier() {
 }
 
 #[test]
+#[ignore = "requires live MySQL 5.7 and PostgreSQL 15; creates isolated 37-type source and target tables"]
+fn live_web_mysql57_all_native_types_to_postgresql15_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("5.7", 15);
+}
+
+#[test]
+#[ignore = "requires live MySQL 5.7 and PostgreSQL 16; creates isolated 37-type source and target tables"]
+fn live_web_mysql57_all_native_types_to_postgresql16_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("5.7", 16);
+}
+
+#[test]
+#[ignore = "requires live MySQL 5.7 and PostgreSQL 17; creates isolated 37-type source and target tables"]
+fn live_web_mysql57_all_native_types_to_postgresql17_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("5.7", 17);
+}
+
+#[test]
+#[ignore = "requires live MySQL 8.0 and PostgreSQL 15; creates isolated 37-type source and target tables"]
+fn live_web_mysql80_all_native_types_to_postgresql15_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("8.0", 15);
+}
+
+#[test]
+#[ignore = "requires live MySQL 8.0 and PostgreSQL 16; creates isolated 37-type source and target tables"]
+fn live_web_mysql80_all_native_types_to_postgresql16_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("8.0", 16);
+}
+
+#[test]
+#[ignore = "requires live MySQL 8.0 and PostgreSQL 17; creates isolated 37-type source and target tables"]
+fn live_web_mysql80_all_native_types_to_postgresql17_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("8.0", 17);
+}
+
+#[test]
+#[ignore = "requires live MySQL 8.4 and PostgreSQL 15; creates isolated 37-type source and target tables"]
+fn live_web_mysql84_all_native_types_to_postgresql15_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("8.4", 15);
+}
+
+#[test]
+#[ignore = "requires live MySQL 8.4 and PostgreSQL 16; creates isolated 37-type source and target tables"]
+fn live_web_mysql84_all_native_types_to_postgresql16_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("8.4", 16);
+}
+
+#[test]
+#[ignore = "requires live MySQL 8.4 and PostgreSQL 17; creates isolated 37-type source and target tables"]
+fn live_web_mysql84_all_native_types_to_postgresql17_carriers() {
+    live_web_mysql_all_native_types_to_postgresql_carriers("8.4", 17);
+}
+
+fn live_web_mysql_all_native_types_to_postgresql_carriers(mysql_version: &str, pg_major: u16) {
+    const FIELDS: &[(&str, &str, &str, &str)] = &[
+        ("tinyint_value", "TINYINT", "mysql.tinyint", "-12"),
+        ("smallint_value", "SMALLINT", "mysql.smallint", "-1234"),
+        ("mediumint_value", "MEDIUMINT", "mysql.mediumint", "-12345"),
+        ("integer_value", "INT", "mysql.integer", "-123456"),
+        ("bigint_value", "BIGINT", "mysql.bigint", "-123456789"),
+        (
+            "decimal_value",
+            "DECIMAL(30,6)",
+            "mysql.decimal",
+            "12345.125000",
+        ),
+        ("float_value", "FLOAT", "mysql.float", "1.25"),
+        ("double_value", "DOUBLE", "mysql.double", "1.125"),
+        ("bit_value", "BIT(8)", "mysql.bit", "b'10100101'"),
+        ("date_value", "DATE", "mysql.date", "'2024-02-29'"),
+        ("time_value", "TIME(6)", "mysql.time", "'12:30:15.123456'"),
+        (
+            "datetime_value",
+            "DATETIME(6)",
+            "mysql.datetime",
+            "'2024-02-29 12:30:15.123456'",
+        ),
+        (
+            "timestamp_value",
+            "TIMESTAMP(6) NULL",
+            "mysql.timestamp",
+            "'2024-02-29 12:30:15.123456'",
+        ),
+        ("year_value", "YEAR", "mysql.year", "2024"),
+        ("char_value", "CHAR(16)", "mysql.char", "'fixed'"),
+        (
+            "varchar_value",
+            "VARCHAR(32)",
+            "mysql.varchar",
+            "'variable'",
+        ),
+        ("binary_value", "BINARY(4)", "mysql.binary", "X'01020304'"),
+        (
+            "varbinary_value",
+            "VARBINARY(8)",
+            "mysql.varbinary",
+            "X'00FF'",
+        ),
+        ("tinytext_value", "TINYTEXT", "mysql.tinytext", "'tiny'"),
+        ("text_value", "TEXT", "mysql.text", "'text'"),
+        (
+            "mediumtext_value",
+            "MEDIUMTEXT",
+            "mysql.mediumtext",
+            "'medium'",
+        ),
+        ("longtext_value", "LONGTEXT", "mysql.longtext", "'long'"),
+        ("tinyblob_value", "TINYBLOB", "mysql.tinyblob", "X'01'"),
+        ("blob_value", "BLOB", "mysql.blob", "X'0203'"),
+        (
+            "mediumblob_value",
+            "MEDIUMBLOB",
+            "mysql.mediumblob",
+            "X'040506'",
+        ),
+        ("longblob_value", "LONGBLOB", "mysql.longblob", "X'070809'"),
+        ("enum_value", "ENUM('alpha','beta')", "mysql.enum", "'beta'"),
+        ("set_value", "SET('a','b','c')", "mysql.set", "'a,c'"),
+        (
+            "json_value",
+            "JSON",
+            "mysql.json",
+            "JSON_OBJECT('kind','web')",
+        ),
+        (
+            "geometry_value",
+            "GEOMETRY",
+            "mysql.geometry",
+            "ST_GeomFromText('POINT(1 2)')",
+        ),
+        (
+            "point_value",
+            "POINT",
+            "mysql.point",
+            "ST_GeomFromText('POINT(1 2)')",
+        ),
+        (
+            "linestring_value",
+            "LINESTRING",
+            "mysql.linestring",
+            "ST_GeomFromText('LINESTRING(0 0,1 1)')",
+        ),
+        (
+            "polygon_value",
+            "POLYGON",
+            "mysql.polygon",
+            "ST_GeomFromText('POLYGON((0 0,1 0,1 1,0 0))')",
+        ),
+        (
+            "multipoint_value",
+            "MULTIPOINT",
+            "mysql.multipoint",
+            "ST_GeomFromText('MULTIPOINT((1 1),(2 2))')",
+        ),
+        (
+            "multilinestring_value",
+            "MULTILINESTRING",
+            "mysql.multilinestring",
+            "ST_GeomFromText('MULTILINESTRING((0 0,1 1),(2 2,3 3))')",
+        ),
+        (
+            "multipolygon_value",
+            "MULTIPOLYGON",
+            "mysql.multipolygon",
+            "ST_GeomFromText('MULTIPOLYGON(((0 0,1 0,1 1,0 0)))')",
+        ),
+        (
+            "geometrycollection_value",
+            "GEOMETRYCOLLECTION",
+            "mysql.geometrycollection",
+            "ST_GeomFromText('GEOMETRYCOLLECTION(POINT(1 1),LINESTRING(0 0,1 1))')",
+        ),
+    ];
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let table = format!("web_mysql_types_{nonce}");
+    let mysql_host = std::env::var("CDC_MYSQL_HOST").unwrap();
+    let mysql_port_key = match mysql_version {
+        "5.7" => "CDC_MYSQL57_PORT",
+        "8.0" => "CDC_MYSQL80_PORT",
+        "8.4" => "CDC_MYSQL84_PORT",
+        _ => panic!("unsupported test MySQL version"),
+    };
+    let mysql_port = std::env::var(mysql_port_key)
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let mysql_reader_password = std::env::var("CDC_MYSQL_READER_PASSWORD").unwrap();
+    let mysql_writer_password = std::env::var("CDC_MYSQL_WRITER_PASSWORD").unwrap();
+    let pg_prefix = if pg_major == 15 {
+        "PG_CDC".to_owned()
+    } else {
+        format!("PG_CDC{pg_major}")
+    };
+    let pg_env = |suffix: &str| std::env::var(format!("{pg_prefix}_{suffix}")).unwrap();
+    let pg_host = pg_env("HOST");
+    let pg_port = pg_env("PORT").parse::<u16>().unwrap();
+    let pg_password = pg_env("TEST_PASSWORD");
+    let pg_admin = pg_env("ADMIN_USER");
+    let pg_reader = pg_env("READER_USER");
+    let pg_writer = pg_env("WRITER_USER");
+    let mut source = Conn::new(
+        OptsBuilder::new()
+            .ip_or_hostname(Some(mysql_host.clone()))
+            .tcp_port(mysql_port)
+            .user(Some(std::env::var("CDC_MYSQL_WRITER_USER").unwrap()))
+            .pass(Some(mysql_writer_password.clone())),
+    )
+    .unwrap();
+    source
+        .query_drop("CREATE DATABASE IF NOT EXISTS CDC_test")
+        .unwrap();
+    let mysql_columns = FIELDS
+        .iter()
+        .map(|(name, kind, _, _)| format!("{name} {kind} NULL"))
+        .collect::<Vec<_>>()
+        .join(",");
+    source.query_drop(format!("CREATE TABLE CDC_test.{table}(id BIGINT PRIMARY KEY,{mysql_columns}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let options = PgConnectOptions::new()
+        .host(&pg_host)
+        .port(pg_port)
+        .database("CDC_test")
+        .username(&pg_admin)
+        .password(&pg_password)
+        .ssl_mode(PgSslMode::Prefer);
+    let mut target = runtime
+        .block_on(PgConnection::connect_with(&options))
+        .unwrap();
+    let pg_columns = FIELDS
+        .iter()
+        .map(|(name, _, _, _)| format!("{name} text"))
+        .collect::<Vec<_>>()
+        .join(",");
+    runtime
+        .block_on(target.execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA IF NOT EXISTS \"CDC_test\";
+         CREATE SCHEMA IF NOT EXISTS cdc;
+         GRANT USAGE,CREATE ON SCHEMA cdc TO {pg_writer};
+         GRANT USAGE ON SCHEMA \"CDC_test\" TO {pg_writer};
+         CREATE TABLE \"CDC_test\".{table}(id bigint PRIMARY KEY,{pg_columns});
+         GRANT SELECT,INSERT,UPDATE,DELETE ON \"CDC_test\".{table} TO {pg_writer}"
+        )))))
+        .unwrap();
+    let (dir, store) = store();
+    let admin = store.login("admin", "admin", None).unwrap().session.user.id;
+    let mut source_input = instance_input();
+    source_input.name = format!("mysql-{mysql_version}-all-types-{nonce}");
+    source_input.host = mysql_host;
+    source_input.port = mysql_port;
+    source_input.version = mysql_version.into();
+    source_input.reader_password = Some(mysql_reader_password);
+    source_input.writer_password = Some(mysql_writer_password);
+    let source_instance = store.save_instance(admin, None, source_input).unwrap();
+    let mut sink_input = instance_input();
+    sink_input.name = format!("pg-{pg_major}-all-types-{nonce}");
+    sink_input.host = pg_host;
+    sink_input.port = pg_port;
+    sink_input.kind = "postgresql".into();
+    sink_input.version = pg_major.to_string();
+    sink_input.database = "CDC_test".into();
+    sink_input.reader_username = pg_reader;
+    sink_input.reader_password = Some(pg_password.clone());
+    sink_input.writer_username = pg_writer;
+    sink_input.writer_password = Some(pg_password);
+    let sink_instance = store.save_instance(admin, None, sink_input).unwrap();
+    let draft_id = format!(
+        "mysql-{}-pg-{pg_major}-all-types-{nonce}",
+        mysql_version.replace('.', "-")
+    );
+    let preview_input =
+        |column: &str, parameters: BTreeMap<String, String>, confirmations| FieldPreviewInput {
+            draft_id: draft_id.clone(),
+            source_id: source_instance.id.clone(),
+            sink_id: sink_instance.id.clone(),
+            source_database: String::new(),
+            sink_database: "CDC_test".into(),
+            source_revision: 1,
+            sink_revision: 1,
+            schema: "CDC_test".into(),
+            table: table.clone(),
+            column: column.into(),
+            parameters,
+            confirmations,
+        };
+    let mut conversion_options = BTreeMap::new();
+    let mut confirmations = Vec::new();
+    let mut confirmed_plans = Vec::new();
+    for (column, _, type_id, _) in FIELDS {
+        let discovered = store
+            .preview_field(admin, preview_input(column, BTreeMap::new(), vec![]))
+            .unwrap();
+        let candidate = discovered
+            .available_candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .target
+                    .parameters
+                    .get("conversion_kind")
+                    .map(String::as_str)
+                    == Some("logical_value_json")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "Web lacks a target representation for {type_id}: {}",
+                    serde_json::to_string_pretty(&discovered).unwrap()
+                )
+            });
+        let parameters = BTreeMap::from([
+            ("__rule_id".into(), candidate.rule.id.clone()),
+            ("__rule_version".into(), candidate.rule.version.clone()),
+        ]);
+        let pending = store
+            .preview_field(admin, preview_input(column, parameters.clone(), vec![]))
+            .unwrap()
+            .result
+            .unwrap();
+        let pending_plan = pending
+            .plan
+            .clone()
+            .unwrap_or_else(|| panic!("Web could not plan {type_id}: {pending:?}"));
+        let field_confirmations =
+            if pending.status == change_event::CompatibilityStatus::NeedsConfirmation {
+                let confirmation = change_event::RiskConfirmation {
+                    source_field_lineage: pending_plan.source_field.lineage_id.clone(),
+                    target_field_lineage: pending_plan.target_field.lineage_id.clone(),
+                    rule: pending_plan.rule.clone(),
+                    plan_digest: pending_plan.plan_digest.clone(),
+                    actor: "admin".into(),
+                    confirmed_at: "2026-09-30T00:00:00Z".into(),
+                    reason: Some("tagged value carrier replaces native target behavior".into()),
+                };
+                confirmations.push(confirmation.clone());
+                vec![confirmation]
+            } else {
+                assert_eq!(
+                    pending.status,
+                    change_event::CompatibilityStatus::Compatible,
+                    "{type_id}: {}",
+                    pending.explanation
+                );
+                vec![]
+            };
+        let confirmed = store
+            .preview_field(
+                admin,
+                preview_input(column, parameters.clone(), field_confirmations),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(
+            confirmed.status,
+            change_event::CompatibilityStatus::Compatible,
+            "{type_id}: {}",
+            confirmed.explanation
+        );
+        conversion_options.insert((*column).to_owned(), parameters);
+        confirmed_plans.push((*type_id, confirmed.plan.unwrap()));
+    }
+    let task = store
+        .create_task(
+            admin,
+            TaskInput {
+                draft_id: Some(draft_id),
+                name: format!(
+                    "live MySQL {mysql_version} all types to PostgreSQL {pg_major} {nonce}"
+                ),
+                source_id: source_instance.id,
+                sink_id: sink_instance.id,
+                source_database: String::new(),
+                sink_database: "CDC_test".into(),
+                source_revision: 1,
+                sink_revision: 1,
+                start_mode: "auto".into(),
+                mappings: vec![TableMapping {
+                    source_schema: "CDC_test".into(),
+                    source_table: table.clone(),
+                    sink_schema: "CDC_test".into(),
+                    sink_table: table.clone(),
+                    columns: std::iter::once("id".to_owned())
+                        .chain(FIELDS.iter().map(|(name, _, _, _)| (*name).to_owned()))
+                        .collect(),
+                    conversion_options,
+                }],
+                confirmations,
+            },
+        )
+        .unwrap();
+    assert_eq!(task.plan_status, "valid");
+    assert!(confirmed_plans.iter().all(|(_, plan)| {
+        task.plans
+            .iter()
+            .any(|saved| saved.plan_digest == plan.plan_digest)
+    }));
+    store.start_task(admin, task.id.clone()).unwrap();
+    wait_for(&store, &task.id, |task| task.status == "running");
+    let names = FIELDS
+        .iter()
+        .map(|(name, _, _, _)| *name)
+        .collect::<Vec<_>>()
+        .join(",");
+    let values = FIELDS
+        .iter()
+        .map(|(_, _, _, value)| *value)
+        .collect::<Vec<_>>()
+        .join(",");
+    source
+        .query_drop(format!(
+            "INSERT INTO CDC_test.{table}(id,{names}) VALUES(1,{values})"
+        ))
+        .unwrap();
+    wait_for(&store, &task.id, |task| task.runtime.applied_rows >= 1);
+    for (column, _, type_id, _) in FIELDS {
+        let stored: String = runtime
+            .block_on(
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT {column} FROM \"CDC_test\".{table} WHERE id=1"
+                )))
+                .fetch_one(&mut target),
+            )
+            .unwrap();
+        serde_json::from_str::<change_event::LogicalValue>(&stored).unwrap_or_else(|error| {
+            panic!("{type_id} target carrier is not replayable JSON: {error}")
+        });
+    }
+    store.stop_task(admin, &task.id).unwrap();
+    store.shutdown_tasks();
+    assert!(store.task(&task.id).unwrap().runtime.checkpoint.is_some());
+    source
+        .query_drop(format!("DROP TABLE CDC_test.{table}"))
+        .unwrap();
+    runtime
+        .block_on(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP TABLE \"CDC_test\".{table}"
+            )))
+            .execute(&mut target),
+        )
+        .unwrap();
+    drop(dir);
+    let source_connector_id = format!("mysql_{}", mysql_version.replace('.', "_"));
+    let sink_connector_id = format!("postgresql_{pg_major}");
+    let suite_id = format!(
+        "web_ui.{source_connector_id}_all_native_types_to_{sink_connector_id}_carrier_live"
+    );
+    for (type_id, plan) in &confirmed_plans {
+        type_qualification_evidence::record_web_plan_evidence(
+            &source_connector_id,
+            &sink_connector_id,
+            &suite_id,
+            type_id,
+            plan,
+            "logical_value_json_carrier",
+            true,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
 #[ignore = "requires live PostgreSQL 16 and MySQL 8.0; creates isolated type, table, publication membership, and local SQLite"]
 fn live_web_postgresql16_enum_to_mysql80_carrier() {
     live_web_postgresql_enum_to_mysql_carrier(16, "8.0");

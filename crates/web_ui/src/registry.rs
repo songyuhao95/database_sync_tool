@@ -8,7 +8,7 @@ use change_event::{
     CapabilityManifest, CompatibilityError, CompatibilityResult,
     ConnectorIdentity as ModelConnectorIdentity, DefinitionReference, FieldCompatibilityInput,
     FieldDefinition, LogicalType, Operation, PresenceState, RouteOptions, ServerBuildIdentity,
-    SourceTypeMapping, TargetCapabilityManifest,
+    SourceTypeMapping, TargetCapabilityManifest, ValidatedTargetCapabilityManifest,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -304,6 +304,34 @@ impl ConnectorDescriptor {
                 .entry(key)
                 .or_insert(manifest),
         )
+    }
+
+    fn validated_manifest(
+        &self,
+        target_build: ServerBuildIdentity,
+    ) -> Result<Arc<ValidatedTargetCapabilityManifest>, CompatibilityError> {
+        type ManifestCache =
+            RwLock<HashMap<(AdapterKind, String), Arc<ValidatedTargetCapabilityManifest>>>;
+        static MANIFESTS: OnceLock<ManifestCache> = OnceLock::new();
+        let manifests = MANIFESTS.get_or_init(|| RwLock::new(HashMap::new()));
+        let key = (self.adapter, change_event::stable_digest(&target_build));
+        if let Some(cached) = manifests
+            .read()
+            .expect("validated manifest cache read")
+            .get(&key)
+        {
+            return Ok(Arc::clone(cached));
+        }
+        let validated = Arc::new(ValidatedTargetCapabilityManifest::new(
+            self.structured_manifest(target_build),
+        )?);
+        Ok(Arc::clone(
+            manifests
+                .write()
+                .expect("validated manifest cache write")
+                .entry(key)
+                .or_insert(validated),
+        ))
     }
 
     pub(crate) fn source_type_mapping(
@@ -604,7 +632,7 @@ pub(crate) fn field_compatibility_with_source_evidence_and_target_probe(
                 "catalog",
             )
         });
-    let manifest = sink_connector.structured_manifest(manifest_build);
+    let manifest = sink_connector.validated_manifest(manifest_build)?;
     // A Raw field carries a protocol envelope, not a decoded Value. An
     // Unavailable before-image is still safe for a non-key field because the
     // sink does not write it; the common event validator checks its position.
@@ -613,38 +641,41 @@ pub(crate) fn field_compatibility_with_source_evidence_and_target_probe(
     } else {
         PresenceState::Value
     };
-    change_event::plan_field_compatibility(FieldCompatibilityInput {
-        source_field,
-        target_field,
-        source_type_mapping: source_mapping,
-        source_connector: ModelConnectorIdentity::new(
-            source_connector.identity.kind,
-            source_connector.identity.version,
-        ),
-        sink_connector: ModelConnectorIdentity::new(
-            sink_connector.identity.kind,
-            sink_connector.identity.version,
-        ),
-        source_build,
-        target_build: Some(manifest.target_build.clone()),
-        manifest: &manifest,
-        operations: vec![Operation::Insert, Operation::Update, Operation::Delete],
-        presences: vec![
-            value_presence,
-            PresenceState::Null,
-            PresenceState::Unchanged,
-            PresenceState::Unavailable,
-        ],
-        source_has_primary_key: !source.primary_key.is_empty(),
-        options: RouteOptions {
-            route_id: route_id.into(),
-            configuration_revision: configuration_revision.into(),
-            selected_rule,
-            parameters: planner_parameters,
-            confirmations: confirmations.to_vec(),
-            target_probe: target_probe.cloned(),
+    change_event::plan_field_compatibility_with_validated_manifest(
+        FieldCompatibilityInput {
+            source_field,
+            target_field,
+            source_type_mapping: source_mapping,
+            source_connector: ModelConnectorIdentity::new(
+                source_connector.identity.kind,
+                source_connector.identity.version,
+            ),
+            sink_connector: ModelConnectorIdentity::new(
+                sink_connector.identity.kind,
+                sink_connector.identity.version,
+            ),
+            source_build,
+            target_build: Some(manifest.as_manifest().target_build.clone()),
+            manifest: manifest.as_manifest(),
+            operations: vec![Operation::Insert, Operation::Update, Operation::Delete],
+            presences: vec![
+                value_presence,
+                PresenceState::Null,
+                PresenceState::Unchanged,
+                PresenceState::Unavailable,
+            ],
+            source_has_primary_key: !source.primary_key.is_empty(),
+            options: RouteOptions {
+                route_id: route_id.into(),
+                configuration_revision: configuration_revision.into(),
+                selected_rule,
+                parameters: planner_parameters,
+                confirmations: confirmations.to_vec(),
+                target_probe: target_probe.cloned(),
+            },
         },
-    })
+        &manifest,
+    )
 }
 
 fn field_definition(

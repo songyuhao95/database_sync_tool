@@ -1682,6 +1682,25 @@ pub struct TargetCapabilityManifest {
     pub digest: String,
 }
 
+/// An immutable manifest whose digest and entries were checked at construction.
+/// Cloning the internal Arc cannot mutate the validated value; callers with an
+/// untrusted manifest continue to use the regular planning entry point.
+#[derive(Debug, Clone)]
+pub struct ValidatedTargetCapabilityManifest(std::sync::Arc<TargetCapabilityManifest>);
+
+impl ValidatedTargetCapabilityManifest {
+    pub fn new(
+        manifest: std::sync::Arc<TargetCapabilityManifest>,
+    ) -> Result<Self, CompatibilityError> {
+        manifest.validate()?;
+        Ok(Self(manifest))
+    }
+
+    pub fn as_manifest(&self) -> &TargetCapabilityManifest {
+        &self.0
+    }
+}
+
 impl TargetCapabilityManifest {
     pub fn new(
         connector: ConnectorIdentity,
@@ -5102,7 +5121,22 @@ pub fn plan_compatibility(
 pub fn explain_field_compatibility(
     input: FieldCompatibilityInput<'_>,
 ) -> Result<CompatibilityResult, CompatibilityError> {
-    validate_field_input(&input)?;
+    explain_field_compatibility_inner(input, false)
+}
+
+pub fn plan_field_compatibility_with_validated_manifest<'a>(
+    mut input: FieldCompatibilityInput<'a>,
+    manifest: &'a ValidatedTargetCapabilityManifest,
+) -> Result<CompatibilityResult, CompatibilityError> {
+    input.manifest = manifest.as_manifest();
+    explain_field_compatibility_inner(input, true)
+}
+
+fn explain_field_compatibility_inner(
+    input: FieldCompatibilityInput<'_>,
+    manifest_validated: bool,
+) -> Result<CompatibilityResult, CompatibilityError> {
+    validate_field_input(&input, manifest_validated)?;
     if input.manifest.requires_primary_key && !input.source_has_primary_key {
         return Ok(field_result(
             &input,
@@ -5435,7 +5469,10 @@ pub fn plan_field_compatibility(
     explain_field_compatibility(input)
 }
 
-fn validate_field_input(input: &FieldCompatibilityInput<'_>) -> Result<(), CompatibilityError> {
+fn validate_field_input(
+    input: &FieldCompatibilityInput<'_>,
+    manifest_validated: bool,
+) -> Result<(), CompatibilityError> {
     let invalid = |code: &'static str, message: &'static str| {
         CompatibilityError::InvalidInput(CompatibilityFailure::new(
             FailureClass::InvalidInput,
@@ -5542,7 +5579,9 @@ fn validate_field_input(input: &FieldCompatibilityInput<'_>) -> Result<(), Compa
             "at least one operation and presence state are required",
         ));
     }
-    input.manifest.validate()?;
+    if !manifest_validated {
+        input.manifest.validate()?;
+    }
     validate_target_probe(
         input.options.target_probe.as_ref(),
         &input.target_field,

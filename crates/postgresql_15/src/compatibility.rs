@@ -7,6 +7,10 @@ use change_event::{
     TargetRepresentation,
 };
 use sha2::{Digest as _, Sha256};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 
 const CONNECTOR_VERSION: &str = "15";
 const RULE_VERSION: &str = "postgresql-15.sink-conversion.v1";
@@ -239,6 +243,28 @@ pub fn compatibility_manifest(target_build: ServerBuildIdentity) -> TargetCapabi
 /// changing the connector identity, rule identity, or evidence version also
 /// changes the manifest digest.
 pub fn compatibility_manifest_for_version(
+    target_build: ServerBuildIdentity,
+    connector_version: &str,
+) -> TargetCapabilityManifest {
+    type ManifestCache = Mutex<HashMap<(String, ServerBuildIdentity), TargetCapabilityManifest>>;
+    static MANIFESTS: OnceLock<ManifestCache> = OnceLock::new();
+    let mut manifests = MANIFESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("PostgreSQL manifest cache");
+    let key = (connector_version.to_owned(), target_build.clone());
+    if let Some(manifest) = manifests.get(&key) {
+        return manifest.clone();
+    }
+    let manifest = build_compatibility_manifest_for_version(target_build, connector_version);
+    if manifests.len() >= 64 {
+        manifests.clear();
+    }
+    manifests.insert(key, manifest.clone());
+    manifest
+}
+
+fn build_compatibility_manifest_for_version(
     target_build: ServerBuildIdentity,
     connector_version: &str,
 ) -> TargetCapabilityManifest {

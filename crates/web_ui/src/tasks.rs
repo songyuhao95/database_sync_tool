@@ -1172,14 +1172,10 @@ impl Store {
             return Err(Error::Conflict("实例配置已变化，请重新选择实例并加载库表"));
         }
         let source_table = source
-            .tables(&input.schema)?
-            .into_iter()
-            .find(|table| table.name == input.table)
+            .table(&input.schema, &input.table)?
             .ok_or(Error::Validation("源表不存在或无权访问".into()))?;
         let sink_table = sink
-            .tables(&input.schema)?
-            .into_iter()
-            .find(|table| table.name == input.table)
+            .table(&input.schema, &input.table)?
             .ok_or(Error::Validation("目的表不存在或无权访问".into()))?;
         let source_column = source_table
             .columns
