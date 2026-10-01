@@ -24,6 +24,8 @@ live qualification；缺少对应实例或凭据时仍标记为 `REQUIRES_LIVE`�
 .\scripts\test.ps1 -Database mysql_5_7,mysql_8_0 -Stage Sql
 .\scripts\test.ps1 -Live -Database postgresql_15 -Stage ChangeEvent
 .\scripts\test.ps1 -Live -Database mysql_5_7,mysql_8_0,mysql_8_4 -Stage Web
+# 按登记的 suite 精确运行，避免重跑矩阵中的其他路线
+.\scripts\test.ps1 -Live -Database mysql_5_7 -Stage Web -SuiteId mysql_5_7.web_same_version_all_types
 
 # 临时使用另一个配置文件
 .\scripts\test.ps1 -Live -ConfigFile .\my-test.txt
@@ -31,9 +33,13 @@ live qualification；缺少对应实例或凭据时仍标记为 `REQUIRES_LIVE`�
 
 `test.txt` 使用 `KEY=VALUE` 格式，支持空行和以 `#` 开头的注释。值不要加引号；等号后的内容会原样作为配置值。未知字段、重复字段、空值或格式错误会立即停止测试。已经设置的同名进程环境变量优先于文件，方便 CI 临时覆盖。
 
+`-SuiteId` 可按 `test-matrix.json` 中的 suite ID 过滤。多个 ID 可用逗号分隔；无效 ID 会在测试前报错，`-List` 可预览筛选结果。
+
 控制台只显示最终覆盖矩阵和 `Report` 路径。Cargo 编译过程、每项测试输出和失败详情保存在该次报告目录的日志文件中。
 
 每次生成 `target/test-results/<时间-随机标识>/summary.json`、各用例日志、真机读取的 ChangeEvent JSONL，以及 MySQL 原始协议事件摘要。失败继续检查其他版本，最终退出码为 1；连接失败、筛选到零个测试都算失败。缺少凭据或未运行的真机测试显示 REQUIRES_LIVE，不会算作通过。
+
+`qualify.ps1 -Live` 的 `all_types_live_qualified` 只有在离线 6×6 矩阵、完整逐类型清单、六个 Source/Sink live suite、事务恢复、能力失效和全部必需 Web 路由均通过时才为 `true`。仅有安全拒绝、缺少逐类型读回或缺少 live 凭据不能达到此状态。
 
 | 阶段 | 本地检查 | 真机检查 |
 |---|---|---|

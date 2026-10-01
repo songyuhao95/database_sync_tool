@@ -1318,6 +1318,1386 @@
         "PG_CDC_WRITER_USER",
         "PG_CDC_TEST_PASSWORD"
       ]
+    },
+    {
+      "id": "mysql_5_7.web_all_native_types_to_mysql_8_0",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_5_7"
+      ],
+      "databases": [
+        "mysql_5_7",
+        "mysql_8_0"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql57_all_native_types_to_mysql80_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT",
+        "CDC_MYSQL80_PORT"
+      ]
+    },
+    {
+      "id": "mysql_5_7.web_all_native_types_to_mysql_8_4",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_5_7"
+      ],
+      "databases": [
+        "mysql_5_7",
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql57_all_native_types_to_mysql84_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT",
+        "CDC_MYSQL84_PORT"
+      ]
+    },
+    {
+      "id": "mysql_5_7.web_all_native_types_to_postgresql_15",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_5_7"
+      ],
+      "databases": [
+        "mysql_5_7",
+        "postgresql_15"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql57_all_native_types_to_postgresql15_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT",
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_5_7.web_all_native_types_to_postgresql_16",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_5_7"
+      ],
+      "databases": [
+        "mysql_5_7",
+        "postgresql_16"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql57_all_native_types_to_postgresql16_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT",
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_5_7.web_all_native_types_to_postgresql_17",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_5_7"
+      ],
+      "databases": [
+        "mysql_5_7",
+        "postgresql_17"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql57_all_native_types_to_postgresql17_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT",
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_0.web_all_native_types_to_mysql_5_7",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_0"
+      ],
+      "databases": [
+        "mysql_8_0",
+        "mysql_5_7"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql80_all_native_types_to_mysql57_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL80_PORT",
+        "CDC_MYSQL57_PORT"
+      ]
+    },
+    {
+      "id": "mysql_8_0.web_all_native_types_to_mysql_8_4",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_0"
+      ],
+      "databases": [
+        "mysql_8_0",
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql80_all_native_types_to_mysql84_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL80_PORT",
+        "CDC_MYSQL84_PORT"
+      ]
+    },
+    {
+      "id": "mysql_8_0.web_all_native_types_to_postgresql_15",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_0"
+      ],
+      "databases": [
+        "mysql_8_0",
+        "postgresql_15"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql80_all_native_types_to_postgresql15_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL80_PORT",
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_0.web_all_native_types_to_postgresql_16",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_0"
+      ],
+      "databases": [
+        "mysql_8_0",
+        "postgresql_16"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql80_all_native_types_to_postgresql16_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL80_PORT",
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_0.web_all_native_types_to_postgresql_17",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_0"
+      ],
+      "databases": [
+        "mysql_8_0",
+        "postgresql_17"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql80_all_native_types_to_postgresql17_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL80_PORT",
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_4.web_all_native_types_to_mysql_5_7",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_4"
+      ],
+      "databases": [
+        "mysql_8_4",
+        "mysql_5_7"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql84_all_native_types_to_mysql57_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL84_PORT",
+        "CDC_MYSQL57_PORT"
+      ]
+    },
+    {
+      "id": "mysql_8_4.web_all_native_types_to_mysql_8_0",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_4"
+      ],
+      "databases": [
+        "mysql_8_4",
+        "mysql_8_0"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql84_all_native_types_to_mysql80_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL84_PORT",
+        "CDC_MYSQL80_PORT"
+      ]
+    },
+    {
+      "id": "mysql_8_4.web_all_native_types_to_postgresql_15",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_4"
+      ],
+      "databases": [
+        "mysql_8_4",
+        "postgresql_15"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql84_all_native_types_to_postgresql15_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL84_PORT",
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_4.web_all_native_types_to_postgresql_16",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_4"
+      ],
+      "databases": [
+        "mysql_8_4",
+        "postgresql_16"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql84_all_native_types_to_postgresql16_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL84_PORT",
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "mysql_8_4.web_all_native_types_to_postgresql_17",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "mysql_8_4"
+      ],
+      "databases": [
+        "mysql_8_4",
+        "postgresql_17"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_mysql84_all_native_types_to_postgresql17_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL84_PORT",
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_15.web_all_builtin_types_to_mysql_5_7",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_15"
+      ],
+      "databases": [
+        "postgresql_15",
+        "mysql_5_7"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql15_all_builtin_types_to_mysql57_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_15.web_all_builtin_types_to_mysql_8_0",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_15"
+      ],
+      "databases": [
+        "postgresql_15",
+        "mysql_8_0"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql15_all_builtin_types_to_mysql80_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL80_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_15.web_all_builtin_types_to_mysql_8_4",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_15"
+      ],
+      "databases": [
+        "postgresql_15",
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql15_all_builtin_types_to_mysql84_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL84_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_15.web_all_builtin_types_to_postgresql_16",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_15"
+      ],
+      "databases": [
+        "postgresql_15",
+        "postgresql_16"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql15_all_builtin_types_to_postgresql16_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD",
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_15.web_all_builtin_types_to_postgresql_17",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_15"
+      ],
+      "databases": [
+        "postgresql_15",
+        "postgresql_17"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql15_all_builtin_types_to_postgresql17_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD",
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_16.web_all_builtin_types_to_mysql_5_7",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_16"
+      ],
+      "databases": [
+        "postgresql_16",
+        "mysql_5_7"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql16_all_builtin_types_to_mysql57_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_16.web_all_builtin_types_to_mysql_8_0",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_16"
+      ],
+      "databases": [
+        "postgresql_16",
+        "mysql_8_0"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql16_all_builtin_types_to_mysql80_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL80_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_16.web_all_builtin_types_to_mysql_8_4",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_16"
+      ],
+      "databases": [
+        "postgresql_16",
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql16_all_builtin_types_to_mysql84_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL84_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_16.web_all_builtin_types_to_postgresql_15",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_16"
+      ],
+      "databases": [
+        "postgresql_16",
+        "postgresql_15"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql16_all_builtin_types_to_postgresql15_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD",
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_16.web_all_builtin_types_to_postgresql_17",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_16"
+      ],
+      "databases": [
+        "postgresql_16",
+        "postgresql_17"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql16_all_builtin_types_to_postgresql17_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD",
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_17.web_all_builtin_types_to_mysql_5_7",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_17"
+      ],
+      "databases": [
+        "postgresql_17",
+        "mysql_5_7"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql17_all_builtin_types_to_mysql57_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL57_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_17.web_all_builtin_types_to_mysql_8_0",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_17"
+      ],
+      "databases": [
+        "postgresql_17",
+        "mysql_8_0"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql17_all_builtin_types_to_mysql80_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL80_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_17.web_all_builtin_types_to_mysql_8_4",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_17"
+      ],
+      "databases": [
+        "postgresql_17",
+        "mysql_8_4"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql17_all_builtin_types_to_mysql84_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD",
+        "CDC_MYSQL_HOST",
+        "CDC_MYSQL_READER_USER",
+        "CDC_MYSQL_READER_PASSWORD",
+        "CDC_MYSQL_WRITER_USER",
+        "CDC_MYSQL_WRITER_PASSWORD",
+        "CDC_MYSQL84_PORT"
+      ]
+    },
+    {
+      "id": "postgresql_17.web_all_builtin_types_to_postgresql_15",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_17"
+      ],
+      "databases": [
+        "postgresql_17",
+        "postgresql_15"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql17_all_builtin_types_to_postgresql15_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD",
+        "PG_CDC_HOST",
+        "PG_CDC_PORT",
+        "PG_CDC_ADMIN_USER",
+        "PG_CDC_READER_USER",
+        "PG_CDC_WRITER_USER",
+        "PG_CDC_TEST_PASSWORD"
+      ]
+    },
+    {
+      "id": "postgresql_17.web_all_builtin_types_to_postgresql_16",
+      "mode": "Live",
+      "category": "route_smoke",
+      "required_for_live_qualified": true,
+      "source_fixtures": [
+        "postgresql_17"
+      ],
+      "databases": [
+        "postgresql_17",
+        "postgresql_16"
+      ],
+      "stages": [
+        "Read",
+        "ChangeEvent",
+        "Sql",
+        "Web"
+      ],
+      "args": [
+        "test",
+        "--locked",
+        "-p",
+        "web_ui",
+        "--no-default-features",
+        "--lib",
+        "tests::runtime_tests::live_web_postgresql17_all_builtin_types_to_postgresql16_carriers",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "required_env": [
+        "PG_CDC17_HOST",
+        "PG_CDC17_PORT",
+        "PG_CDC17_ADMIN_USER",
+        "PG_CDC17_READER_USER",
+        "PG_CDC17_WRITER_USER",
+        "PG_CDC17_TEST_PASSWORD",
+        "PG_CDC16_HOST",
+        "PG_CDC16_PORT",
+        "PG_CDC16_ADMIN_USER",
+        "PG_CDC16_READER_USER",
+        "PG_CDC16_WRITER_USER",
+        "PG_CDC16_TEST_PASSWORD"
+      ]
     }
   ]
 }

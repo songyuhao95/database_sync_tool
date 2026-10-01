@@ -5,6 +5,7 @@ param(
     [ValidateSet('All', 'Read', 'ChangeEvent', 'Sql', 'Web')]
     [string]$Stage = 'All',
     [string[]]$Database = @('all'),
+    [string[]]$SuiteId = @(),
     [string]$ConfigFile = '',
     [switch]$List
 )
@@ -62,9 +63,16 @@ $databases = if ($Database -contains 'all') { @($connectorRoster) } else { @($Da
 foreach ($db in $databases) {
     if ($db -notin $connectorRoster) { throw "Unknown database '$db'. Available: $($connectorRoster -join ', ')" }
 }
+$knownSuiteIds = @($matrix.suites | ForEach-Object { [string]$_.id })
+foreach ($requestedSuite in $SuiteId) {
+    if ($requestedSuite -notin $knownSuiteIds) {
+        throw "Unknown suite '$requestedSuite'. Use -List to see registered suites."
+    }
+}
 $stages = if ($Stage -eq 'All') { @('Read', 'ChangeEvent', 'Sql') } else { @($Stage) }
 $selected = @($matrix.suites | Where-Object {
     $suite = $_
+    ($SuiteId.Count -eq 0 -or $suite.id -in $SuiteId) -and
     @($suite.databases | Where-Object { $_ -in $databases }).Count -gt 0 -and
     @($suite.stages | Where-Object { $_ -in $stages }).Count -gt 0 -and
     ($suite.mode -eq 'Local' -or $Live)

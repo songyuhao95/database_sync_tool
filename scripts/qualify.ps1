@@ -72,6 +72,13 @@ function Add-DatabaseEnvironment([object]$Suite) {
     return @($required | Select-Object -Unique)
 }
 
+function Get-SourceFixtureList([object]$Suite) {
+    if ($null -eq $Suite.source_fixtures) {
+        return @()
+    }
+    return @($Suite.source_fixtures)
+}
+
 function Run-Suite([object]$Suite, [string[]]$Required, [bool]$Execute) {
     $missing = @($Required | Where-Object {
         -not [string]::IsNullOrWhiteSpace($_) -and
@@ -107,6 +114,7 @@ function Run-Suite([object]$Suite, [string[]]$Required, [bool]$Execute) {
 
     $logName = "$($Suite.id).log"
     $lines | Set-Content -LiteralPath (Join-Path $out $logName) -Encoding UTF8
+    $sourceFixtures = @(Get-SourceFixtureList $Suite)
     $record = [pscustomobject]@{
         id                          = [string]$Suite.id
         mode                        = [string]$Suite.mode
@@ -116,10 +124,10 @@ function Run-Suite([object]$Suite, [string[]]$Required, [bool]$Execute) {
         missing_environment         = $missing
         required_for_live_qualified = [bool]$Suite.required_for_live_qualified
         databases                   = @($Suite.databases)
-        source_fixtures             = if ([string]$Suite.category -eq 'sink' -and @($Suite.source_fixtures).Count -eq 0) {
+        source_fixtures             = if ([string]$Suite.category -eq 'sink' -and $sourceFixtures.Count -eq 0) {
             @($connectorRoster)
         } else {
-            @($Suite.source_fixtures)
+            $sourceFixtures
         }
         log                         = $logName
     }
@@ -261,7 +269,7 @@ foreach ($sinkSpec in $sinkSpecs) {
             -not [bool]$sinkSuite.required_for_live_qualified) {
             throw "Additional sink suite $suiteId must be required for live qualification."
         }
-        if ($suiteId -eq [string]$sinkSpec.suite -and @($sinkSuite.source_fixtures).Count -gt 0) {
+        if ($suiteId -eq [string]$sinkSpec.suite -and @(Get-SourceFixtureList $sinkSuite).Count -gt 0) {
             throw "Primary sink suite $suiteId must derive source fixtures from type-inventory.json."
         }
     }
@@ -556,7 +564,11 @@ try {
             additional_suites = @($spec.additional_suites)
             suites = $suiteEvidence
             status = $status
-            source_fixtures = if ($null -ne $suite) { @($suite.source_fixtures) } else { @($roster) }
+            source_fixtures = if ($null -ne $suite -and @(Get-SourceFixtureList $suite).Count -gt 0) {
+                @(Get-SourceFixtureList $suite)
+            } else {
+                @($roster)
+            }
             log = if ($suiteEvidence.Count -gt 0) { $suiteEvidence[0].log } else { $null }
             reason = if ($status -eq 'REQUIRES_LIVE') { 'one_or_more_live_sink_suites_not_registered' } else { $null }
             evidence_scope = 'live_sink_adapter'
@@ -655,14 +667,15 @@ try {
     $offlineSuccess = $offlinePassed -and $missing.Count -eq 0
     $suiteFailures = @($results | Where-Object status -eq 'FAIL')
     $failed = $baselineFailed -or $missing.Count -gt 0 -or $suiteFailures.Count -gt 0 -or $passwordScan.matches_redacted -gt 0
-    if ($Live -and (-not $liveQualified -or -not $routeSmokeQualified)) { $failed = $true }
+    $allTypesLiveQualified = $offlineSuccess -and $typeInventoryComplete -and $liveQualified -and $routeSmokeQualified
+    if ($Live -and -not $allTypesLiveQualified) { $failed = $true }
     $success = -not $failed
     $report = [ordered]@{
         schema = 'cdc.qualification.v2'
         matrix_semantics = [ordered]@{
             offline_direction_matrix = 'six_by_six_planning_and_type_qualification'
             live_qualification = 'six_source_adapters_plus_six_sink_adapters_plus_common_transaction_recovery'
-            route_smoke = 'representative routes, same-version MySQL Web tasks on separate servers, and dynamic-type Web tasks from each PostgreSQL source to all six sink versions'
+            route_smoke = 'all 36 source-to-sink Web routes, plus 7 supplemental smoke suites; PostgreSQL catalog-discovered type routes from each source to all six sink versions; MySQL cross-version routes use separate server instances'
             live_database_to_database_links = $false
         }
         databases = @($config.databases)
@@ -672,6 +685,7 @@ try {
         offline_success = $offlineSuccess
         type_inventory_complete = $typeInventoryComplete
         type_inventory = $typeInventoryEvidence
+        all_types_live_qualified = $allTypesLiveQualified
         live_qualified = $liveQualified
         source_qualified = $sourceQualified
         sink_qualified = $sinkQualified
@@ -727,6 +741,7 @@ try {
     Write-Output "Capability invalidation qualified: $capabilityInvalidationQualified"
     Write-Output "Route smoke qualified: $routeSmokeQualified"
     Write-Output "Live qualified: $liveQualified"
+    Write-Output "All types live qualified: $allTypesLiveQualified"
     if ($null -ne $typeInventoryEvidence) {
         Write-Output "Native type inventory: $($typeInventoryEvidence.status)"
         Write-Output "Native types: $($typeInventoryEvidence.native_type_count); source declarations: $($typeInventoryEvidence.source_declaration_count); source mapping gaps: $($typeInventoryEvidence.source_mapping_gaps)"
