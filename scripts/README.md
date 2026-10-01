@@ -23,6 +23,7 @@ live qualification；缺少对应实例或凭据时仍标记为 `REQUIRES_LIVE`�
 .\scripts\test.ps1 -Live -Database mysql_8_4 -Stage Read
 .\scripts\test.ps1 -Database mysql_5_7,mysql_8_0 -Stage Sql
 .\scripts\test.ps1 -Live -Database postgresql_15 -Stage ChangeEvent
+.\scripts\test.ps1 -Live -Database mysql_5_7,mysql_8_0,mysql_8_4 -Stage Web
 
 # 临时使用另一个配置文件
 .\scripts\test.ps1 -Live -ConfigFile .\my-test.txt
@@ -40,7 +41,7 @@ live qualification；缺少对应实例或凭据时仍标记为 `REQUIRES_LIVE`�
 | ChangeEvent | 校验、完整事务、JSON 往返、无效位点与缺失值拒绝 | 真实 INSERT/UPDATE/DELETE、事务多行、回滚排除、精确值、复合主键变化；PG15/16/17 DEFAULT/FULL、TOAST、JSONB |
 | Sql | 固定事件 × 三种 MySQL 来源 × 六种 Sink 目标，匹配预期 SQL | MySQL 与 PG15/16/17 Sink 均写入并查询六种 Source fixture；校验重复键整事务回滚及 PG checkpoint 重启恢复 |
 
-Read 和 ChangeEvent 共用一次真机捕获，脚本不会重复执行同一用例。MySQL 当前还需要查询源表元信息，本地检查不代表已验证二进制解码。三种 MySQL 来源的 SQL 矩阵使用固定事件；这不是九条真实实例之间的端到端迁移测试。全量、故障注入和 Web 测试暂不属于这三个阶段；其他本地回归仍可执行 `cargo test --workspace`。
+Read 和 ChangeEvent 共用一次真机捕获，脚本不会重复执行同一用例。MySQL 当前还需要查询源表元信息，本地检查不代表已验证二进制解码。三种 MySQL 来源的 SQL 矩阵使用固定事件；这不是九条真实实例之间的端到端迁移测试。Web 阶段运行登记的端到端页面预检、创建、启动和写入测试；同版本 MySQL 测试要求在 `test.txt` 配置对应的 `CDC_MYSQL57_SINK_HOST/PORT`、`CDC_MYSQL80_SINK_HOST/PORT`、`CDC_MYSQL84_SINK_HOST/PORT` 独立目标端。未配置时显示 `REQUIRES_LIVE`。全量和故障注入测试不属于这些阶段；其他本地回归仍可执行 `cargo test --workspace`。
 
 `scripts/qualify.ps1 -Live` 还运行并单独报告目标能力失效：保存 MySQL 5.7 → PostgreSQL 15 计划后，测试改变本次创建的目标表定义，验证重新预检将计划标记为 stale，且任务无法启动。该项需要 MySQL 5.7 与 PostgreSQL 15 的 reader、writer、admin 配置；无配置时报告 `REQUIRES_LIVE`。
 

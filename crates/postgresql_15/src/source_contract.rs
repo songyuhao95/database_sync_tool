@@ -144,7 +144,13 @@ fn validate_image(
                     )));
                 }
             }
-            _ => validate_native_type_for_version(version, &column.native_type)?,
+            // Presence-only datums carry no source value to decode. In
+            // particular, UPDATE may mark an unchanged TOASTed value of a
+            // catalog-defined Raw type as Unchanged; that declaration was
+            // already resolved against the source catalog when the relation
+            // was decoded, and must not be rejected by this semantic-value
+            // allow-list.
+            Datum::Null | Datum::Unavailable | Datum::Unchanged => {}
         }
     }
     Ok(())
@@ -260,7 +266,10 @@ fn validate_native_type_for_version(
             && crate::type_mapping::validate_native_type_for_version(version, native_type).is_ok())
         || (native.starts_with("enum(")
             && crate::type_mapping::validate_native_type_for_version(version, native_type).is_ok());
-    ensure(supported, "unsupported PostgreSQL native type")
+    ensure(
+        supported,
+        &format!("unsupported PostgreSQL native type '{native_type}'"),
+    )
 }
 
 fn validate_representation(

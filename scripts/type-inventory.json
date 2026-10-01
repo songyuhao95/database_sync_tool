@@ -21,6 +21,7 @@
     "required_web_evidence": ["real_target_probe", "explicit_selection", "risk_confirmation", "saved_plan", "start_gate", "evidence"],
     "web_evidence_scope": "one verified Web plan per type_id@source_connector_id>sink_connector_id; aliases and sample parameter spellings share their native type identity, but do not count as extra pairs",
     "web_evidence_verification": "web_ui.preview_save_start_gate",
+  "same_version_web_evidence_verification": "web_ui.preview_save_start_gate",
     "evidence_registry": {
       "required_entry_fields": ["id", "type_id", "source_connector_id", "sink_connector_id", "axis", "status", "run_id", "suite_id", "target_storage_mode", "artifact_path", "report_digest"],
       "allowed_axes": ["source.protocol_capture", "source.semantic_codec", "source.change_event", "source.live", "source.source_representation_capture", "source.protocol_framing", "source.dynamic_type_class_fixture", "source.catalog_type_mapping", "sink.offline", "sink.live", "sink.representation_carrier", "sink.representation_preserved", "web.plan"],

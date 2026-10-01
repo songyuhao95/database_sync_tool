@@ -67,8 +67,12 @@ static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn new() -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cdc-web-ui-test-{}-{}",
+            "cdc-web-ui-test-{}-{nonce}-{}",
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));

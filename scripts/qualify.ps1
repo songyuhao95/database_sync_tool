@@ -4,7 +4,8 @@ param(
     [switch]$Live,
     [string]$ConfigFile = '',
     [string]$BaselineFile = '',
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [string[]]$AdditionalTypeEvidenceDirectory = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -115,7 +116,11 @@ function Run-Suite([object]$Suite, [string[]]$Required, [bool]$Execute) {
         missing_environment         = $missing
         required_for_live_qualified = [bool]$Suite.required_for_live_qualified
         databases                   = @($Suite.databases)
-        source_fixtures             = @($Suite.source_fixtures)
+        source_fixtures             = if ([string]$Suite.category -eq 'sink' -and @($Suite.source_fixtures).Count -eq 0) {
+            @($connectorRoster)
+        } else {
+            @($Suite.source_fixtures)
+        }
         log                         = $logName
     }
     $results.Add($record) | Out-Null
@@ -189,9 +194,9 @@ function Redact-ReportObject($Value) {
 
 # Validate the semantic registry before running tests. This prevents a future
 # configuration from silently turning a 6+6 qualification into 36 live links.
-$roster = @($config.live_qualification.source_fixture_roster)
+$roster = @($connectorRoster)
 if ($roster.Count -ne 6 -or @($roster | Select-Object -Unique).Count -ne 6) {
-    throw 'live_qualification.source_fixture_roster must contain six unique source fixtures.'
+    throw 'type-inventory.json must provide six unique source fixtures.'
 }
 $sourceSpecs = @($config.live_qualification.sources)
 $sinkSpecs = @($config.live_qualification.sinks)
@@ -256,9 +261,8 @@ foreach ($sinkSpec in $sinkSpecs) {
             -not [bool]$sinkSuite.required_for_live_qualified) {
             throw "Additional sink suite $suiteId must be required for live qualification."
         }
-        if ($suiteId -eq [string]$sinkSpec.suite -and
-            ((@($sinkSuite.source_fixtures) -join ',') -ne ($roster -join ','))) {
-            throw "Primary sink suite $suiteId must declare all six source fixtures."
+        if ($suiteId -eq [string]$sinkSpec.suite -and @($sinkSuite.source_fixtures).Count -gt 0) {
+            throw "Primary sink suite $suiteId must derive source fixtures from type-inventory.json."
         }
     }
 }
@@ -304,6 +308,40 @@ try {
     foreach ($suite in $suiteDefinitions | Where-Object { $_.mode -eq 'Live' -or $_.mode -eq 'Recovery' }) {
         $execute = ([string]$suite.mode -eq 'Recovery') -or $Live
         Run-Suite $suite (Add-DatabaseEnvironment $suite) $execute
+    }
+
+    $additionalTypeEvidenceImported = 0
+    $externalTypeEvidencePath = Join-Path $out 'type-evidence'
+    New-Item -ItemType Directory -Path $externalTypeEvidencePath -Force | Out-Null
+    foreach ($evidenceDirectory in $AdditionalTypeEvidenceDirectory) {
+        $resolvedEvidenceDirectory = if ([IO.Path]::IsPathRooted($evidenceDirectory)) {
+            [IO.Path]::GetFullPath($evidenceDirectory)
+        } else {
+            [IO.Path]::GetFullPath((Join-Path $root $evidenceDirectory))
+        }
+        if (-not (Test-Path -LiteralPath $resolvedEvidenceDirectory -PathType Container)) {
+            throw "Additional type evidence directory does not exist: $evidenceDirectory"
+        }
+        foreach ($file in Get-ChildItem -LiteralPath $resolvedEvidenceDirectory -File -Filter '*.json' -Recurse) {
+            $artifact = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+            if ($artifact.schema -ne 'cdc.type_qualification_evidence_report.v1') { continue }
+
+            $destinationName = $file.Name
+            $destinationPath = Join-Path $externalTypeEvidencePath $destinationName
+            $collision = 0
+            while (Test-Path -LiteralPath $destinationPath) {
+                $collision++
+                $destinationName = '{0}-import-{1}{2}' -f $file.BaseName, $collision, $file.Extension
+                $destinationPath = Join-Path $externalTypeEvidencePath $destinationName
+            }
+            $artifact.artifact_path = [IO.Path]::GetRelativePath($root, $destinationPath).Replace('\', '/')
+            $json = ConvertTo-Json -InputObject $artifact -Depth 64
+            [IO.File]::WriteAllText($destinationPath, $json, [Text.UTF8Encoding]::new($false))
+            $additionalTypeEvidenceImported++
+        }
+    }
+    if ($additionalTypeEvidenceImported -gt 0) {
+        Write-Output "Imported additional type evidence artifacts: $additionalTypeEvidenceImported"
     }
 
     $typeEvidenceReportSuite = [pscustomobject]@{
@@ -624,7 +662,7 @@ try {
         matrix_semantics = [ordered]@{
             offline_direction_matrix = 'six_by_six_planning_and_type_qualification'
             live_qualification = 'six_source_adapters_plus_six_sink_adapters_plus_common_transaction_recovery'
-            route_smoke = 'representative_end_to_end_runtime_routes'
+            route_smoke = 'representative routes, same-version MySQL Web tasks on separate servers, and dynamic-type Web tasks from each PostgreSQL source to all six sink versions'
             live_database_to_database_links = $false
         }
         databases = @($config.databases)

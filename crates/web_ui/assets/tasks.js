@@ -224,7 +224,7 @@ function compatibilityHumanSummary(source,sink,result,plan,targetOverride,candid
   if(!['logical_value_json','source_representation'].includes(kind)&&qualification==='EXACT')targetBehavior='目的端按 '+targetType+' 原生类型保存，可使用该类型已验证的查询、比较和约束行为。';
   else if(!['logical_value_json','source_representation'].includes(kind)&&qualification==='RANGE_CHECKED')targetBehavior='目的端按 '+targetType+' 保存；仅在计划声明的范围/精度内保留值，相关约束需按目标字段定义执行。';
   else if(!['logical_value_json','source_representation'].includes(kind)&&qualification==='EXPLICIT_CONVERSION')targetBehavior='目的端使用 '+targetType+' 保存显式转换结果；上面列出的源类型行为变化不会自动恢复。';
-  return {difference:difference.join('；'),conversion,target:targetText,example:exampleText,retained,targetBehavior,loss,locator,prerequisite:targetPrerequisite,status,riskLabel:compatibilityRiskLabel(plan?.risk||candidate?.risk||result?.risk)};
+  return {difference:difference.join('；'),conversion,target:targetText,example:exampleText,retained,targetBehavior,loss,risk,locator,prerequisite:targetPrerequisite,status,riskLabel:compatibilityRiskLabel(plan?.risk||candidate?.risk||result?.risk)};
 }
 function appendCompatibilitySummary(parent,summary) {
   const section=node('section','compatibility-human-summary');

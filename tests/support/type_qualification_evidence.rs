@@ -341,15 +341,18 @@ pub fn record_dynamic_type_class_evidence(
         .flat_map(|class_id| {
             let type_id = format!("dynamic:{class_id}");
             let run_id = run_id.clone();
-            [
+            let mut axes = vec![
                 "source.dynamic_type_class_fixture",
                 "source.protocol_capture",
-                "source.semantic_codec",
                 "source.change_event",
                 "source.live",
-            ]
-            .into_iter()
-            .map(move |axis| {
+            ];
+            if class_id == "postgresql.other_defined_catalog_types" {
+                axes.push("source.source_representation_capture");
+            } else {
+                axes.push("source.semantic_codec");
+            }
+            axes.into_iter().map(move |axis| {
                 json!({
                     "id": format!("{type_id}@{connector_id}:{axis}:{run_id}"),
                     "type_id": type_id.clone(),
@@ -390,6 +393,86 @@ pub fn record_dynamic_type_class_evidence(
         "TYPE_EVIDENCE {suite_id}: {} dynamic PostgreSQL catalog classes exercised",
         report["evidence"].as_array().map_or(0, Vec::len)
     );
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn record_dynamic_type_class_sink_evidence(
+    source_connector_id: &str,
+    sink_connector_id: &str,
+    suite_id: &str,
+    class_ids: impl IntoIterator<Item = String>,
+    outcome: &str,
+    target_storage_mode: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if outcome != "SOURCE_REPRESENTATION_PRESERVED"
+        || target_storage_mode != "source_representation_blob_carrier"
+    {
+        return Err(std::io::Error::other(
+            "dynamic catalog fallback evidence requires a read-back-verified source representation carrier",
+        )
+        .into());
+    }
+    let Some(directory) = env::var_os("CDC_TYPE_QUALIFICATION_ARTIFACT_DIR") else {
+        return Ok(());
+    };
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory)?;
+    let root = workspace_root()?;
+    let artifact_directory = directory.canonicalize()?;
+    let relative_directory = artifact_directory.strip_prefix(&root).map_err(|_| {
+        std::io::Error::other("type qualification evidence directory must be within the workspace")
+    })?;
+    let artifact_path = relative_directory
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let run_id = format!("{source_connector_id}-to-{sink_connector_id}-dynamic-{timestamp}");
+    let records = class_ids
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .flat_map(|class_id| {
+            let type_id = format!("dynamic:{class_id}");
+            let run_id = run_id.clone();
+            ["sink.offline", "sink.live", "sink.representation_carrier", "sink.representation_preserved"]
+                .into_iter()
+                .map(move |axis| {
+                    json!({
+                        "id": format!("{type_id}@{source_connector_id}>{sink_connector_id}:{axis}:{run_id}"),
+                        "type_id": type_id.clone(),
+                        "source_connector_id": source_connector_id,
+                        "sink_connector_id": sink_connector_id,
+                        "axis": axis,
+                        "status": "PASS",
+                        "run_id": run_id.clone(),
+                        "outcome": outcome,
+                        "target_storage_mode": target_storage_mode
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Err(std::io::Error::other("dynamic sink fixture matched no type classes").into());
+    }
+    let file_name = format!("{run_id}.json");
+    let report = json!({
+        "schema": "cdc.type_qualification_evidence_report.v1",
+        "run_id": run_id,
+        "suite_id": suite_id,
+        "artifact_path": format!("{artifact_path}/{file_name}"),
+        "assertions": [
+            "the same captured catalog-defined source representation was applied by the live Sink",
+            "the precreated carrier returned the exact validated envelope including payload digest and type context"
+        ],
+        "evidence": records
+    });
+    fs::write(
+        directory.join(file_name),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
     Ok(())
 }
 

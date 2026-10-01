@@ -204,6 +204,71 @@ pub async fn source_type_catalog(conn: &mut PgConnection) -> Result<crate::Sourc
     )
     .fetch_all(&mut *conn)
     .await?;
+
+    // Load dependent catalog rows in batches. The type catalog contains many
+    // PostgreSQL system composites; querying pg_attribute once per composite
+    // made startup time grow with the number of types and could take minutes
+    // on a remote server.
+    let mut enum_labels_by_oid: HashMap<u32, Vec<String>> = HashMap::new();
+    for row in sqlx::query(
+        "SELECT enumtypid::bigint AS type_oid, enumlabel
+           FROM pg_enum
+          ORDER BY enumtypid, enumsortorder",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        let oid = u32::try_from(row.try_get::<i64, _>("type_oid")?)?;
+        enum_labels_by_oid
+            .entry(oid)
+            .or_default()
+            .push(row.try_get("enumlabel")?);
+    }
+
+    let mut domain_constraints_by_oid: HashMap<u32, Vec<String>> = HashMap::new();
+    for row in sqlx::query(
+        "SELECT contypid::bigint AS type_oid, pg_get_constraintdef(oid) AS definition
+           FROM pg_constraint
+          WHERE contypid <> 0
+          ORDER BY contypid, oid",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        let oid = u32::try_from(row.try_get::<i64, _>("type_oid")?)?;
+        domain_constraints_by_oid
+            .entry(oid)
+            .or_default()
+            .push(row.try_get("definition")?);
+    }
+
+    let mut composite_fields_by_relid: HashMap<u32, Vec<SourceTypeField>> = HashMap::new();
+    for row in sqlx::query(
+        "SELECT t.typrelid::bigint AS relid, a.attname,
+                a.atttypid::bigint AS type_oid, NOT a.attnotnull AS nullable
+           FROM pg_type t
+           JOIN pg_namespace n ON n.oid=t.typnamespace
+           JOIN pg_attribute a ON a.attrelid=t.typrelid
+          WHERE t.typisdefined AND t.typtype='c'
+            AND n.nspname NOT LIKE 'pg_toast%'
+            AND a.attnum>0 AND NOT a.attisdropped
+          ORDER BY t.typrelid, a.attnum",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        let relid = u32::try_from(row.try_get::<i64, _>("relid")?)?;
+        let field = SourceTypeField::new(
+            row.try_get::<String, _>("attname")?,
+            u32::try_from(row.try_get::<i64, _>("type_oid")?)?,
+            row.try_get("nullable")?,
+        );
+        composite_fields_by_relid
+            .entry(relid)
+            .or_default()
+            .push(field);
+    }
+
     let mut definitions = Vec::with_capacity(rows.len());
     for row in rows {
         let oid = u32::try_from(row.try_get::<i64, _>("oid")?)?;
@@ -255,53 +320,27 @@ pub async fn source_type_catalog(conn: &mut PgConnection) -> Result<crate::Sourc
                 )
             }
             "b" => SourceTypeDefinition::builtin(oid, &schema, &name),
-            "e" => {
-                let labels = sqlx::query_scalar::<_, String>(
-                    "SELECT enumlabel FROM pg_enum WHERE enumtypid=$1::bigint::oid ORDER BY enumsortorder",
-                )
-                .bind(i64::from(oid))
-                .fetch_all(&mut *conn)
-                .await?;
-                SourceTypeDefinition::enum_type(oid, &schema, &name, labels)
-            }
+            "e" => SourceTypeDefinition::enum_type(
+                oid,
+                &schema,
+                &name,
+                enum_labels_by_oid.remove(&oid).unwrap_or_default(),
+            ),
             "d" => {
                 let base_oid = u32::try_from(row.try_get::<i64, _>("base_oid")?)?;
-                let constraints = sqlx::query_scalar::<_, String>(
-                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contypid=$1::bigint::oid ORDER BY oid",
-                )
-                .bind(i64::from(oid))
-                .fetch_all(&mut *conn)
-                .await?;
                 SourceTypeDefinition::domain(
                     oid,
                     &schema,
                     &name,
                     base_oid,
-                    constraints,
+                    domain_constraints_by_oid.remove(&oid).unwrap_or_default(),
                     row.try_get("typnotnull")?,
                     row.try_get("collation")?,
                 )
             }
             "c" => {
                 let relid = u32::try_from(row.try_get::<i64, _>("relid")?)?;
-                let fields = sqlx::query(
-                    "SELECT attname,atttypid::bigint AS type_oid,NOT attnotnull AS nullable
-                       FROM pg_attribute
-                      WHERE attrelid=$1::bigint::oid AND attnum>0 AND NOT attisdropped
-                      ORDER BY attnum",
-                )
-                .bind(i64::from(relid))
-                .fetch_all(&mut *conn)
-                .await?
-                .into_iter()
-                .map(|field| {
-                    Ok(SourceTypeField::new(
-                        field.try_get::<String, _>("attname")?,
-                        u32::try_from(field.try_get::<i64, _>("type_oid")?)?,
-                        field.try_get("nullable")?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
+                let fields = composite_fields_by_relid.remove(&relid).unwrap_or_default();
                 SourceTypeDefinition::composite(oid, &schema, &name, fields)
             }
             "r" => SourceTypeDefinition::range(

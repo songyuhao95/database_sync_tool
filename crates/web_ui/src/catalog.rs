@@ -100,12 +100,8 @@ pub(crate) struct CatalogConnection {
     pub database: Option<String>,
     pub metadata: Metadata,
     pub source_type_catalog: Option<postgresql_15::SourceTypeCatalog>,
-    host: String,
-    port: u16,
     kind: String,
     version: String,
-    username: String,
-    password: String,
     conn: CatalogBackend,
 }
 
@@ -196,11 +192,8 @@ impl Store {
         }
         .ok_or(Error::Invalid("Web 未注册该数据库连接器"))?;
         if kind == "postgresql" {
-            let probe_host = host.clone();
             let probe_kind = kind.clone();
             let probe_version = version.clone();
-            let probe_username = username.clone();
-            let probe_password = password.clone();
             let database_for_connection = database.clone();
             let (runtime, conn, metadata, source_type_catalog) = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -264,12 +257,8 @@ impl Store {
                 database: Some(database),
                 metadata: Metadata::Postgresql(metadata),
                 source_type_catalog,
-                host: probe_host,
-                port,
                 kind: probe_kind,
                 version: probe_version,
-                username: probe_username,
-                password: probe_password,
                 conn: CatalogBackend::Postgresql {
                     runtime: Some(runtime),
                     conn,
@@ -296,6 +285,14 @@ impl Store {
         if !actual_version.starts_with(&format!("{version}.")) {
             return Err(Error::Invalid("实际 MySQL 版本与实例配置不符"));
         }
+        if role == EndpointRole::Sink {
+            conn.query_drop("SET SESSION time_zone = '+00:00'")
+                .map_err(|_| Error::Invalid("设置目的端会话时区失败"))?;
+            conn.query_drop(
+                "SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION,NO_AUTO_VALUE_ON_ZERO'",
+            )
+            .map_err(|_| Error::Invalid("设置目的端会话 SQL 模式失败"))?;
+        }
         Ok(CatalogConnection {
             revision,
             server_uuid,
@@ -308,12 +305,8 @@ impl Store {
                 gtid_mode: gtid,
             },
             source_type_catalog: None,
-            host,
-            port,
             kind,
             version,
-            username,
-            password,
             conn: CatalogBackend::Mysql(conn),
         })
     }
@@ -349,39 +342,24 @@ impl CatalogConnection {
         column: &str,
     ) -> Result<change_event::TargetCapabilityProbe> {
         let probe = match (self.kind.as_str(), self.version.as_str()) {
-            ("mysql", "5.7") => mysql_5_7::probe_target(
-                &mysql_5_7::TargetConfig {
-                    host: self.host.clone(),
-                    port: self.port,
-                    user: self.username.clone(),
-                    password: self.password.clone(),
-                },
-                schema,
-                table,
-                column,
-            ),
-            ("mysql", "8.0") => mysql_8_0::probe_target(
-                &mysql_8_0::TargetConfig {
-                    host: self.host.clone(),
-                    port: self.port,
-                    user: self.username.clone(),
-                    password: self.password.clone(),
-                },
-                schema,
-                table,
-                column,
-            ),
-            ("mysql", "8.4") => mysql_8_4::probe_target(
-                &mysql_8_4::TargetConfig {
-                    host: self.host.clone(),
-                    port: self.port,
-                    user: self.username.clone(),
-                    password: self.password.clone(),
-                },
-                schema,
-                table,
-                column,
-            ),
+            ("mysql", "5.7") => match &mut self.conn {
+                CatalogBackend::Mysql(conn) => {
+                    mysql_5_7::probe_target_with_connection(conn, schema, table, column)
+                }
+                CatalogBackend::Postgresql { .. } => return Err(Error::Internal),
+            },
+            ("mysql", "8.0") => match &mut self.conn {
+                CatalogBackend::Mysql(conn) => {
+                    mysql_8_0::probe_target_with_connection(conn, schema, table, column)
+                }
+                CatalogBackend::Postgresql { .. } => return Err(Error::Internal),
+            },
+            ("mysql", "8.4") => match &mut self.conn {
+                CatalogBackend::Mysql(conn) => {
+                    mysql_8_4::probe_target_with_connection(conn, schema, table, column)
+                }
+                CatalogBackend::Postgresql { .. } => return Err(Error::Internal),
+            },
             ("postgresql", target_version) => {
                 let (runtime, conn) = match &mut self.conn {
                     CatalogBackend::Postgresql { runtime, conn } => {

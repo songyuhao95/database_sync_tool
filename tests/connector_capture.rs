@@ -1396,6 +1396,15 @@ macro_rules! capture_tests {
 
             #[test]
             #[ignore = "requires an explicitly configured test database"]
+            fn live_visible_type_catalog_mapping() {
+                let port = port($port_key, $port);
+                let mut table = AllMysqlTypesTable::create(port);
+                qualify_mysql_visible_catalog_types(stringify!($adapter), port);
+                table.cleanup();
+            }
+
+            #[test]
+            #[ignore = "requires an explicitly configured test database"]
             fn live_all_mysql_type_capture() {
                 let port = port($port_key, $port);
                 let mut table = AllMysqlTypesTable::create(port);

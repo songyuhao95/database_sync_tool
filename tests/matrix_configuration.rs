@@ -63,12 +63,6 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
         .expect("qualification matrix must be valid JSON");
     let matrix: Value = serde_json::from_str(include_str!("../scripts/test-matrix.json"))
         .expect("test matrix must be valid JSON");
-    let roster = config["live_qualification"]["source_fixture_roster"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|value| value.as_str().unwrap())
-        .collect::<Vec<_>>();
     let inventory: Value = serde_json::from_str(include_str!("../scripts/type-inventory.json"))
         .expect("type inventory must be valid JSON");
     let type_roster = inventory["connectors"]
@@ -81,12 +75,30 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
         config.get("databases").is_none(),
         "type inventory owns the connector roster"
     );
-    assert_eq!(roster, type_roster);
+    assert!(
+        config["live_qualification"]
+            .get("source_fixture_roster")
+            .is_none()
+    );
 
     let sources = config["live_qualification"]["sources"].as_array().unwrap();
     let sinks = config["live_qualification"]["sinks"].as_array().unwrap();
     assert_eq!(sources.len(), 6);
     assert_eq!(sinks.len(), 6);
+    assert_eq!(
+        sources
+            .iter()
+            .map(|entry| entry["database"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        type_roster
+    );
+    assert_eq!(
+        sinks
+            .iter()
+            .map(|entry| entry["database"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        type_roster
+    );
     assert!(
         !config["live_qualification"]["route_smoke"]
             .as_array()
@@ -122,15 +134,60 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             "the PostgreSQL carrier suite must gate {database} qualification"
         );
     }
-
     let suites = matrix["suites"].as_array().unwrap();
+    for (database, suite_id, sink_host_env, sink_port_env) in [
+        (
+            "mysql_5_7",
+            "mysql_5_7.web_same_version_all_types",
+            "CDC_MYSQL57_SINK_HOST",
+            "CDC_MYSQL57_SINK_PORT",
+        ),
+        (
+            "mysql_8_0",
+            "mysql_8_0.web_same_version_all_types",
+            "CDC_MYSQL80_SINK_HOST",
+            "CDC_MYSQL80_SINK_PORT",
+        ),
+        (
+            "mysql_8_4",
+            "mysql_8_4.web_same_version_all_types",
+            "CDC_MYSQL84_SINK_HOST",
+            "CDC_MYSQL84_SINK_PORT",
+        ),
+    ] {
+        let route = suites
+            .iter()
+            .find(|suite| suite["id"] == suite_id)
+            .unwrap_or_else(|| panic!("missing same-version Web route for {database}"));
+        assert_eq!(route["category"], "route_smoke");
+        assert!(
+            route["required_for_live_qualified"] == true
+                && route["required_env"].as_array().is_some_and(|env| {
+                    env.iter().any(|name| name == sink_host_env)
+                        && env.iter().any(|name| name == sink_port_env)
+                }),
+            "same-version Web qualification for {database} requires a separate target host and port"
+        );
+    }
+
     assert_eq!(
         suites
             .iter()
             .filter(|suite| suite["category"] == "source")
             .count(),
-        16
+        19
     );
+    for (database, expected_suite) in [
+        ("mysql_5_7", "mysql_5_7.visible_type_catalog"),
+        ("mysql_8_0", "mysql_8_0.visible_type_catalog"),
+        ("mysql_8_4", "mysql_8_4.visible_type_catalog"),
+    ] {
+        assert!(
+            suites.iter().any(|suite| suite["id"] == expected_suite
+                && suite["required_for_live_qualified"] == true),
+            "the visible MySQL type catalog suite must gate {database} qualification"
+        );
+    }
     let mysql_snapshot_suite = suites
         .iter()
         .find(|suite| suite["id"] == "mysql.all_types_snapshot_round_trip")
@@ -439,15 +496,9 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .find(|candidate| candidate["id"] == carrier_suite)
             .expect("every Sink must register a carrier qualification suite");
         assert_eq!(carrier_definition["required_for_live_qualified"], true);
-        let fixtures = suite["source_fixtures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            fixtures, roster,
-            "every live Sink suite consumes six source fixtures"
+        assert!(
+            suite.get("source_fixtures").is_none(),
+            "primary sink suites derive canonical fixtures instead of duplicating the roster"
         );
         if let Some(major) = sink["database"]
             .as_str()

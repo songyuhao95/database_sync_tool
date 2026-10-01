@@ -4,7 +4,6 @@
   "source_only": [],
   "unsupported": [],
   "live_qualification": {
-    "source_fixture_roster": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
     "sources": [
       {"database": "mysql_5_7", "suite": "mysql_5_7.capture", "additional_suites": ["mysql_5_7.all_types_capture"]},
       {"database": "mysql_8_0", "suite": "mysql_8_0.capture", "additional_suites": ["mysql_8_0.all_types_capture"]},
@@ -23,6 +22,20 @@
     ],
     "transaction_recovery": ["transaction_recovery.common"],
     "capability_invalidation": ["postgresql_15.capability_invalidation"],
-    "route_smoke": ["postgresql_15.capture_to_mysql", "postgresql_15.web_sink", "mysql_5_7.web_explicit_carrier", "postgresql.dynamic_types_all_sinks"]
+    "route_smoke": [
+      "postgresql_15.capture_to_mysql",
+      "postgresql_15.web_sink",
+      "mysql_5_7.web_explicit_carrier",
+      "mysql_5_7.web_same_version_all_types",
+      "mysql_8_0.web_same_version_all_types",
+      "mysql_8_4.web_same_version_all_types",
+      "postgresql.dynamic_types_all_sinks",
+      "postgresql_15.web_all_builtin_types_self_sink",
+      "postgresql_16.web_all_builtin_types_self_sink",
+      "postgresql_17.web_all_builtin_types_self_sink",
+      "postgresql_15.web_dynamic_types_all_sinks",
+      "postgresql_16.web_dynamic_types_all_sinks",
+      "postgresql_17.web_dynamic_types_all_sinks"
+    ]
   }
 }

@@ -45,6 +45,19 @@ versions never borrow PostgreSQL 15 connection settings, and server-version
 assertions reject a misrouted endpoint. Without those settings the live
 component status remains `REQUIRES_LIVE`.
 
+Same-version MySQL Web qualification uses independent source and target
+servers because task start rejects equal MySQL `server_uuid` values to prevent
+replication loops. Keep the normal source ports in `CDC_MYSQL57_PORT`,
+`CDC_MYSQL80_PORT`, and `CDC_MYSQL84_PORT`; configure a second server of each
+version with `CDC_MYSQL57_SINK_PORT`, `CDC_MYSQL80_SINK_PORT`, and
+`CDC_MYSQL84_SINK_PORT`, and set its host in `CDC_MYSQL57_SINK_HOST`,
+`CDC_MYSQL80_SINK_HOST`, or `CDC_MYSQL84_SINK_HOST`. The sink endpoint must
+report the same MySQL version as its source port but a different server UUID.
+The test reuses the configured reader/writer usernames and passwords on that
+endpoint. Until the host, port, credentials, and matching independent server
+are configured, the corresponding same-version Web routes remain
+`REQUIRES_LIVE`.
+
 The console contains only an ordered final matrix, missing-direction count,
 and report location. Cargo output stays in per-suite logs. `summary.json`
 contains the complete offline matrix, per-case qualification and status,

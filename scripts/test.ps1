@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [switch]$Live,
-    [ValidateSet('All', 'Read', 'ChangeEvent', 'Sql')]
+    [ValidateSet('All', 'Read', 'ChangeEvent', 'Sql', 'Web')]
     [string]$Stage = 'All',
     [string[]]$Database = @('all'),
     [string]$ConfigFile = '',
@@ -153,6 +153,7 @@ try {
                 $checks = @($results | Where-Object { $db -in $_.databases -and $part -in $_.stages -and $_.mode -eq $mode })
                 $registered = @($matrix.suites | Where-Object { $db -in $_.databases -and $part -in $_.stages -and $_.mode -eq $mode })
                 $states[$mode] = if ($unsupported.Count) { 'UNSUPPORTED' }
+                    elseif ($part -eq 'Web' -and $mode -eq 'Local') { 'UNSUPPORTED' }
                     elseif (@($checks | Where-Object status -eq 'FAIL').Count) { 'FAIL' }
                     elseif (@($checks | Where-Object status -eq 'REQUIRES_LIVE').Count) { 'REQUIRES_LIVE' }
                     elseif ($checks.Count) { 'PASS' }

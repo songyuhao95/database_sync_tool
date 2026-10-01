@@ -100,6 +100,7 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
                     matrix integer[] NOT NULL,
                     span {schema}.intspan NOT NULL,
                     spans {schema}.intspan_multirange NOT NULL,
+                    catalog_internal pg_catalog.pg_node_tree NOT NULL,
                     nullable_marker text
                     {extension_columns}
                 )"
@@ -184,6 +185,14 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
         ] {
             execute(&mut writer, setting.into()).await?;
         }
+        let catalog_tree_text: Option<String> = sqlx::query_scalar(
+            "SELECT ev_action::text FROM pg_catalog.pg_rewrite ORDER BY oid LIMIT 1",
+        )
+        .fetch_one(&mut writer)
+        .await?;
+        let catalog_tree_text = catalog_tree_text.ok_or_else(|| {
+            std::io::Error::other("selected pg_catalog.pg_rewrite row has NULL ev_action")
+        })?;
         let mut insert_columns = vec![
             "id",
             "mood",
@@ -193,6 +202,7 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
             "matrix",
             "span",
             "spans",
+            "catalog_internal",
             "nullable_marker",
         ];
         let mut insert_values = vec![
@@ -208,6 +218,7 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
             "'[0:1][2:3]={{1,NULL},{3,4}}'::integer[]".to_owned(),
             format!("'[1,8)'::{schema}.intspan"),
             format!("'{{[1,3),[5,8)}}'::{schema}.intspan_multirange"),
+            "(SELECT ev_action FROM pg_catalog.pg_rewrite ORDER BY oid LIMIT 1)".to_owned(),
             "NULL".to_owned(),
         ];
         if let Some(extension_schema) = &hstore_schema {
@@ -260,6 +271,15 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
         assert!(matches!(get("matrix"), Datum::Value(LogicalValue::ArrayWithMetadata { elements, dimensions: 2, lower_bounds, dimension_lengths }) if elements.len() == 4 && lower_bounds == &[0, 2] && dimension_lengths == &[2, 2] && matches!(elements[1], LogicalValue::Null)));
         assert!(matches!(get("span"), Datum::Value(LogicalValue::Range { empty: false, lower: Some(lower), upper: Some(upper), lower_inclusive: true, upper_inclusive: false }) if matches!(lower.as_ref(), LogicalValue::Integer { value, .. } if value == "1") && matches!(upper.as_ref(), LogicalValue::Integer { value, .. } if value == "8")));
         assert!(matches!(get("spans"), Datum::Value(LogicalValue::MultiRange { ranges }) if ranges.len() == 2));
+        match get("catalog_internal") {
+            Datum::SourceRepresentationEnvelope(envelope) => {
+                assert_eq!(envelope.raw_bytes()?, catalog_tree_text.as_bytes());
+                assert!(envelope.context.type_metadata["native_type"].ends_with("pg_node_tree"));
+            }
+            other => return Err(std::io::Error::other(format!(
+                "pg_catalog.pg_node_tree did not enter ChangeEvent as a source representation: {other:?}"
+            )).into()),
+        }
         assert!(matches!(get("nullable_marker"), Datum::Null));
         if hstore_schema.is_some() {
             assert!(matches!(get("attributes"), Datum::Value(LogicalValue::Map { entries }) if entries.len() == 2));
@@ -282,6 +302,7 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
             reader.finish()?;
         }
         let mut dynamic_classes = vec![
+            "postgresql.other_defined_catalog_types".to_owned(),
             "postgresql.arrays".to_owned(),
             "postgresql.domains".to_owned(),
             "postgresql.enums".to_owned(),

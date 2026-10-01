@@ -574,6 +574,18 @@ pub fn probe_target(
     column: &str,
 ) -> io::Result<TargetCapabilityProbe> {
     let mut conn = connect(config, None)?;
+    probe_target_with_connection(&mut conn, schema, table, column)
+}
+
+/// Probe target catalog and session capabilities on a caller-owned writer
+/// connection. This keeps batch preflight from opening one network connection
+/// per mapped column.
+pub fn probe_target_with_connection(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> io::Result<TargetCapabilityProbe> {
     let (version, version_comment, time_zone, sql_mode): (String, String, String, String) = conn
         .query_first("SELECT VERSION(), @@version_comment, @@time_zone, @@sql_mode")
         .map_err(io::Error::other)?
@@ -648,6 +660,7 @@ pub fn probe_target(
             | "multilinestring"
             | "multipolygon"
             | "geometrycollection"
+            | "geomcollection"
     );
     let qualified = engine.eq_ignore_ascii_case("InnoDB") && triggers == 0 && foreign_keys == 0;
     let mut capabilities = manifest
