@@ -2643,10 +2643,13 @@ fn type_inventory_coverage() -> Value {
             })
             .collect::<Vec<_>>();
         for axis in ["protocol_capture", "semantic_codec", "change_event"] {
-            let passed = !scoped.is_empty()
-                && scoped.iter().all(|declaration| {
+            let qualified_count = scoped
+                .iter()
+                .filter(|declaration| {
                     declaration_source_axis_qualified(declaration, evidence_registry, axis)
-                });
+                })
+                .count();
+            let passed = !scoped.is_empty() && qualified_count == scoped.len();
             profile[axis]["status"] = json!(if scoped.is_empty() {
                 "NOT_REQUIRED"
             } else if passed {
@@ -2654,16 +2657,20 @@ fn type_inventory_coverage() -> Value {
             } else {
                 "REQUIRES_PER_TYPE_QUALIFICATION"
             });
-            profile[axis]["qualified_declaration_count"] =
-                json!(if passed { scoped.len() } else { 0 });
+            profile[axis]["qualified_declaration_count"] = json!(qualified_count);
+            profile[axis]["evidence"] = json!([format!(
+                "Derived from artifact-bound per-type source.{axis} receipts: {qualified_count}/{} declarations qualified; each declaration contains its receipt IDs.",
+                scoped.len()
+            )]);
         }
         let representation_rows = scoped
             .iter()
             .copied()
             .filter(|declaration| declaration_requires_source_representation(declaration))
             .collect::<Vec<_>>();
-        let representation_passed = !representation_rows.is_empty()
-            && representation_rows.iter().all(|declaration| {
+        let representation_qualified_count = representation_rows
+            .iter()
+            .filter(|declaration| {
                 declaration_source_axis_qualified(
                     declaration,
                     evidence_registry,
@@ -2673,7 +2680,10 @@ fn type_inventory_coverage() -> Value {
                     evidence_registry,
                     "protocol_framing",
                 )
-            });
+            })
+            .count();
+        let representation_passed = !representation_rows.is_empty()
+            && representation_qualified_count == representation_rows.len();
         profile["source_representation_capture"]["status"] =
             json!(if representation_rows.is_empty() {
                 "NOT_REQUIRED"
@@ -2683,11 +2693,11 @@ fn type_inventory_coverage() -> Value {
                 "REQUIRES_PER_TYPE_QUALIFICATION"
             });
         profile["source_representation_capture"]["qualified_declaration_count"] =
-            json!(if representation_passed {
-                representation_rows.len()
-            } else {
-                0
-            });
+            json!(representation_qualified_count);
+        profile["source_representation_capture"]["evidence"] = json!([format!(
+            "Derived from source_representation_capture and protocol_framing receipts: {representation_qualified_count}/{} declarations qualified; each declaration contains its receipt IDs.",
+            representation_rows.len()
+        )]);
     }
 
     let mut protocol_profiles =
@@ -2740,19 +2750,24 @@ fn type_inventory_coverage() -> Value {
     for profile in sink_profiles.as_object_mut().unwrap().values_mut() {
         let targets = profile["targets"].as_object_mut().unwrap();
         for (sink_id, target) in targets {
-            let live_passed = !declarations.is_empty()
-                && declarations.iter().all(|declaration| {
+            let live_qualified_count = declarations
+                .iter()
+                .filter(|declaration| {
                     declaration_sink_axis_qualified(
                         declaration,
                         evidence_registry,
                         sink_id,
                         "sink.live",
                     )
-                });
-            let web_passed = !declarations.is_empty()
-                && declarations
-                    .iter()
-                    .all(|declaration| declaration["per_type_web_status"] == "PASS");
+                })
+                .count();
+            let live_passed =
+                !declarations.is_empty() && live_qualified_count == declarations.len();
+            let web_qualified_count = declarations
+                .iter()
+                .filter(|declaration| declaration["per_type_web_status"] == "PASS")
+                .count();
+            let web_passed = !declarations.is_empty() && web_qualified_count == declarations.len();
             let storage_qualification = &target_storage_qualification[sink_id];
             target["native_target"]["status"] =
                 storage_qualification["native_target_column"]["status"].clone();
@@ -2760,6 +2775,15 @@ fn type_inventory_coverage() -> Value {
                 storage_qualification["native_target_column"]["qualified_pairs"].clone();
             target["native_target"]["expected_pair_count"] =
                 storage_qualification["native_target_column"]["expected_pairs"].clone();
+            target["native_target"]["evidence"] = json!([format!(
+                "Per-type native target-column evidence: {}/{} pairs qualified; remaining types require another separately qualified representation.",
+                storage_qualification["native_target_column"]["qualified_pairs"]
+                    .as_u64()
+                    .unwrap_or_default(),
+                storage_qualification["native_target_column"]["expected_pairs"]
+                    .as_u64()
+                    .unwrap_or_default()
+            )]);
             target["logical_value_carrier"] =
                 storage_qualification["logical_value_json_carrier"].clone();
             target["web_candidate"]["status"] = json!(if web_passed {
@@ -2767,15 +2791,21 @@ fn type_inventory_coverage() -> Value {
             } else {
                 "REQUIRES_PER_TYPE_QUALIFICATION"
             });
-            target["web_candidate"]["qualified_declaration_count"] =
-                json!(if web_passed { declarations.len() } else { 0 });
+            target["web_candidate"]["qualified_declaration_count"] = json!(web_qualified_count);
+            target["web_candidate"]["evidence"] = json!([format!(
+                "Derived from per-type Web preview/save/start-gate receipts: {web_qualified_count}/{} declarations qualified; each declaration contains its receipt ID.",
+                declarations.len()
+            )]);
             target["live"]["status"] = json!(if live_passed {
                 "PASS"
             } else {
                 "REQUIRES_PER_TYPE_QUALIFICATION"
             });
-            target["live"]["qualified_declaration_count"] =
-                json!(if live_passed { declarations.len() } else { 0 });
+            target["live"]["qualified_declaration_count"] = json!(live_qualified_count);
+            target["live"]["evidence"] = json!([format!(
+                "Derived from artifact-bound per-type sink.live receipts: {live_qualified_count}/{} declarations qualified; each declaration contains its receipt IDs.",
+                declarations.len()
+            )]);
             let representation_rows = declarations
                 .iter()
                 .filter(|declaration| {
@@ -2783,8 +2813,9 @@ fn type_inventory_coverage() -> Value {
                         == "SOURCE_REPRESENTATION_PRESERVED"
                 })
                 .collect::<Vec<_>>();
-            let representation_passed = !representation_rows.is_empty()
-                && representation_rows.iter().all(|declaration| {
+            let representation_qualified_count = representation_rows
+                .iter()
+                .filter(|declaration| {
                     declaration_sink_axis_qualified(
                         declaration,
                         evidence_registry,
@@ -2796,7 +2827,10 @@ fn type_inventory_coverage() -> Value {
                         sink_id,
                         "sink.representation_preserved",
                     )
-                });
+                })
+                .count();
+            let representation_passed = !representation_rows.is_empty()
+                && representation_qualified_count == representation_rows.len();
             target["representation_carrier"]["status"] = json!(if representation_rows.is_empty() {
                 "NOT_REQUIRED"
             } else if representation_passed {
@@ -2805,11 +2839,11 @@ fn type_inventory_coverage() -> Value {
                 "REQUIRES_PER_TYPE_QUALIFICATION"
             });
             target["representation_carrier"]["qualified_declaration_count"] =
-                json!(if representation_passed {
-                    representation_rows.len()
-                } else {
-                    0
-                });
+                json!(representation_qualified_count);
+            target["representation_carrier"]["evidence"] = json!([format!(
+                "Derived from sink.representation_carrier and sink.representation_preserved receipts: {representation_qualified_count}/{} declarations qualified; read-back proves envelope integrity only, not native value recovery.",
+                representation_rows.len()
+            )]);
         }
     }
     let sink_targets =
@@ -2831,17 +2865,21 @@ fn type_inventory_coverage() -> Value {
                     == "SOURCE_REPRESENTATION_PRESERVED"
             })
             .collect::<Vec<_>>();
-        let value_passed = !value_rows.is_empty()
-            && value_rows.iter().all(|declaration| {
+        let value_qualified_count = value_rows
+            .iter()
+            .filter(|declaration| {
                 declaration_sink_axis_qualified(
                     declaration,
                     evidence_registry,
                     sink_id,
                     "sink.live",
                 )
-            });
-        let representation_passed = !representation_rows.is_empty()
-            && representation_rows.iter().all(|declaration| {
+            })
+            .count();
+        let value_passed = !value_rows.is_empty() && value_qualified_count == value_rows.len();
+        let representation_qualified_count = representation_rows
+            .iter()
+            .filter(|declaration| {
                 declaration_sink_axis_qualified(
                     declaration,
                     evidence_registry,
@@ -2853,11 +2891,17 @@ fn type_inventory_coverage() -> Value {
                     sink_id,
                     "sink.representation_preserved",
                 )
-            });
+            })
+            .count();
+        let representation_passed = !representation_rows.is_empty()
+            && representation_qualified_count == representation_rows.len();
         outcomes["value_preserved"]["status"] =
             json!(if value_passed { "PASS" } else { "NOT_REQUIRED" });
-        outcomes["value_preserved"]["qualified_declaration_count"] =
-            json!(if value_passed { value_rows.len() } else { 0 });
+        outcomes["value_preserved"]["qualified_declaration_count"] = json!(value_qualified_count);
+        outcomes["value_preserved"]["evidence"] = json!([format!(
+            "Derived from artifact-bound sink.live receipts for VALUE_PRESERVED declarations: {value_qualified_count}/{} qualified; detailed receipt IDs are attached to declarations.",
+            value_rows.len()
+        )]);
         outcomes["source_representation_preserved"]["status"] =
             json!(if representation_rows.is_empty() {
                 "NOT_REQUIRED"
@@ -2867,11 +2911,11 @@ fn type_inventory_coverage() -> Value {
                 "REQUIRES_PER_TYPE_QUALIFICATION"
             });
         outcomes["source_representation_preserved"]["qualified_declaration_count"] =
-            json!(if representation_passed {
-                representation_rows.len()
-            } else {
-                0
-            });
+            json!(representation_qualified_count);
+        outcomes["source_representation_preserved"]["evidence"] = json!([format!(
+            "Derived from artifact-bound sink.representation_carrier and sink.representation_preserved receipts for SOURCE_REPRESENTATION_PRESERVED declarations: {representation_qualified_count}/{} qualified; read-back proves envelope integrity only, not native value recovery.",
+            representation_rows.len()
+        )]);
     }
 
     let representation_declarations = declarations
@@ -4501,6 +4545,10 @@ fn type_inventory_live_evidence_report() {
     )
     .expect("offline qualification report is valid JSON");
     report["type_inventory"] = type_inventory_coverage();
+    assert!(
+        !has_stale_pass_evidence(&report["type_inventory"]),
+        "a PASS qualification report must replace stale pending/not-implemented evidence"
+    );
     std::fs::write(
         report_path,
         serde_json::to_vec_pretty(&report).expect("serialize live type inventory report"),
@@ -4518,6 +4566,37 @@ fn type_inventory_live_evidence_report() {
             })
             .unwrap_or_default();
     println!("updated native type evidence from {evidence_artifact_count} report artifact(s)");
+}
+
+fn has_stale_pass_evidence(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let stale_pass = object.get("status").and_then(Value::as_str) == Some("PASS")
+                && object.get("evidence").is_some_and(|evidence| {
+                    let evidence = evidence.to_string().to_ascii_lowercase();
+                    ["not implemented", "pending", "not registered"]
+                        .iter()
+                        .any(|stale| evidence.contains(stale))
+                });
+            stale_pass || object.values().any(has_stale_pass_evidence)
+        }
+        Value::Array(values) => values.iter().any(has_stale_pass_evidence),
+        _ => false,
+    }
+}
+
+#[test]
+fn qualification_report_rejects_pass_with_stale_evidence_text() {
+    let stale = json!({
+        "status": "PASS",
+        "evidence": ["Envelope write/readback qualification is pending."]
+    });
+    let current = json!({
+        "status": "PASS",
+        "evidence": ["Derived from artifact-bound sink receipts; declaration contains receipt IDs."]
+    });
+    assert!(has_stale_pass_evidence(&stale));
+    assert!(!has_stale_pass_evidence(&current));
 }
 
 #[test]
