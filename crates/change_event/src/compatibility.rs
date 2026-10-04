@@ -4148,6 +4148,22 @@ fn convert_image_with_plans(
         if column.generated {
             continue;
         }
+        if plan.qualification == QualificationLevel::Exact
+            && plan
+                .target
+                .parameters
+                .get("conversion_kind")
+                .map(String::as_str)
+                == Some("spatial")
+            && is_geography_native_type(&column.native_type)
+                != is_geography_native_type(&plan.target.native_type)
+        {
+            return Err(plan_failure(
+                plan,
+                "target_capability.spatial_geodetic_planar_mismatch",
+                "the saved spatial plan treats geodetic geography and planar geometry as equivalent; requalify this field before writing",
+            ));
+        }
         column.datum = match &column.datum {
             Datum::Value(value) => Datum::Value(convert_value_with_plan(plan, value)?),
             Datum::Null => Datum::Null,
@@ -4884,6 +4900,12 @@ pub fn explain_compatibility(
                 "target_capability.lossy_key_conversion",
                 "a key or Row Locator field cannot use a lossy conversion",
             )
+        } else if spatial_native_semantics_mismatch(&input.source_field, &input.target_field) {
+            (
+                CompatibilityStatus::Blocked,
+                "target_capability.spatial_geodetic_planar_mismatch",
+                "geography uses geodetic coordinates while geometry uses planar coordinates; select a qualified explicit conversion or a value-preserving carrier",
+            )
         } else {
             match &input.source_field.logical_type {
                 LogicalType::Binary { .. } => (
@@ -5289,6 +5311,12 @@ fn explain_field_compatibility_inner(
                 CompatibilityStatus::Blocked,
                 "target_capability.lossy_key_conversion",
                 "a key or Row Locator field cannot use a lossy conversion",
+            )
+        } else if spatial_native_semantics_mismatch(&input.source_field, &input.target_field) {
+            (
+                CompatibilityStatus::Blocked,
+                "target_capability.spatial_geodetic_planar_mismatch",
+                "geography uses geodetic coordinates while geometry uses planar coordinates; select a qualified explicit conversion or a value-preserving carrier",
             )
         } else {
             match &input.source_field.logical_type {
@@ -7574,16 +7602,18 @@ fn exact_candidate_matches_binding(
             subtype: source_subtype,
             srid: source_srid,
             dimensions: source_dimensions,
-        } => matches!(
-            &target.logical_type,
-            LogicalType::Spatial {
-                subtype: target_subtype,
-                srid: target_srid,
-                dimensions: target_dimensions,
-            } if source_subtype.eq_ignore_ascii_case(target_subtype)
-                && source_srid == target_srid
-                && source_dimensions == target_dimensions
-        ),
+        } => {
+            matches!(
+                &target.logical_type,
+                LogicalType::Spatial {
+                    subtype: target_subtype,
+                    srid: target_srid,
+                    dimensions: target_dimensions,
+                } if source_subtype.eq_ignore_ascii_case(target_subtype)
+                    && source_srid == target_srid
+                    && source_dimensions == target_dimensions
+            ) && !spatial_native_semantics_mismatch(source, target)
+        }
         LogicalType::Array { element: source } => matches!(
             &target.logical_type,
             LogicalType::Array { element: target } if source == target
@@ -7617,6 +7647,27 @@ fn exact_candidate_matches_binding(
         // incorrectly reject those key-safe representations.
         _ => true,
     }
+}
+
+fn spatial_native_semantics_mismatch(source: &FieldDefinition, target: &FieldDefinition) -> bool {
+    matches!(source.logical_type, LogicalType::Spatial { .. })
+        && matches!(target.logical_type, LogicalType::Spatial { .. })
+        && is_geography_native_type(&source.native_type)
+            != is_geography_native_type(&target.native_type)
+}
+
+fn is_geography_native_type(native_type: &str) -> bool {
+    native_type
+        .trim()
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('"')
+        .eq_ignore_ascii_case("geography")
 }
 
 fn text_binding_is_exact(source: &FieldDefinition, target: &FieldDefinition) -> bool {

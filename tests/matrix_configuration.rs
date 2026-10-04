@@ -187,8 +187,30 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "source")
             .count(),
-        19
+        22
     );
+    for major in [15, 16, 17] {
+        let database = format!("postgresql_{major}");
+        let suite_id = format!("{database}.postgis_spatial");
+        let source = sources
+            .iter()
+            .find(|source| source["database"] == database)
+            .expect("each PostgreSQL version is a live source component");
+        assert!(
+            source["additional_suites"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|suite| suite == &suite_id),
+            "PostGIS geometry and geography must gate {database} source qualification"
+        );
+        assert!(
+            suites.iter().any(|suite| {
+                suite["id"] == suite_id && suite["required_for_live_qualified"] == true
+            }),
+            "{suite_id} must be a required live suite"
+        );
+    }
     for (database, expected_suite) in [
         ("mysql_5_7", "mysql_5_7.visible_type_catalog"),
         ("mysql_8_0", "mysql_8_0.visible_type_catalog"),
@@ -309,7 +331,7 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "sink")
             .count(),
-        15
+        18
     );
     for suite_id in [
         "mysql_5_7.representation_carriers",
@@ -416,6 +438,7 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             "postgresql_15" | "postgresql_16" | "postgresql_17" => vec![
                 format!("{database}.builtins"),
                 format!("{database}.recursive_types"),
+                format!("{database}.postgis_spatial"),
             ],
             _ => unreachable!("six connector roster is fixed"),
         };
@@ -566,6 +589,31 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
                     .any(|arg| {
                         arg.as_str().is_some_and(|arg| {
                             arg.contains(&format!("postgres{major}_writes_native_type_values"))
+                        })
+                    })
+            );
+            let postgis_suite = format!("{database}.postgis_native_sink");
+            assert!(
+                sink["additional_suites"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry == &serde_json::json!(postgis_suite))
+            );
+            let postgis_definition = suites
+                .iter()
+                .find(|entry| entry["id"] == postgis_suite)
+                .expect("native PostGIS sink qualification must be registered");
+            assert_eq!(postgis_definition["category"], "sink");
+            assert_eq!(postgis_definition["required_for_live_qualified"], true);
+            assert!(
+                postgis_definition["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| {
+                        arg.as_str().is_some_and(|arg| {
+                            arg.contains(&format!("postgres{major}_postgis_native_sink"))
                         })
                     })
             );

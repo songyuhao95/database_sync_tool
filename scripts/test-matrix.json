@@ -890,6 +890,36 @@
       "required_for_live_qualified": true
     },
     {
+      "id": "postgresql_15.postgis_native_sink",
+      "mode": "Live",
+      "category": "sink",
+      "databases": ["postgresql_15"],
+      "stages": ["Sql"],
+      "args": ["test", "--locked", "-p", "postgresql_15", "--test", "sql_sink", "postgres15_postgis_native_sink", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"],
+      "required_env": ["PG_CDC_HOST", "PG_CDC_PORT", "PG_CDC_ADMIN_USER", "PG_CDC_WRITER_USER", "PG_CDC_TEST_PASSWORD"],
+      "required_for_live_qualified": true
+    },
+    {
+      "id": "postgresql_16.postgis_native_sink",
+      "mode": "Live",
+      "category": "sink",
+      "databases": ["postgresql_16"],
+      "stages": ["Sql"],
+      "args": ["test", "--locked", "-p", "postgresql_15", "--test", "sql_sink", "postgres16_postgis_native_sink", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"],
+      "required_env": ["PG_CDC16_HOST", "PG_CDC16_PORT", "PG_CDC16_ADMIN_USER", "PG_CDC16_WRITER_USER", "PG_CDC16_TEST_PASSWORD"],
+      "required_for_live_qualified": true
+    },
+    {
+      "id": "postgresql_17.postgis_native_sink",
+      "mode": "Live",
+      "category": "sink",
+      "databases": ["postgresql_17"],
+      "stages": ["Sql"],
+      "args": ["test", "--locked", "-p", "postgresql_15", "--test", "sql_sink", "postgres17_postgis_native_sink", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"],
+      "required_env": ["PG_CDC17_HOST", "PG_CDC17_PORT", "PG_CDC17_ADMIN_USER", "PG_CDC17_WRITER_USER", "PG_CDC17_TEST_PASSWORD"],
+      "required_for_live_qualified": true
+    },
+    {
       "id": "postgresql_16.apply",
       "mode": "Live",
       "category": "sink",

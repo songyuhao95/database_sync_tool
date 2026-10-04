@@ -22,9 +22,9 @@
       {"database": "mysql_5_7", "suite": "mysql_5_7.apply", "additional_suites": ["mysql_5_7.representation_carriers"]},
       {"database": "mysql_8_0", "suite": "mysql_8_0.apply", "additional_suites": ["mysql_8_0.representation_carriers"]},
       {"database": "mysql_8_4", "suite": "mysql_8_4.apply", "additional_suites": ["mysql_8_4.representation_carriers"]},
-      {"database": "postgresql_15", "suite": "postgresql_15.apply", "additional_suites": ["postgresql_15.native_type_apply", "postgresql_15.representation_carriers"]},
-      {"database": "postgresql_16", "suite": "postgresql_16.apply", "additional_suites": ["postgresql_16.native_type_apply", "postgresql_16.representation_carriers"]},
-      {"database": "postgresql_17", "suite": "postgresql_17.apply", "additional_suites": ["postgresql_17.native_type_apply", "postgresql_17.representation_carriers"]}
+      {"database": "postgresql_15", "suite": "postgresql_15.apply", "additional_suites": ["postgresql_15.native_type_apply", "postgresql_15.representation_carriers", "postgresql_15.postgis_native_sink"]},
+      {"database": "postgresql_16", "suite": "postgresql_16.apply", "additional_suites": ["postgresql_16.native_type_apply", "postgresql_16.representation_carriers", "postgresql_16.postgis_native_sink"]},
+      {"database": "postgresql_17", "suite": "postgresql_17.apply", "additional_suites": ["postgresql_17.native_type_apply", "postgresql_17.representation_carriers", "postgresql_17.postgis_native_sink"]}
     ],
     "transaction_recovery": ["transaction_recovery.common"],
     "capability_invalidation": ["postgresql_15.capability_invalidation"],

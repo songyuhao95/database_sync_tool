@@ -1,6 +1,7 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{
     ChangeTransaction, ColumnDatum, Datum, JsonEntry, JsonValue, LogicalValue, Operation,
-    RowChange, SinkAdapter as _, Source, TargetCapabilityFailure, validate,
+    RowChange, SinkAdapter as _, Source, SpatialFormat, TargetCapabilityFailure, validate,
 };
 use postgresql_15::{SinkAdapter, TargetConfig, execute};
 use sqlx::{Connection, PgConnection, Row};
@@ -854,4 +855,188 @@ async fn postgres16_checkpoint_and_dml_commit_atomically_across_restart()
 async fn postgres17_checkpoint_and_dml_commit_atomically_across_restart()
 -> postgresql_15::Result<()> {
     checkpoint_and_dml_for_version("17").await
+}
+
+fn postgis_point(x: f64, y: f64) -> Datum {
+    let mut ewkb = vec![1, 1, 0, 0, 0x20];
+    ewkb.extend_from_slice(&4326_i32.to_le_bytes());
+    ewkb.extend_from_slice(&x.to_le_bytes());
+    ewkb.extend_from_slice(&y.to_le_bytes());
+    Datum::Value(LogicalValue::Spatial {
+        format: SpatialFormat::Ewkb,
+        bytes_base64url: URL_SAFE_NO_PAD.encode(ewkb),
+        geometry_type: "point".into(),
+        dimensions: 2,
+        srid: Some(4326),
+        crs: Some("srid:4326".into()),
+    })
+}
+
+fn postgis_row(x: f64, y: f64) -> Vec<ColumnDatum> {
+    vec![
+        typed_column(
+            0,
+            "id",
+            "bigint",
+            Datum::Value(LogicalValue::Integer {
+                signed: true,
+                bits: 64,
+                value: "1".into(),
+            }),
+        ),
+        typed_column(1, "planar", "geometry(Point,4326)", postgis_point(x, y)),
+        typed_column(2, "geodetic", "geography(Point,4326)", postgis_point(x, y)),
+    ]
+}
+
+fn postgis_transaction(
+    table: &str,
+    operation: Operation,
+    x: f64,
+    y: f64,
+) -> change_event::ValidatedTransaction {
+    let mut transaction = fixture().transaction().clone();
+    let change = &mut transaction.changes[0];
+    change.table = table.into();
+    change.operation = operation;
+    change.before = if matches!(operation, Operation::Insert) {
+        None
+    } else {
+        Some(if matches!(operation, Operation::Delete) {
+            postgis_row(x, y)
+        } else {
+            postgis_row(12.5, 45.25)
+        })
+    };
+    change.after = if matches!(operation, Operation::Delete) {
+        None
+    } else {
+        Some(postgis_row(x, y))
+    };
+    transaction.changes.truncate(1);
+    validate(transaction).unwrap()
+}
+
+#[test]
+fn postgis_geometry_and_geography_use_distinct_parameterized_target_expressions() {
+    for version in ["15", "16", "17"] {
+        let transaction = postgis_transaction("postgis_contract", Operation::Insert, 12.5, 45.25);
+        let plan = SinkAdapter::new_for_version(version)
+            .plan(&transaction)
+            .unwrap();
+        let statement = plan.statements().next().unwrap();
+        assert!(statement.contains("ST_GeomFromEWKB($"));
+        assert!(statement.contains("::geography"));
+        let parameters = plan.parameters().next().unwrap();
+        assert_eq!(
+            parameters
+                .iter()
+                .filter(|parameter| matches!(parameter, postgresql_15::Parameter::Spatial { .. }))
+                .count(),
+            2
+        );
+    }
+}
+
+async fn postgis_native_sink_for_version(
+    target_version: &'static str,
+) -> postgresql_15::Result<()> {
+    let password = env::var(postgres_env::env_name(target_version, "TEST_PASSWORD"))?;
+    let writer = postgres_env::setting(target_version, "WRITER_USER", "postgresql_writer");
+    let admin = postgres_env::setting(target_version, "ADMIN_USER", "postgres");
+    let tag = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let table = format!("cdc_postgis_sink_pg{target_version}_{tag}");
+    let mut setup =
+        PgConnection::connect_with(&postgres_env::options(target_version, &admin, &password))
+            .await?;
+    let available: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name='postgis')",
+    )
+    .fetch_one(&mut setup)
+    .await?;
+    assert!(
+        available,
+        "PostgreSQL {target_version} native spatial sink qualification requires the PostGIS server extension package; pg_available_extensions has no postgis entry"
+    );
+    let installed: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='postgis')")
+            .fetch_one(&mut setup)
+            .await?;
+    if !installed {
+        sqlx::query("CREATE EXTENSION postgis")
+            .execute(&mut setup)
+            .await?;
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE public.\"{table}\" (id bigint PRIMARY KEY, planar geometry(Point,4326), geodetic geography(Point,4326))"
+    )))
+    .execute(&mut setup)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON public.\"{table}\" TO \"{}\"",
+        writer.replace('"', "\"\"")
+    )))
+    .execute(&mut setup)
+    .await?;
+    let result = async {
+        let config = TargetConfig::new(
+            postgres_env::setting(target_version, "HOST", "192.168.0.10"),
+            "CDC_test",
+            writer,
+            password,
+        )
+        .with_port(postgres_env::setting(target_version, "PORT", "54321").parse().expect("invalid PostgreSQL test port"));
+        let sink = SinkAdapter::new_for_version(target_version);
+        let insert = postgis_transaction(&table, Operation::Insert, 12.5, 45.25);
+        assert_eq!(execute(&config, &sink.plan(&insert)?).await?.statements_executed, 1);
+        let mut verify = PgConnection::connect_with(&postgres_env::options(target_version, &admin, &config.password)).await?;
+        let query = format!("SELECT ST_AsText(planar) AS planar, ST_AsText(geodetic::geometry) AS geodetic, ST_SRID(planar) AS planar_srid, ST_SRID(geodetic::geometry) AS geodetic_srid FROM public.\"{table}\"");
+        let row = sqlx::query(sqlx::AssertSqlSafe(query.clone())).fetch_one(&mut verify).await?;
+        assert_eq!(row.try_get::<String, _>("planar")?, "POINT(12.5 45.25)");
+        assert_eq!(row.try_get::<String, _>("geodetic")?, "POINT(12.5 45.25)");
+        assert_eq!(row.try_get::<i32, _>("planar_srid")?, 4326);
+        assert_eq!(row.try_get::<i32, _>("geodetic_srid")?, 4326);
+
+        let update = postgis_transaction(&table, Operation::Update, 13.5, 46.25);
+        assert_eq!(execute(&config, &sink.plan(&update)?).await?.statements_executed, 1);
+        let row = sqlx::query(sqlx::AssertSqlSafe(query)).fetch_one(&mut verify).await?;
+        assert_eq!(row.try_get::<String, _>("planar")?, "POINT(13.5 46.25)");
+        assert_eq!(row.try_get::<String, _>("geodetic")?, "POINT(13.5 46.25)");
+
+        let delete = postgis_transaction(&table, Operation::Delete, 13.5, 46.25);
+        assert_eq!(execute(&config, &sink.plan(&delete)?).await?.statements_executed, 1);
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM public.\"{table}\""))).fetch_one(&mut verify).await?;
+        assert_eq!(count, 0);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    }.await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS public.\"{table}\""
+    )))
+    .execute(&mut setup)
+    .await?;
+    if !installed {
+        sqlx::query("DROP EXTENSION postgis")
+            .execute(&mut setup)
+            .await?;
+    }
+    result?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 15 and PostGIS server package"]
+async fn postgres15_postgis_native_sink() -> postgresql_15::Result<()> {
+    postgis_native_sink_for_version("15").await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 16 and PostGIS server package"]
+async fn postgres16_postgis_native_sink() -> postgresql_15::Result<()> {
+    postgis_native_sink_for_version("16").await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 17 and PostGIS server package"]
+async fn postgres17_postgis_native_sink() -> postgresql_15::Result<()> {
+    postgis_native_sink_for_version("17").await
 }

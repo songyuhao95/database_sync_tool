@@ -200,7 +200,11 @@ fn input<'a>(
 }
 
 fn spatial_manifest() -> TargetCapabilityManifest {
-    let mut target = TargetRepresentation::new("geometry(point,4326)");
+    spatial_manifest_for("geometry(point,4326)")
+}
+
+fn spatial_manifest_for(native_type: &str) -> TargetCapabilityManifest {
+    let mut target = TargetRepresentation::new(native_type);
     target
         .parameters
         .insert("source_spatial_format".into(), "ewkb".into());
@@ -537,6 +541,84 @@ fn spatial_requires_wire_header_srid_crs_and_geometry_metadata() {
     }
     let error = change_event::validate_value_against_plan(&plan, &wrong_srid).unwrap_err();
     assert_eq!(error.code, "target_capability.spatial_srid_mismatch");
+}
+
+#[test]
+fn geography_and_geometry_are_not_exactly_equivalent() {
+    let logical = LogicalType::spatial("point", Some(4326), 2);
+    let mapping = SourceTypeMapping::new(
+        ConnectorIdentity::new("postgresql", "15"),
+        "geography(point,4326)",
+        logical.clone(),
+        "postgresql15.source-type.geography",
+        "postgresql-test.v1",
+    );
+    let result = change_event::plan_field_compatibility(input(
+        field("geography(point,4326)", logical.clone(), None),
+        target_field("geometry(point,4326)", logical.clone(), None),
+        mapping.clone(),
+        &spatial_manifest(),
+        "geography-to-geometry",
+    ))
+    .unwrap();
+    assert!(
+        result.plan.is_none(),
+        "geodetic geography cannot be silently qualified as planar geometry: {result:?}"
+    );
+    assert_eq!(
+        result.reason_code,
+        "target_capability.spatial_geodetic_planar_mismatch"
+    );
+
+    let reverse = change_event::plan_field_compatibility(input(
+        field("geometry(point,4326)", logical.clone(), None),
+        target_field("geography(point,4326)", logical.clone(), None),
+        SourceTypeMapping::new(
+            ConnectorIdentity::new("postgresql", "15"),
+            "geometry(point,4326)",
+            logical.clone(),
+            "postgresql15.source-type.geometry",
+            "postgresql-test.v1",
+        ),
+        &spatial_manifest_for("geography(point,4326)"),
+        "geometry-to-geography",
+    ))
+    .unwrap();
+    assert_eq!(
+        reverse.reason_code,
+        "target_capability.spatial_geodetic_planar_mismatch"
+    );
+
+    let result = change_event::plan_field_compatibility(input(
+        field("geography(point,4326)", logical.clone(), None),
+        target_field("geography(point,4326)", logical, None),
+        mapping,
+        &spatial_manifest_for("geography(point,4326)"),
+        "geography-to-geography",
+    ))
+    .unwrap();
+    let mut saved_plan = result
+        .plan
+        .expect("matching geography must remain selectable");
+    saved_plan.target.native_type = "geometry(point,4326)".into();
+    saved_plan.plan_digest = saved_plan.computed_digest();
+    let error = change_event::convert_transaction_with_plans(
+        transaction(
+            ewkb_point(4326),
+            "geography(point,4326)",
+            Source {
+                kind: "postgresql".into(),
+                version: "15.19".into(),
+                id: "source".into(),
+            },
+        ),
+        &[saved_plan],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.code, "target_capability.spatial_geodetic_planar_mismatch",
+        "an older saved exact plan must fail before any Sink DML"
+    );
 }
 
 #[test]
