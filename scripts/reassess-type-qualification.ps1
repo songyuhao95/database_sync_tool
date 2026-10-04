@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'qualification-web-path-gate.ps1')
 function Read-Evidence([string]$Path) {
     $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
     return [pscustomobject]@{
@@ -103,12 +104,7 @@ $checks = [ordered]@{
         $mysqlAudit.live_web_e2e_route_count -ge 15 -and
         $mysqlAudit.component_composed_route_count -eq 3 -and
         @($mysqlAudit.routes | Where-Object { -not $_.qualified }).Count -eq 0
-    user_configurable_target_paths = $inventory.per_type_web_plan_gaps -eq 0 -and
-        $inventory.per_type_web_sink_plan_gaps -eq 0 -and
-        @($mysqlAudit.routes | Where-Object {
-            $_.web_plan_type_count -ne $_.source_type_count -or
-            @($_.missing_web_plans).Count -ne 0
-        }).Count -eq 0
+    user_configurable_target_paths = Test-UserConfigurableTargetPaths -TypeInventory $inventory -MysqlRouteCoverage $mysqlAudit
 }
 $passed = @($checks.Values | Where-Object { $_ -ne $true }).Count -eq 0
 $report = [ordered]@{

@@ -11,6 +11,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 . (Join-Path $PSScriptRoot 'qualification-route-suites.ps1')
+. (Join-Path $PSScriptRoot 'qualification-web-path-gate.ps1')
 $root = Split-Path -Parent $PSScriptRoot
 $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'qualification-matrix.json') -Raw | ConvertFrom-Json
 $typeInventory = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'type-inventory.json') -Raw | ConvertFrom-Json
@@ -696,12 +697,7 @@ try {
         @($requiredLiveSuiteResults | Where-Object status -ne 'PASS').Count -eq 0
     $failed = $baselineFailed -or $missing.Count -gt 0 -or $suiteFailures.Count -gt 0 -or $passwordScan.matches_redacted -gt 0
     $userConfigurableTargetPathsQualified = $typeInventoryComplete -and
-        $typeInventoryEvidence.per_type_web_plan_gaps -eq 0 -and
-        $typeInventoryEvidence.per_type_web_sink_plan_gaps -eq 0 -and
-        @($mysqlRouteCoverage.routes | Where-Object {
-            $_.web_plan_type_count -ne $_.source_type_count -or
-            @($_.missing_web_plans).Count -ne 0
-        }).Count -eq 0
+        (Test-UserConfigurableTargetPaths -TypeInventory $typeInventoryEvidence -MysqlRouteCoverage $mysqlRouteCoverage)
     $allTypesLiveQualified = $offlineSuccess -and $typeInventoryComplete -and $liveQualified -and
         $routeSmokeQualified -and $requiredLiveSuitesQualified -and
         $catalogRouteCoverage.qualified -and $mysqlRouteCoverage.qualified -and
