@@ -695,9 +695,17 @@ try {
     $requiredLiveSuitesQualified = $requiredLiveSuiteResults.Count -gt 0 -and
         @($requiredLiveSuiteResults | Where-Object status -ne 'PASS').Count -eq 0
     $failed = $baselineFailed -or $missing.Count -gt 0 -or $suiteFailures.Count -gt 0 -or $passwordScan.matches_redacted -gt 0
+    $userConfigurableTargetPathsQualified = $typeInventoryComplete -and
+        $typeInventoryEvidence.per_type_web_plan_gaps -eq 0 -and
+        $typeInventoryEvidence.per_type_web_sink_plan_gaps -eq 0 -and
+        @($mysqlRouteCoverage.routes | Where-Object {
+            $_.web_plan_type_count -ne $_.source_type_count -or
+            @($_.missing_web_plans).Count -ne 0
+        }).Count -eq 0
     $allTypesLiveQualified = $offlineSuccess -and $typeInventoryComplete -and $liveQualified -and
         $routeSmokeQualified -and $requiredLiveSuitesQualified -and
-        $catalogRouteCoverage.qualified -and $mysqlRouteCoverage.qualified
+        $catalogRouteCoverage.qualified -and $mysqlRouteCoverage.qualified -and
+        $userConfigurableTargetPathsQualified
     if ($Live -and -not $allTypesLiveQualified) { $failed = $true }
     $success = -not $failed
     $report = [ordered]@{
@@ -705,7 +713,7 @@ try {
         matrix_semantics = [ordered]@{
             offline_direction_matrix = 'six_by_six_planning_and_type_qualification'
             live_qualification = 'six_source_adapters_plus_six_sink_adapters_plus_common_transaction_recovery'
-            route_smoke = 'registered representative live Web routes; all PostgreSQL catalog type routes and MySQL cross-version routes have route receipts; identical-version MySQL type routes may be explicitly qualified by separate Source/ChangeEvent/Sink evidence plus the offline direction, without claiming Web end-to-end execution'
+            route_smoke = 'registered representative live Web routes; all PostgreSQL catalog type routes and MySQL cross-version routes have route receipts; identical-version MySQL adapter components may compose without claiming Web end-to-end execution, but final all-types qualification still requires per-type Web plan receipts'
             live_database_to_database_links = $false
         }
         databases = @($config.databases)
@@ -714,6 +722,7 @@ try {
         success = $success
         offline_success = $offlineSuccess
         type_inventory_complete = $typeInventoryComplete
+        user_configurable_target_paths_qualified = $userConfigurableTargetPathsQualified
         type_inventory = $typeInventoryEvidence
         all_types_live_qualified = $allTypesLiveQualified
         live_qualified = $liveQualified

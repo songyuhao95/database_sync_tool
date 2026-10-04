@@ -39,7 +39,7 @@ live qualification；缺少对应实例或凭据时仍标记为 `REQUIRES_LIVE`�
 
 每次生成 `target/test-results/<时间-随机标识>/summary.json`、各用例日志、真机读取的 ChangeEvent JSONL，以及 MySQL 原始协议事件摘要。失败继续检查其他版本，最终退出码为 1；连接失败、筛选到零个测试都算失败。缺少凭据或未运行的真机测试显示 REQUIRES_LIVE，不会算作通过。
 
-`qualify.ps1 -Live` 的 `all_types_live_qualified` 只有在离线 6×6 矩阵、完整逐类型清单、六个 Source/Sink live suite、事务恢复、能力失效和必需路由证据均通过时才为 `true`。Source 和 Sink 的逐类型证据按 ChangeEvent 解耦组合；实际 Web 路由和同版本 MySQL 组件组合分别报告，不能把组件组合说成 Web 端到端通过。
+`qualify.ps1 -Live` 的 `all_types_live_qualified` 只有在离线 6×6 矩阵、完整逐类型清单、六个 Source/Sink live suite、事务恢复、能力失效、必需路由证据和全部逐类型 Web 计划回执均通过时才为 `true`。Source 和 Sink 的逐类型证据按 ChangeEvent 解耦组合；实际 Web 路由和同版本 MySQL 组件组合分别报告，不能把组件组合说成 Web 端到端通过。
 
 如果只修复资格报告生成逻辑，可以用 `reassess-type-qualification.ps1` 基于已保存的 live `summary.json`、重新生成的 `types.json` 及两份路由审计重算门禁。复评报告记录四个输入文件的 SHA-256，并明确不重新执行数据库测试；原始报告保持不变。组件组合证据只证明适配器可以配合工作；“所有类型可同步”的最终门禁还要求每条方向、每种源类型都有实际 Web 兼容计划回执，缺失时 `qualified=false`。
 
