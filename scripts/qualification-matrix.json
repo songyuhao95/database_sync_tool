@@ -14,9 +14,9 @@
       {"database": "mysql_5_7", "suite": "mysql_5_7.capture", "additional_suites": ["mysql_5_7.all_types_capture"]},
       {"database": "mysql_8_0", "suite": "mysql_8_0.capture", "additional_suites": ["mysql_8_0.all_types_capture"]},
       {"database": "mysql_8_4", "suite": "mysql_8_4.capture", "additional_suites": ["mysql_8_4.all_types_capture"]},
-      {"database": "postgresql_15", "suite": "postgresql_15.capture", "additional_suites": ["postgresql_15.builtins", "postgresql_15.recursive_types"]},
-      {"database": "postgresql_16", "suite": "postgresql_16.capture", "additional_suites": ["postgresql_16.builtins", "postgresql_16.recursive_types"]},
-      {"database": "postgresql_17", "suite": "postgresql_17.capture", "additional_suites": ["postgresql_17.builtins", "postgresql_17.recursive_types"]}
+      {"database": "postgresql_15", "suite": "postgresql_15.capture", "additional_suites": ["postgresql_15.builtins", "postgresql_15.recursive_types", "postgresql_15.postgis_spatial"]},
+      {"database": "postgresql_16", "suite": "postgresql_16.capture", "additional_suites": ["postgresql_16.builtins", "postgresql_16.recursive_types", "postgresql_16.postgis_spatial"]},
+      {"database": "postgresql_17", "suite": "postgresql_17.capture", "additional_suites": ["postgresql_17.builtins", "postgresql_17.recursive_types", "postgresql_17.postgis_spatial"]}
     ],
     "sinks": [
       {"database": "mysql_5_7", "suite": "mysql_5_7.apply", "additional_suites": ["mysql_5_7.representation_carriers"]},

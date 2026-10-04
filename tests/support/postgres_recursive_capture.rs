@@ -121,6 +121,13 @@ pub(super) struct RecursiveCapture {
 }
 
 pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveCapture> {
+    capture_recursive_types_with_postgis(major, false).await
+}
+
+async fn capture_recursive_types_with_postgis(
+    major: u16,
+    require_postgis: bool,
+) -> TestResult<RecursiveCapture> {
     let version = major.to_string();
     let password = env::var(postgres_env::env_name(&version, "TEST_PASSWORD"))?;
     let tag = std::time::SystemTime::now()
@@ -151,6 +158,12 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
         created_hstore = created;
         let (postgis_schema, created) = ensure_postgis(&mut admin).await?;
         created_postgis = created;
+        if require_postgis && postgis_schema.is_none() {
+            return Err(std::io::Error::other(format!(
+                "PostgreSQL {major} PostGIS geometry/geography live qualification requires the PostGIS server extension package; pg_available_extensions has no postgis entry"
+            ))
+            .into());
+        }
         eprintln!(
             "PostgreSQL {major} recursive qualification extensions: hstore={}, hstore_temporary_install={}, postgis={}, postgis_temporary_install={}",
             hstore_schema.is_some(),
@@ -192,7 +205,11 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
             + &postgis_schema
                 .as_ref()
                 .map(|extension_schema| {
-                    format!(", location {}.geometry", quote_ident(extension_schema))
+                    format!(
+                        ", location {}.geometry, earth_location {}.geography",
+                        quote_ident(extension_schema),
+                        quote_ident(extension_schema)
+                    )
                 })
                 .unwrap_or_default();
         execute(
@@ -592,6 +609,11 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
                 "{}.st_geomfromewkt('SRID=4326;POINT(1 2)')",
                 quote_ident(extension_schema)
             ));
+            insert_columns.push("earth_location");
+            insert_values.push(format!(
+                "'SRID=4326;POINT(3 4)'::{}.geography",
+                quote_ident(extension_schema)
+            ));
         }
         execute(
             &mut writer,
@@ -644,6 +666,7 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
         }
         if postgis_schema.is_some() {
             assert!(matches!(get("location"), Datum::Value(LogicalValue::Spatial { geometry_type, dimensions: 2, srid: Some(4326), .. }) if geometry_type == "point"));
+            assert!(matches!(get("earth_location"), Datum::Value(LogicalValue::Spatial { geometry_type, dimensions: 2, srid: Some(4326), .. }) if geometry_type == "point"));
         }
 
         let update = transactions[1].transaction().changes.first().expect("UPDATE row");
@@ -672,6 +695,7 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
         .into_iter()
         .chain(hstore_schema.is_some().then_some("attributes"))
         .chain(postgis_schema.is_some().then_some("location"))
+        .chain(postgis_schema.is_some().then_some("earth_location"))
         .collect::<std::collections::BTreeSet<_>>();
         let exact_catalog_columns = sqlx::query_as::<_, (String, i64, String)>(
             "SELECT a.attname, a.atttypid::bigint, pg_catalog.format_type(a.atttypid, a.atttypmod)
@@ -1059,3 +1083,25 @@ macro_rules! live_test {
 live_test!(postgresql15_recursive_type_capture, 15);
 live_test!(postgresql16_recursive_type_capture, 16);
 live_test!(postgresql17_recursive_type_capture, 17);
+
+macro_rules! postgis_live_test {
+    ($name:ident, $major:literal) => {
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "requires a configured PostgreSQL live test instance with the PostGIS server extension package"]
+        async fn $name() -> TestResult {
+            let capture = capture_recursive_types_with_postgis($major, true).await?;
+            for expected in ["location", "earth_location"] {
+                assert!(
+                    capture.fields.iter().any(|(name, _)| name == expected),
+                    "PostgreSQL {} PostGIS capture lacks {expected}",
+                    $major
+                );
+            }
+            Ok(())
+        }
+    };
+}
+
+postgis_live_test!(postgresql15_postgis_geometry_geography_capture, 15);
+postgis_live_test!(postgresql16_postgis_geometry_geography_capture, 16);
+postgis_live_test!(postgresql17_postgis_geometry_geography_capture, 17);

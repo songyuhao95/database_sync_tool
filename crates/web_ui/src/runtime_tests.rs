@@ -3723,7 +3723,7 @@ fn live_web_postgresql_all_types_partition(
             .fetch_optional(&mut source_admin_connection),
         )
         .unwrap();
-    if postgis_schema.is_none() && !dynamic_only {
+    if postgis_schema.is_none() {
         let available = pg_runtime
             .block_on(sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_available_extensions WHERE name='postgis')",
@@ -3754,6 +3754,12 @@ fn live_web_postgresql_all_types_partition(
             expression: format!(
                 "{quoted_extension_schema}.st_geomfromewkt('SRID=4326;POINT(1 2)')"
             ),
+            type_ids: vec!["dynamic:postgresql.extensions_and_custom_base_types".into()],
+        });
+        fields.push(LivePostgresqlField {
+            name: "dynamic_postgis_geography".into(),
+            declaration: format!("{quoted_extension_schema}.geography"),
+            expression: format!("'SRID=4326;POINT(3 4)'::{quoted_extension_schema}.geography"),
             type_ids: vec!["dynamic:postgresql.extensions_and_custom_base_types".into()],
         });
     }
@@ -5946,7 +5952,7 @@ fn live_web_postgresql_all_types_partition(
             )
             .unwrap();
     }
-    if !dynamic_only && !preserve_type_schema && *created_postgis_for_fixture {
+    if !preserve_type_schema && *created_postgis_for_fixture {
         pg_runtime
             .block_on(
                 sqlx::query("DROP EXTENSION postgis CASCADE").execute(&mut source_admin_connection),

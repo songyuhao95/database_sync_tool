@@ -1683,6 +1683,15 @@ mod tests {
                     "hex-EWKB",
                     Some(change_event::LogicalType::spatial("*", None, 0)),
                 ),
+                SourceTypeDefinition::extension(
+                    90_003,
+                    "extensions",
+                    "geography",
+                    "postgis",
+                    "postgresql.postgis.ewkb-hex.v1",
+                    "hex-EWKB",
+                    Some(change_event::LogicalType::spatial("*", None, 0)),
+                ),
             ],
             [
                 SourceExtension {
@@ -1740,6 +1749,23 @@ mod tests {
         .unwrap();
         assert!(matches!(
             value,
+            V::Spatial {
+                geometry_type,
+                dimensions: 2,
+                srid: Some(4326),
+                ..
+            } if geometry_type == "point"
+        ));
+        let geography = decode_catalog_column_for_version(
+            "15",
+            &catalog,
+            90_003,
+            "extensions.geography",
+            b"0101000020e610000000000000000008400000000000001040",
+        )
+        .unwrap();
+        assert!(matches!(
+            geography,
             V::Spatial {
                 geometry_type,
                 dimensions: 2,
