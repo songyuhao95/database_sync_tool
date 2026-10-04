@@ -39,7 +39,9 @@ live qualification；缺少对应实例或凭据时仍标记为 `REQUIRES_LIVE`�
 
 每次生成 `target/test-results/<时间-随机标识>/summary.json`、各用例日志、真机读取的 ChangeEvent JSONL，以及 MySQL 原始协议事件摘要。失败继续检查其他版本，最终退出码为 1；连接失败、筛选到零个测试都算失败。缺少凭据或未运行的真机测试显示 REQUIRES_LIVE，不会算作通过。
 
-`qualify.ps1 -Live` 的 `all_types_live_qualified` 只有在离线 6×6 矩阵、完整逐类型清单、六个 Source/Sink live suite、事务恢复、能力失效和全部必需 Web 路由均通过时才为 `true`。仅有安全拒绝、缺少逐类型读回或缺少 live 凭据不能达到此状态。
+`qualify.ps1 -Live` 的 `all_types_live_qualified` 只有在离线 6×6 矩阵、完整逐类型清单、六个 Source/Sink live suite、事务恢复、能力失效和必需路由证据均通过时才为 `true`。Source 和 Sink 的逐类型证据按 ChangeEvent 解耦组合；实际 Web 路由和同版本 MySQL 组件组合分别报告，不能把组件组合说成 Web 端到端通过。
+
+如果只修复资格报告生成逻辑，可以用 `reassess-type-qualification.ps1` 基于已保存的 live `summary.json`、重新生成的 `types.json` 及两份路由审计重算门禁。复评报告记录四个输入文件的 SHA-256，并明确不重新执行数据库测试；原始报告保持不变。
 
 | 阶段 | 本地检查 | 真机检查 |
 |---|---|---|
@@ -47,7 +49,7 @@ live qualification；缺少对应实例或凭据时仍标记为 `REQUIRES_LIVE`�
 | ChangeEvent | 校验、完整事务、JSON 往返、无效位点与缺失值拒绝 | 真实 INSERT/UPDATE/DELETE、事务多行、回滚排除、精确值、复合主键变化；PG15/16/17 DEFAULT/FULL、TOAST、JSONB |
 | Sql | 固定事件 × 三种 MySQL 来源 × 六种 Sink 目标，匹配预期 SQL | MySQL 与 PG15/16/17 Sink 均写入并查询六种 Source fixture；校验重复键整事务回滚及 PG checkpoint 重启恢复 |
 
-Read 和 ChangeEvent 共用一次真机捕获，脚本不会重复执行同一用例。MySQL 当前还需要查询源表元信息，本地检查不代表已验证二进制解码。三种 MySQL 来源的 SQL 矩阵使用固定事件；这不是九条真实实例之间的端到端迁移测试。Web 阶段运行登记的端到端页面预检、创建、启动和写入测试；同版本 MySQL 测试要求在 `test.txt` 配置对应的 `CDC_MYSQL57_SINK_HOST/PORT`、`CDC_MYSQL80_SINK_HOST/PORT`、`CDC_MYSQL84_SINK_HOST/PORT` 独立目标端。未配置时显示 `REQUIRES_LIVE`。全量和故障注入测试不属于这些阶段；其他本地回归仍可执行 `cargo test --workspace`。
+Read 和 ChangeEvent 共用一次真机捕获，脚本不会重复执行同一用例。MySQL 当前还需要查询源表元信息，本地检查不代表已验证二进制解码。三种 MySQL 来源的 SQL 矩阵使用固定事件；这不是九条真实实例之间的端到端迁移测试。Web 阶段运行登记的代表性端到端页面预检、创建、启动和写入测试。同版本 MySQL 的真实 Web 测试要求在 `test.txt` 配置对应的 `CDC_MYSQL57_SINK_HOST/PORT`、`CDC_MYSQL80_SINK_HOST/PORT`、`CDC_MYSQL84_SINK_HOST/PORT` 独立目标端；没有独立目标时，逐类型 Source + ChangeEvent + Sink 证据及离线 6×6 方向共同验证该适配器组合，报告明确标记 `COMPONENTS_COMPOSED_MYSQL_SELF_ROUTE` 并保留缺失的 Web 实测计划数。全量和故障注入测试不属于这些阶段；其他本地回归仍可执行 `cargo test --workspace`。
 
 `scripts/qualify.ps1 -Live` 还运行并单独报告目标能力失效：保存 MySQL 5.7 → PostgreSQL 15 计划后，测试改变本次创建的目标表定义，验证重新预检将计划标记为 stale，且任务无法启动。该项需要 MySQL 5.7 与 PostgreSQL 15 的 reader、writer、admin 配置；无配置时报告 `REQUIRES_LIVE`。
 

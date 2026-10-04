@@ -341,22 +341,37 @@ impl CatalogConnection {
         table: &str,
         column: &str,
     ) -> Result<change_event::TargetCapabilityProbe> {
-        let probe = match (self.kind.as_str(), self.version.as_str()) {
+        let column = column.to_owned();
+        self.probe_targets(schema, table, std::slice::from_ref(&column))?
+            .remove(&column)
+            .ok_or(Error::Internal)
+    }
+
+    pub(crate) fn probe_targets(
+        &mut self,
+        schema: &str,
+        table: &str,
+        columns: &[String],
+    ) -> Result<BTreeMap<String, change_event::TargetCapabilityProbe>> {
+        if columns.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let probes = match (self.kind.as_str(), self.version.as_str()) {
             ("mysql", "5.7") => match &mut self.conn {
                 CatalogBackend::Mysql(conn) => {
-                    mysql_5_7::probe_target_with_connection(conn, schema, table, column)
+                    mysql_5_7::probe_targets_with_connection(conn, schema, table, columns)
                 }
                 CatalogBackend::Postgresql { .. } => return Err(Error::Internal),
             },
             ("mysql", "8.0") => match &mut self.conn {
                 CatalogBackend::Mysql(conn) => {
-                    mysql_8_0::probe_target_with_connection(conn, schema, table, column)
+                    mysql_8_0::probe_targets_with_connection(conn, schema, table, columns)
                 }
                 CatalogBackend::Postgresql { .. } => return Err(Error::Internal),
             },
             ("mysql", "8.4") => match &mut self.conn {
                 CatalogBackend::Mysql(conn) => {
-                    mysql_8_4::probe_target_with_connection(conn, schema, table, column)
+                    mysql_8_4::probe_targets_with_connection(conn, schema, table, columns)
                 }
                 CatalogBackend::Postgresql { .. } => return Err(Error::Internal),
             },
@@ -368,11 +383,11 @@ impl CatalogConnection {
                     CatalogBackend::Mysql(_) => return Err(Error::Internal),
                 };
                 postgres_block_on(runtime, async {
-                    postgresql_15::probe_target_on_connection_for_version(
+                    postgresql_15::probe_targets_on_connection_for_version(
                         conn,
                         schema,
                         table,
-                        column,
+                        columns,
                         target_version,
                     )
                     .await
@@ -381,7 +396,7 @@ impl CatalogConnection {
             _ => return Err(Error::Invalid("Web 未注册该数据库连接器")),
         }
         .map_err(|_| Error::Invalid("读取目的端能力与会话配置失败，请检查账号权限"))?;
-        Ok(probe)
+        Ok(probes)
     }
 
     pub(crate) fn schemas(&mut self) -> Result<Vec<String>> {
@@ -514,12 +529,31 @@ impl CatalogConnection {
                 .collect();
             let columns = sqlx::query(
                 "SELECT c.table_name,c.column_name,
-                            format_type(a.atttypid,a.atttypmod) AS column_type,
+                            CASE
+                              WHEN tn.nspname='pg_catalog' AND t.typtype='c' THEN
+                                pg_catalog.quote_ident(tn.nspname)||'.'||pg_catalog.quote_ident(t.typname)
+                              WHEN tn.nspname='pg_catalog' THEN pg_catalog.format_type(a.atttypid,a.atttypmod)
+                              WHEN t.typtype='b' AND t.typelem<>0 AND t.typcategory='A' THEN
+                                pg_catalog.quote_ident(element_ns.nspname)||'.'||pg_catalog.quote_ident(element.typname)||
+                                CASE WHEN a.atttypmod<0 THEN '' ELSE
+                                  substring(pg_catalog.format_type(element.oid,a.atttypmod) from
+                                    char_length(pg_catalog.format_type(element.oid,-1))+1)
+                                END||'[]'
+                              ELSE pg_catalog.quote_ident(tn.nspname)||'.'||pg_catalog.quote_ident(t.typname)||
+                                CASE WHEN a.atttypmod<0 THEN '' ELSE
+                                  substring(pg_catalog.format_type(a.atttypid,a.atttypmod) from
+                                    char_length(pg_catalog.format_type(a.atttypid,-1))+1)
+                                END
+                            END AS column_type,
                             c.is_nullable,c.is_generated,c.collation_name,c.column_default
                      FROM information_schema.columns c
                      JOIN pg_namespace n ON n.nspname=c.table_schema
                      JOIN pg_class cl ON cl.relnamespace=n.oid AND cl.relname=c.table_name
                      JOIN pg_attribute a ON a.attrelid=cl.oid AND a.attname=c.column_name
+                     JOIN pg_type t ON t.oid=a.atttypid
+                     JOIN pg_namespace tn ON tn.oid=t.typnamespace
+                     LEFT JOIN pg_type element ON element.oid=t.typelem
+                     LEFT JOIN pg_namespace element_ns ON element_ns.oid=element.typnamespace
                      WHERE c.table_schema=$1 AND ($2::text IS NULL OR c.table_name=$2)
                      ORDER BY c.table_name,c.ordinal_position",
             )

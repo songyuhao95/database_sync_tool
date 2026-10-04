@@ -328,7 +328,10 @@ fn protocol_type_identity_matches(
     else {
         return false;
     };
-    if definition.schema == namespace && definition.name == name {
+    if definition.name == name
+        && (definition.schema == namespace
+            || (namespace.is_empty() && definition.schema == "pg_catalog"))
+    {
         return true;
     }
     match definition.kind {
@@ -549,6 +552,35 @@ mod tests {
     fn test_type_closure(oid: u32) -> (String, String) {
         let closure = test_type_catalog().definition_closure(oid).unwrap();
         (serde_json::to_string(&closure).unwrap(), closure.digest())
+    }
+
+    #[test]
+    fn accepts_pgoutput_omitted_namespace_only_for_catalog_types() {
+        let catalog = crate::SourceTypeCatalog::new([
+            crate::SourceTypeDefinition::builtin(790, "pg_catalog", "money"),
+            crate::SourceTypeDefinition::enum_type(9_001, "app", "mood", ["calm"]),
+        ]);
+        assert!(protocol_type_identity_matches(
+            &catalog,
+            790,
+            "",
+            "money",
+            &mut HashSet::new(),
+        ));
+        assert!(protocol_type_identity_matches(
+            &catalog,
+            9_001,
+            "app",
+            "mood",
+            &mut HashSet::new(),
+        ));
+        assert!(!protocol_type_identity_matches(
+            &catalog,
+            9_001,
+            "",
+            "mood",
+            &mut HashSet::new(),
+        ));
     }
 
     fn decoder() -> Decoder {

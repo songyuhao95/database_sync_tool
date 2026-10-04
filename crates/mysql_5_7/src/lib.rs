@@ -22,7 +22,7 @@ pub use decoder::decode_temporal_components;
 pub use sql::{
     ApplyResult, CAPABILITY_MANIFEST, SinkAdapter, SqlTransaction, TargetConfig,
     capability_manifest, classify_apply_error, commit_outcome_unknown, execute, execute_with_plans,
-    probe_target, probe_target_with_connection, sql, sql_with_plans,
+    probe_target, probe_target_with_connection, probe_targets_with_connection, sql, sql_with_plans,
 };
 pub use type_mapping::{
     MAPPING_VERSION, SourceTypeMappingError, decode_enum_set_ordinal, decode_set_bitmask,

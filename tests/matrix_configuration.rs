@@ -161,14 +161,26 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .unwrap_or_else(|| panic!("missing same-version Web route for {database}"));
         assert_eq!(route["category"], "route_smoke");
         assert!(
-            route["required_for_live_qualified"] == true
+            route["required_for_live_qualified"] == false
                 && route["required_env"].as_array().is_some_and(|env| {
                     env.iter().any(|name| name == sink_host_env)
                         && env.iter().any(|name| name == sink_port_env)
                 }),
-            "same-version Web qualification for {database} requires a separate target host and port"
+            "same-version Web E2E for {database} is optional and requires a separate target host and port"
+        );
+        assert!(
+            !config["live_qualification"]["route_smoke"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|configured| configured == suite_id),
+            "same-version MySQL Web E2E must not block adapter composition qualification"
         );
     }
+    assert_eq!(
+        config["same_version_mysql_route_policy"]["verification_mode"],
+        "COMPONENTS_COMPOSED_MYSQL_SELF_ROUTE"
+    );
 
     assert_eq!(
         suites
@@ -559,16 +571,17 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             );
         }
     }
-    assert_eq!(
-        suites
+    for suite_id in config["live_qualification"]["route_smoke"]
+        .as_array()
+        .unwrap()
+    {
+        let route = suites
             .iter()
-            .filter(|suite| suite["mode"] == "Live" && suite["category"] == "route_smoke")
-            .count(),
-        config["live_qualification"]["route_smoke"]
-            .as_array()
-            .unwrap()
-            .len()
-    );
+            .find(|suite| suite["id"] == *suite_id)
+            .unwrap_or_else(|| panic!("route-smoke suite {} is not registered", suite_id));
+        assert_eq!(route["mode"], "Live");
+        assert_eq!(route["category"], "route_smoke");
+    }
 }
 
 #[test]

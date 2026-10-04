@@ -1222,6 +1222,7 @@ dependencies = [
  "change_event",
  "mysql",
  "mysql_common",
+ "mysql_sink_contract",
  "mysql_source_contract",
  "serde_json",
  "sha2 0.10.9",
@@ -1236,6 +1237,7 @@ dependencies = [
  "mysql",
  "mysql_5_7",
  "mysql_common",
+ "mysql_sink_contract",
  "mysql_source_contract",
  "serde_json",
  "sha2 0.10.9",
@@ -1250,6 +1252,7 @@ dependencies = [
  "mysql",
  "mysql_5_7",
  "mysql_common",
+ "mysql_sink_contract",
  "mysql_source_contract",
  "serde_json",
  "sha2 0.10.9",
@@ -1281,6 +1284,14 @@ dependencies = [
  "thiserror",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "mysql_sink_contract"
+version = "0.1.0"
+dependencies = [
+ "change_event",
+ "mysql",
 ]
 
 [[package]]

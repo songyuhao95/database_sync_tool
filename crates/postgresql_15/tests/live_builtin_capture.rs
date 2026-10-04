@@ -1322,7 +1322,10 @@ async fn capture_all_builtins(expected_major: u16) -> Result<()> {
 
     let result = async {
         let array_rows = sqlx::query(
-            "SELECT format_type(array_type.oid, -1) AS declaration, element_type.typname AS element_name
+            "SELECT format_type(array_type.oid, -1) AS declaration,
+                    element_type.oid::bigint AS element_oid,
+                    pg_catalog.format_type(element_type.oid, NULL) AS element_declaration,
+                    element_type.typname AS element_name
                FROM pg_catalog.pg_type element_type
                JOIN pg_catalog.pg_namespace namespace ON namespace.oid=element_type.typnamespace
                JOIN pg_catalog.pg_type array_type ON array_type.oid=element_type.typarray
@@ -1336,6 +1339,23 @@ async fn capture_all_builtins(expected_major: u16) -> Result<()> {
         )
         .fetch_all(&mut admin)
         .await?;
+        let mut builtin_element_expressions = std::collections::BTreeMap::new();
+        for case in BUILTINS {
+            let typed_expression = format!("({})::{}", case.expression, case.declaration);
+            let sql = format!("SELECT pg_typeof({typed_expression})::oid::bigint");
+            match sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                .fetch_one(&mut admin)
+                .await
+            {
+                Ok(oid) => {
+                    builtin_element_expressions
+                        .entry(oid)
+                        .or_insert(typed_expression);
+                }
+                Err(sqlx::Error::Database(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let mut fields = BUILTINS
             .iter()
             .map(|case| (case.name.to_owned(), case.declaration.to_owned()))
@@ -1409,12 +1429,28 @@ async fn capture_all_builtins(expected_major: u16) -> Result<()> {
         }
         let mut values = vec!["1".to_owned()];
         values.extend(BUILTINS.iter().map(|case| case.expression.to_owned()));
-        values.extend(array_rows.iter().map(|row| {
-            format!(
-                "ARRAY[NULL]::{}",
-                row.try_get::<String, _>("declaration").expect("catalog declaration")
-            )
-        }));
+        let mut null_only_array_fields = std::collections::BTreeSet::new();
+        for (index, row) in array_rows.iter().enumerate() {
+            let element_oid = row.try_get::<i64, _>("element_oid")?;
+            let element_name = row.try_get::<String, _>("element_name")?;
+            let element_declaration = row.try_get::<String, _>("element_declaration")?;
+            let array_declaration = row.try_get::<String, _>("declaration")?;
+            if let Some(element_expression) = builtin_element_expressions.get(&element_oid) {
+                values.push(format!(
+                    "ARRAY[({element_expression})::{element_declaration}]::{array_declaration}"
+                ));
+            } else if element_name == "gtsvector" {
+                // gtsvector is PostgreSQL's GiST-internal text-search representation;
+                // it has no public input representation, so only NULL elements are valid.
+                values.push(format!("ARRAY[NULL]::{array_declaration}"));
+                null_only_array_fields.insert(format!("array_{index:03}"));
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "PostgreSQL {expected_major} catalog array element {element_name} (OID {element_oid}) has no non-NULL live sample"
+                ))
+                .into());
+            }
+        }
         values.push("NULL".into());
         let columns = std::iter::once("id".to_owned())
             .chain(fields.iter().map(|(name, _)| format!("\"{name}\"")))
@@ -1474,6 +1510,25 @@ async fn capture_all_builtins(expected_major: u16) -> Result<()> {
         assert!(matches!(insert_tx.changes[0].operation, Operation::Insert));
         let image = insert_tx.changes[0].after.as_ref().expect("INSERT after image");
         let by_name = image.iter().map(|column| (column.name.as_str(), &column.datum)).collect::<std::collections::HashMap<_, _>>();
+        for (name, declaration) in &fields {
+            let column = image
+                .iter()
+                .find(|column| column.name == *name)
+                .expect("every declared fixture field is in the captured INSERT image");
+            let mapping = postgresql_15::source_type_mapping_with_catalog_for_version(
+                &expected_major.to_string(),
+                &column.native_type,
+                &catalog,
+            )?;
+            if let Datum::Value(value) = &column.datum
+                && !mapping.logical_type.matches_value(value)
+            {
+                return Err(std::io::Error::other(format!(
+                    "PostgreSQL {expected_major} decoded {declaration} in {name} to a LogicalValue outside the mapped source type"
+                ))
+                .into());
+            }
+        }
         let mut semantic_count = 0;
         let mut envelope_count = 0;
         for (index, (name, _)) in fields.iter().enumerate() {
@@ -1494,6 +1549,27 @@ async fn capture_all_builtins(expected_major: u16) -> Result<()> {
                 Datum::Value(value) => {
                     semantic_count += 1;
                     assert!(!matches!(value, LogicalValue::Null), "{name}");
+                    if name.starts_with("array_") {
+                        let has_non_null_element = match value {
+                            LogicalValue::Array { elements }
+                            | LogicalValue::ArrayWithMetadata { elements, .. } => elements
+                                .iter()
+                                .any(|element| !matches!(element, LogicalValue::Null)),
+                            _ => false,
+                        };
+                        if null_only_array_fields.contains(name) {
+                            assert!(matches!(
+                                value,
+                                LogicalValue::Array { elements }
+                                    if elements.len() == 1 && matches!(elements[0], LogicalValue::Null)
+                            ), "{name} must preserve its only constructible gtsvector-array element state");
+                        } else {
+                            assert!(
+                                has_non_null_element,
+                                "{name} must capture a non-NULL array element, not only its container"
+                            );
+                        }
+                    }
                 }
                 other => panic!("{name} did not carry its inserted value: {other:?}"),
             }

@@ -14,17 +14,22 @@
   "per_type_qualification": {
     "schema": "cdc.native_type_qualification.v1",
     "entry_key": "<type_id>@<source_connector_id>",
-    "required_source_axes": ["protocol_capture", "semantic_codec", "change_event", "live"],
-    "sink_outcomes": ["VALUE_PRESERVED", "SOURCE_REPRESENTATION_PRESERVED"],
+    "required_source_axes": ["protocol_capture", "change_event", "live"],
+    "source_value_path_options": ["SEMANTIC_CODEC", "SOURCE_REPRESENTATION_CAPTURE", "NULL_ONLY_WITH_SOURCE_AND_SINK_READBACK"],
+    "sink_outcomes": ["VALUE_PRESERVED", "SOURCE_REPRESENTATION_PRESERVED", "NULL_PRESERVED"],
     "required_sink_evidence": ["offline_evidence", "live_evidence"],
     "required_representation_sink_evidence": ["representation_carrier_evidence", "representation_preservation_evidence"],
     "required_web_evidence": ["real_target_probe", "explicit_selection", "risk_confirmation", "saved_plan", "start_gate", "evidence"],
-    "web_evidence_scope": "one verified Web plan per type_id@source_connector_id>sink_connector_id; aliases and sample parameter spellings share their native type identity, but do not count as extra pairs",
+    "web_evidence_scope": "Web plan receipts qualify an actual source-to-sink Web route. Type compatibility qualification composes independently verified per-type Source, ChangeEvent, and Sink evidence with the offline 6x6 route matrix; exact same-version MySQL routes use this mode when no distinct sink server is configured.",
     "web_evidence_verification": "web_ui.preview_save_start_gate",
-  "same_version_web_evidence_verification": "web_ui.preview_save_start_gate",
+    "same_version_web_evidence_verification": "per_type_source_change_event_sink_evidence_plus_offline_route_matrix; optional_web_ui.preview_save_start_gate_requires_distinct_same_version_sink_server",
+    "route_qualification_modes": {
+      "LIVE_WEB_E2E": "An artifact-bound per-type Web plan receipt proves target probe, explicit selection, risk confirmation, saved plan, and start gate.",
+      "COMPONENTS_COMPOSED_MYSQL_SELF_ROUTE": "The exact per-type MySQL Source and ChangeEvent evidence composes with the same MySQL Sink's per-type offline and live readback and the offline 6x6 route result. This proves adapter compatibility but is not a live Web route test."
+    },
     "evidence_registry": {
       "required_entry_fields": ["id", "type_id", "source_connector_id", "sink_connector_id", "axis", "status", "run_id", "suite_id", "target_storage_mode", "artifact_path", "report_digest"],
-      "allowed_axes": ["source.protocol_capture", "source.semantic_codec", "source.change_event", "source.live", "source.source_representation_capture", "source.protocol_framing", "source.dynamic_type_class_fixture", "source.catalog_type_mapping", "sink.offline", "sink.live", "sink.representation_carrier", "sink.representation_preserved", "web.plan"],
+      "allowed_axes": ["source.protocol_capture", "source.semantic_codec", "source.change_event", "source.live", "source.null_only", "source.source_representation_capture", "source.protocol_framing", "source.dynamic_type_class_fixture", "source.catalog_type_mapping", "sink.offline", "sink.live", "sink.representation_carrier", "sink.representation_preserved", "web.plan"],
       "entries": []
     },
     "entries": {}
@@ -354,7 +359,7 @@
     { "id": "postgresql.arrays", "connectors": ["postgresql_15", "postgresql_16", "postgresql_17"], "discovery": "pg_catalog.pg_type where typisdefined and typelem is nonzero; record element type OID, array OID, delimiter, dimensions, and element definition digest", "evidence": ["https://www.postgresql.org/docs/17/arrays.html", "https://www.postgresql.org/docs/17/catalog-pg-type.html"] },
     { "id": "postgresql.domains", "connectors": ["postgresql_15", "postgresql_16", "postgresql_17"], "discovery": "pg_type.typtype = 'd'; recursively record base type, typmod, collation, NOT NULL and domain constraints", "evidence": ["https://www.postgresql.org/docs/17/domains.html", "https://www.postgresql.org/docs/17/catalog-pg-type.html"] },
     { "id": "postgresql.enums", "connectors": ["postgresql_15", "postgresql_16", "postgresql_17"], "discovery": "pg_type.typtype = 'e'; record ordered pg_enum labels and definition digest", "evidence": ["https://www.postgresql.org/docs/17/datatype-enum.html", "https://www.postgresql.org/docs/17/catalog-pg-enum.html"] },
-    { "id": "postgresql.composites", "connectors": ["postgresql_15", "postgresql_16", "postgresql_17"], "discovery": "pg_type.typtype = 'c'; record ordered non-dropped pg_attribute members and recursive type identities", "evidence": ["https://www.postgresql.org/docs/17/rowtypes.html", "https://www.postgresql.org/docs/17/catalog-pg-type.html"] },
+    { "id": "postgresql.composites", "connectors": ["postgresql_15", "postgresql_16", "postgresql_17"], "discovery": "pg_type.typtype = 'c'; record ordered non-dropped pg_attribute members and recursive type identities. Keep exact catalog mappings for definitions depending on pseudotypes, but mark those definitions NOT_APPLICABLE_NON_STORABLE and exclude only their user-table DML route tests with an explicit dependency-path reason.", "evidence": ["https://www.postgresql.org/docs/17/rowtypes.html", "https://www.postgresql.org/docs/17/catalog-pg-type.html"] },
     { "id": "postgresql.ranges", "connectors": ["postgresql_15", "postgresql_16", "postgresql_17"], "discovery": "pg_range; record subtype, collation, canonicalization and optional multirange identity", "evidence": ["https://www.postgresql.org/docs/17/rangetypes.html", "https://www.postgresql.org/docs/17/catalog-pg-range.html"] },
     { "id": "postgresql.extensions_and_custom_base_types", "connectors": ["postgresql_15", "postgresql_16", "postgresql_17"], "discovery": "pg_type joined to pg_namespace and pg_depend/pg_extension; record extension name/version and input/output/send/receive functions where visible", "evidence": ["https://www.postgresql.org/docs/17/sql-createtype.html", "https://www.postgresql.org/docs/17/catalog-pg-type.html"] },
     { "id": "postgresql.user_defined_base_types", "connectors": ["postgresql_15", "postgresql_16", "postgresql_17"], "discovery": "Defined non-pg_catalog, non-pseudo base types (typtype = 'b'); record schema identity, I/O and send/receive functions, typmod behavior, and extension ownership if any", "evidence": ["https://www.postgresql.org/docs/17/sql-createtype.html", "https://www.postgresql.org/docs/17/catalog-pg-type.html"] },

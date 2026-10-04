@@ -11,7 +11,10 @@ use sqlx::{
     postgres::{PgArguments, PgConnectOptions, PgSslMode},
     query::Query,
 };
-use std::{collections::BTreeSet, io};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+};
 
 pub const POSTGRESQL_15_VERSION: &str = "15";
 
@@ -2182,9 +2185,44 @@ pub async fn probe_target_on_connection_for_version(
     column: &str,
     target_version: &str,
 ) -> io::Result<TargetCapabilityProbe> {
-    let server_version: String = sqlx::query_scalar("SHOW server_version")
-        .fetch_one(&mut *connection)
-        .await
+    probe_targets_on_connection_for_version(
+        connection,
+        schema,
+        table,
+        &[column.to_owned()],
+        target_version,
+    )
+    .await?
+    .remove(column)
+    .ok_or_else(|| capability_failure("target table or column was not found"))
+}
+
+/// Collect independent column fingerprints while reading the shared server,
+/// session, and extension evidence only once for the whole table.
+pub async fn probe_targets_on_connection_for_version(
+    connection: &mut PgConnection,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    target_version: &str,
+) -> io::Result<BTreeMap<String, TargetCapabilityProbe>> {
+    let requested_columns = columns.iter().cloned().collect::<BTreeSet<_>>();
+    if requested_columns.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let requested_columns = requested_columns.into_iter().collect::<Vec<_>>();
+    let environment = sqlx::query(
+        "SELECT current_setting('server_version') AS server_version, \
+                current_database() AS database_name, \
+                current_setting('server_version_num') AS server_version_num, \
+                set_config('TimeZone','UTC',false) AS timezone, \
+                set_config('standard_conforming_strings','on',false) AS standard_conforming_strings",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(io::Error::other)?;
+    let server_version: String = environment
+        .try_get("server_version")
         .map_err(io::Error::other)?;
     if !server_version
         .split('.')
@@ -2195,33 +2233,19 @@ pub async fn probe_target_on_connection_for_version(
             "postgresql_{target_version} cannot probe target version {server_version}"
         )));
     }
-    let database: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(&mut *connection)
-        .await
+    let database: String = environment
+        .try_get("database_name")
         .map_err(io::Error::other)?;
-    sqlx::query("SET TIME ZONE 'UTC'")
-        .execute(&mut *connection)
-        .await
+    let server_version_num: String = environment
+        .try_get("server_version_num")
         .map_err(io::Error::other)?;
-    sqlx::query("SET standard_conforming_strings = on")
-        .execute(&mut *connection)
-        .await
+    let timezone: String = environment.try_get("timezone").map_err(io::Error::other)?;
+    let standard_conforming_strings: String = environment
+        .try_get("standard_conforming_strings")
         .map_err(io::Error::other)?;
-    let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(io::Error::other)?;
-    let timezone: String = sqlx::query_scalar("SHOW TIME ZONE")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(io::Error::other)?;
-    let standard_conforming_strings: String =
-        sqlx::query_scalar("SHOW standard_conforming_strings")
-            .fetch_one(&mut *connection)
-            .await
-            .map_err(io::Error::other)?;
-    let row = sqlx::query(
-        "SELECT format_type(a.atttypid, a.atttypmod) AS native_type, \
+    let rows = sqlx::query(
+        "SELECT a.attname AS column_name, \
+                format_type(a.atttypid, a.atttypmod) AS native_type, \
                 a.atttypid::bigint AS type_oid, a.atttypmod::bigint AS typmod, \
                 t.typtype::text AS type_kind, n.nspname AS type_schema \
          FROM pg_attribute a \
@@ -2229,21 +2253,30 @@ pub async fn probe_target_on_connection_for_version(
          JOIN pg_namespace ns ON ns.oid = c.relnamespace \
          JOIN pg_type t ON t.oid = a.atttypid \
          JOIN pg_namespace n ON n.oid = t.typnamespace \
-         WHERE ns.nspname = $1 AND c.relname = $2 AND a.attname = $3 \
+         WHERE ns.nspname = $1 AND c.relname = $2 AND a.attname = ANY($3) \
            AND a.attnum > 0 AND NOT a.attisdropped",
     )
     .bind(schema)
     .bind(table)
-    .bind(column)
-    .fetch_optional(&mut *connection)
+    .bind(&requested_columns)
+    .fetch_all(&mut *connection)
     .await
-    .map_err(io::Error::other)?
-    .ok_or_else(|| capability_failure("target table or column was not found"))?;
-    let native_type: String = row.try_get("native_type").map_err(io::Error::other)?;
-    let type_oid: i64 = row.try_get("type_oid").map_err(io::Error::other)?;
-    let typmod: i64 = row.try_get("typmod").map_err(io::Error::other)?;
-    let type_kind: String = row.try_get("type_kind").map_err(io::Error::other)?;
-    let type_schema: String = row.try_get("type_schema").map_err(io::Error::other)?;
+    .map_err(io::Error::other)?;
+    let found_columns = rows
+        .iter()
+        .map(|row| {
+            row.try_get::<String, _>("column_name")
+                .map_err(io::Error::other)
+        })
+        .collect::<io::Result<BTreeSet<_>>>()?;
+    if let Some(missing) = requested_columns
+        .iter()
+        .find(|column| !found_columns.contains(*column))
+    {
+        return Err(capability_failure(format!(
+            "target table or column {schema}.{table}.{missing} was not found"
+        )));
+    }
     let extensions = sqlx::query("SELECT extname, extversion FROM pg_extension ORDER BY extname")
         .fetch_all(&mut *connection)
         .await
@@ -2258,15 +2291,6 @@ pub async fn probe_target_on_connection_for_version(
     let has_postgis = extensions
         .iter()
         .any(|entry| entry.identity.eq_ignore_ascii_case("extension:postgis"));
-    let native_lower = native_type.to_ascii_lowercase();
-    let spatial_target = native_lower.contains("geometry") || native_lower.contains("geography");
-    let type_status = if spatial_target && !has_postgis {
-        CapabilityProbeStatus::Missing
-    } else if is_probeable_target_type(&native_lower) {
-        CapabilityProbeStatus::Qualified
-    } else {
-        CapabilityProbeStatus::Detected
-    };
     let target_build = ServerBuildIdentity::new(
         "postgresql",
         "community",
@@ -2274,77 +2298,103 @@ pub async fn probe_target_on_connection_for_version(
         format!("postgres-{server_version_num}"),
     );
     let manifest = crate::compatibility_manifest_for_version(target_build.clone(), target_version);
-    let capability_identity = if spatial_target {
-        let spatial_kind = if native_lower.contains("geography") {
-            "geography"
+    let mut probes = BTreeMap::new();
+    for row in rows {
+        let column: String = row.try_get("column_name").map_err(io::Error::other)?;
+        let native_type: String = row.try_get("native_type").map_err(io::Error::other)?;
+        let type_oid: i64 = row.try_get("type_oid").map_err(io::Error::other)?;
+        let typmod: i64 = row.try_get("typmod").map_err(io::Error::other)?;
+        let type_kind: String = row.try_get("type_kind").map_err(io::Error::other)?;
+        let type_schema: String = row.try_get("type_schema").map_err(io::Error::other)?;
+        let native_lower = native_type.to_ascii_lowercase();
+        let spatial_target =
+            native_lower.contains("geometry") || native_lower.contains("geography");
+        let type_status = if spatial_target && !has_postgis {
+            CapabilityProbeStatus::Missing
+        } else if is_probeable_target_type(&native_lower) {
+            CapabilityProbeStatus::Qualified
         } else {
-            "geometry"
+            CapabilityProbeStatus::Detected
         };
-        format!("postgresql{target_version}.exact.spatial.{spatial_kind}")
-    } else {
-        format!("target_type:{type_schema}.{native_type}")
-    };
-    let mut capabilities = vec![
-        CapabilityProbeEntry::new(capability_identity, type_status)
-            .with_version(server_version.clone())
-            .with_evidence_digest(change_event::stable_digest(&(
-                target_version,
-                &native_type,
-                type_oid,
-                typmod,
-            ))),
-    ];
-    capabilities.extend(
-        manifest
-            .capabilities
-            .iter()
-            .filter(|entry| entry.target.native_type.eq_ignore_ascii_case(&native_type))
-            .map(|entry| {
-                CapabilityProbeEntry::new(entry.code.clone(), type_status)
-                    .with_version(server_version.clone())
-                    .with_evidence_digest(change_event::stable_digest(&(
-                        target_version,
-                        &native_type,
-                        type_oid,
-                        typmod,
-                        &entry.rule.evidence_digest,
-                    )))
-            }),
-    );
-    if spatial_target && has_postgis {
-        capabilities[0].status = CapabilityProbeStatus::Qualified;
+        let capability_identity = if spatial_target {
+            let spatial_kind = if native_lower.contains("geography") {
+                "geography"
+            } else {
+                "geometry"
+            };
+            format!("postgresql{target_version}.exact.spatial.{spatial_kind}")
+        } else {
+            format!("target_type:{type_schema}.{native_type}")
+        };
+        let mut capabilities = vec![
+            CapabilityProbeEntry::new(capability_identity, type_status)
+                .with_version(server_version.clone())
+                .with_evidence_digest(change_event::stable_digest(&(
+                    target_version,
+                    &native_type,
+                    type_oid,
+                    typmod,
+                ))),
+        ];
+        capabilities.extend(
+            manifest
+                .capabilities
+                .iter()
+                .filter(|entry| entry.target.native_type.eq_ignore_ascii_case(&native_type))
+                .map(|entry| {
+                    CapabilityProbeEntry::new(entry.code.clone(), type_status)
+                        .with_version(server_version.clone())
+                        .with_evidence_digest(change_event::stable_digest(&(
+                            target_version,
+                            &native_type,
+                            type_oid,
+                            typmod,
+                            &entry.rule.evidence_digest,
+                        )))
+                }),
+        );
+        if spatial_target && has_postgis {
+            capabilities[0].status = CapabilityProbeStatus::Qualified;
+        }
+        let definition_fingerprint = change_event::stable_digest(&(
+            schema,
+            table,
+            &column,
+            &native_type,
+            type_oid,
+            typmod,
+            &type_kind,
+        ));
+        let mut metadata =
+            TargetColumnMetadata::new(definition_fingerprint).with_native_type(native_type.clone());
+        if spatial_target {
+            metadata = metadata.with_extension("postgis");
+        }
+        let session = TargetSessionProfile::new(
+            format!("postgresql-{target_version};server_version_num={server_version_num}"),
+            [
+                ("TimeZone", timezone.clone()),
+                (
+                    "standard_conforming_strings",
+                    standard_conforming_strings.clone(),
+                ),
+            ],
+        );
+        probes.insert(
+            column.clone(),
+            TargetCapabilityProbe::new(
+                target_build.clone(),
+                &database,
+                table,
+                &column,
+                metadata,
+                capabilities,
+                extensions.clone(),
+                session,
+            ),
+        );
     }
-    let definition_fingerprint = change_event::stable_digest(&(
-        schema,
-        table,
-        column,
-        &native_type,
-        type_oid,
-        typmod,
-        &type_kind,
-    ));
-    let mut metadata =
-        TargetColumnMetadata::new(definition_fingerprint).with_native_type(native_type.clone());
-    if spatial_target {
-        metadata = metadata.with_extension("postgis");
-    }
-    let session = TargetSessionProfile::new(
-        format!("postgresql-{target_version};server_version_num={server_version_num}"),
-        [
-            ("TimeZone", timezone),
-            ("standard_conforming_strings", standard_conforming_strings),
-        ],
-    );
-    Ok(TargetCapabilityProbe::new(
-        target_build,
-        &database,
-        table,
-        column,
-        metadata,
-        capabilities,
-        extensions,
-        session,
-    ))
+    Ok(probes)
 }
 
 fn is_probeable_target_type(native_type: &str) -> bool {

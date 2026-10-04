@@ -5173,6 +5173,26 @@ fn explain_field_compatibility_inner(
             )),
         ));
     }
+    let collation_mismatch = field_collation_mismatch(&input);
+    if collation_mismatch && is_key_like(&input.source_field) {
+        let message = "source and target key collations differ; key equality and row location cannot be proven equivalent";
+        return Ok(field_result(
+            &input,
+            CompatibilityStatus::Blocked,
+            QualificationLevel::Unsupported,
+            RiskLevel::Critical,
+            "target_capability.key_collation_mismatch",
+            message,
+            Vec::new(),
+            None,
+            Some(CompatibilityFailure::new(
+                FailureClass::TargetCapability,
+                "target_capability.key_collation_mismatch",
+                FailurePhase::CapabilityQualification,
+                message,
+            )),
+        ));
+    }
 
     let mut candidates = input
         .manifest
@@ -5234,10 +5254,19 @@ fn explain_field_compatibility_inner(
             rule: capability.rule.reference(),
             capability_code: capability.code.clone(),
             qualification: capability.rule.qualification,
-            risk: capability.rule.risk,
-            risk_code: capability.rule.risk_code.clone(),
+            risk: if collation_mismatch {
+                capability.rule.risk.max(RiskLevel::High)
+            } else {
+                capability.rule.risk
+            },
+            risk_code: if collation_mismatch {
+                Some("common.collation_semantics_target".into())
+            } else {
+                capability.rule.risk_code.clone()
+            },
             requires_confirmation: capability.rule.requires_confirmation
-                || capability.rule.qualification == QualificationLevel::ExplicitConversion,
+                || capability.rule.qualification == QualificationLevel::ExplicitConversion
+                || collation_mismatch,
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -5410,6 +5439,16 @@ fn explain_field_compatibility_inner(
     }
 
     let mut plan = build_field_plan(&input, &candidate, &capability.rule, &parameters);
+    if collation_mismatch {
+        plan.loss.comparison = true;
+        plan.loss.ordering = true;
+        plan.loss.constraints = true;
+        plan.loss.explanation = format!(
+            "{} Source values are preserved, but the pre-created target column's collation is applied; equality, ordering, and unique-constraint behavior can differ from the source.",
+            plan.loss.explanation
+        );
+        plan.plan_digest = plan.computed_digest();
+    }
     let confirmed = candidate.requires_confirmation
         && input
             .options
@@ -5507,34 +5546,6 @@ fn validate_field_input(
             "source and target field definitions are incomplete",
         ));
     }
-    let collation_mismatch = if input.source_connector == input.sink_connector {
-        input.source_field.collation != input.target_field.collation
-    } else {
-        input.source_field.collation.is_some()
-            && input.target_field.collation.is_some()
-            && input.source_field.collation != input.target_field.collation
-    };
-    // Text-like values can carry a target-side collation policy.  ENUM and
-    // SET values are label/member semantics, so a collation difference must
-    // not prevent the exact label/member plan from being selected.  For
-    // other logical values a catalog collation is evidence of malformed
-    // metadata, so retain the fail-closed contract instead of inventing a
-    // conversion.
-    let collation_is_configurable = matches!(
-        &input.source_field.logical_type,
-        LogicalType::Text { .. } | LogicalType::Enum { .. } | LogicalType::Set { .. }
-    );
-    if collation_mismatch
-        && !collation_is_configurable
-        && input.options.parameters.is_empty()
-        && input.options.selected_rule.is_none()
-    {
-        return Err(CompatibilityError::TargetCapability(Box::new(
-            TargetCapabilityFailure::new("source and target field collations are not equivalent")
-                .with_code("target_capability.collation_mismatch")
-                .with_route(input.options.route_id.clone()),
-        )));
-    }
     if input.source_type_mapping.connector != input.source_connector
         || input.source_type_mapping.logical_type != input.source_field.logical_type
         || !input
@@ -5589,6 +5600,16 @@ fn validate_field_input(
         &input.options.route_id,
     )?;
     Ok(())
+}
+
+fn field_collation_mismatch(input: &FieldCompatibilityInput<'_>) -> bool {
+    if input.source_connector == input.sink_connector {
+        input.source_field.collation != input.target_field.collation
+    } else {
+        input.source_field.collation.is_some()
+            && input.target_field.collation.is_some()
+            && input.source_field.collation != input.target_field.collation
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -71,7 +71,40 @@ pub(crate) async fn load(
                 "{schema}.{name}: requires an ordinary permanent primary-key table without RLS/row filters and DEFAULT or FULL replica identity"
             )));
         }
-        let column_rows=sqlx::query("SELECT a.attname,a.atttypid::bigint AS type_oid,a.atttypmod,CASE WHEN t.typtype='e' THEN 'enum(' || (SELECT string_agg(quote_literal(e.enumlabel), ',' ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid=a.atttypid) || ')' ELSE format_type(a.atttypid,a.atttypmod) END AS native_type,a.attgenerated::text AS generated,(SELECT (k.ord-1)::integer FROM pg_index i CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY AS k(attnum,ord) WHERE i.indrelid=a.attrelid AND i.indisprimary AND k.attnum=a.attnum AND k.ord <= i.indnkeyatts) AS key_ordinal FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=$1::bigint::oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")
+        let column_rows=sqlx::query(
+            "SELECT a.attname,a.atttypid::bigint AS type_oid,a.atttypmod,
+                    CASE
+                      WHEN t.typtype='e' THEN 'enum(' || (
+                        SELECT string_agg(quote_literal(e.enumlabel), ',' ORDER BY e.enumsortorder)
+                          FROM pg_enum e WHERE e.enumtypid=a.atttypid
+                      ) || ')'
+                      WHEN type_ns.nspname='pg_catalog' AND t.typtype='c' THEN
+                        quote_ident(type_ns.nspname)||'.'||quote_ident(t.typname)
+                      WHEN type_ns.nspname='pg_catalog' THEN format_type(a.atttypid,a.atttypmod)
+                      WHEN t.typtype='b' AND t.typelem<>0 AND t.typcategory='A' THEN
+                        quote_ident(element_ns.nspname)||'.'||quote_ident(element.typname)||
+                        CASE WHEN a.atttypmod<0 THEN '' ELSE
+                          substring(format_type(element.oid,a.atttypmod) from
+                            char_length(format_type(element.oid,-1))+1)
+                        END||'[]'
+                      ELSE quote_ident(type_ns.nspname)||'.'||quote_ident(t.typname)||
+                        CASE WHEN a.atttypmod<0 THEN '' ELSE
+                          substring(format_type(a.atttypid,a.atttypmod) from
+                            char_length(format_type(a.atttypid,-1))+1)
+                        END
+                    END AS native_type,
+                    a.attgenerated::text AS generated,
+                    (SELECT (k.ord-1)::integer FROM pg_index i
+                      CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY AS k(attnum,ord)
+                      WHERE i.indrelid=a.attrelid AND i.indisprimary AND k.attnum=a.attnum
+                        AND k.ord <= i.indnkeyatts) AS key_ordinal
+               FROM pg_attribute a
+               JOIN pg_type t ON t.oid=a.atttypid
+               JOIN pg_namespace type_ns ON type_ns.oid=t.typnamespace
+               LEFT JOIN pg_type element ON element.oid=t.typelem
+               LEFT JOIN pg_namespace element_ns ON element_ns.oid=element.typnamespace
+              WHERE a.attrelid=$1::bigint::oid AND a.attnum>0 AND NOT a.attisdropped
+              ORDER BY a.attnum")
             .bind(i64::from(oid)).fetch_all(&mut *conn).await?;
         let mut columns = Vec::new();
         for column in column_rows {

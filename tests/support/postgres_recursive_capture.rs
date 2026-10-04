@@ -4,12 +4,113 @@
 use change_event::{Datum, LogicalValue, Operation, ServerBuildIdentity};
 use postgresql_15::{CancellationToken, Config};
 use sqlx::{Connection, PgConnection};
-use std::{env, time::Duration};
+use std::{collections::BTreeSet, env, time::Duration};
 
 use super::{postgres_env, type_qualification_evidence};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+fn catalog_non_storable_reason(
+    catalog: &postgresql_15::SourceTypeCatalog,
+    root_oid: u32,
+) -> Option<String> {
+    fn visit(
+        catalog: &postgresql_15::SourceTypeCatalog,
+        oid: u32,
+        visiting: &mut BTreeSet<u32>,
+    ) -> Option<String> {
+        if !visiting.insert(oid) {
+            return None;
+        }
+        let Some(definition) = catalog
+            .types
+            .iter()
+            .find(|definition| definition.oid == oid)
+        else {
+            visiting.remove(&oid);
+            return Some(format!("references missing PostgreSQL type OID {oid}"));
+        };
+        let reason = match &definition.kind {
+            postgresql_15::SourceTypeDefinitionKind::Pseudo => Some(format!(
+                "depends on non-storable PostgreSQL pseudotype {}.{}",
+                definition.schema, definition.name
+            )),
+            postgresql_15::SourceTypeDefinitionKind::Domain { base_oid, .. } => {
+                visit(catalog, *base_oid, visiting).map(|reason| {
+                    format!("domain {}.{} {reason}", definition.schema, definition.name)
+                })
+            }
+            postgresql_15::SourceTypeDefinitionKind::Composite { fields } => {
+                fields.iter().find_map(|field| {
+                    visit(catalog, field.type_oid, visiting).map(|reason| {
+                        format!(
+                            "composite {}.{} field {} {reason}",
+                            definition.schema, definition.name, field.name
+                        )
+                    })
+                })
+            }
+            postgresql_15::SourceTypeDefinitionKind::Array { element_oid, .. } => {
+                let element_is_pseudo = catalog.types.iter().any(|element| {
+                    element.oid == *element_oid
+                        && matches!(
+                            element.kind,
+                            postgresql_15::SourceTypeDefinitionKind::Pseudo
+                        )
+                });
+                if element_is_pseudo {
+                    Some(format!(
+                        "array {}.{} has a non-storable pseudo-type element",
+                        definition.schema, definition.name
+                    ))
+                } else {
+                    visit(catalog, *element_oid, visiting)
+                        .filter(|reason| reason.contains("non-storable PostgreSQL pseudotype"))
+                        .map(|reason| {
+                            format!(
+                                "array {}.{} element {reason}",
+                                definition.schema, definition.name
+                            )
+                        })
+                }
+            }
+            postgresql_15::SourceTypeDefinitionKind::Range { subtype_oid } => {
+                visit(catalog, *subtype_oid, visiting).map(|reason| {
+                    format!("range {}.{} {reason}", definition.schema, definition.name)
+                })
+            }
+            postgresql_15::SourceTypeDefinitionKind::MultiRange { range_oid } => {
+                visit(catalog, *range_oid, visiting).map(|reason| {
+                    format!(
+                        "multirange {}.{} {reason}",
+                        definition.schema, definition.name
+                    )
+                })
+            }
+            postgresql_15::SourceTypeDefinitionKind::Builtin { .. }
+                if definition.schema == "pg_catalog"
+                    && matches!(
+                        definition.name.as_str(),
+                        "pg_brin_bloom_summary" | "pg_brin_minmax_multi_summary"
+                    ) =>
+            {
+                Some(format!(
+                    "PostgreSQL internal BRIN summary {}.{} has no input/receive routine for row DML",
+                    definition.schema, definition.name
+                ))
+            }
+            postgresql_15::SourceTypeDefinitionKind::Builtin { .. }
+            | postgresql_15::SourceTypeDefinitionKind::Enum { .. }
+            | postgresql_15::SourceTypeDefinitionKind::Extension { .. } => None,
+        };
+        visiting.remove(&oid);
+        reason
+    }
+
+    visit(catalog, root_oid, &mut BTreeSet::new())
+}
+
+#[allow(dead_code)]
 pub(super) struct RecursiveCapture {
     pub(super) table_name: String,
     pub(super) transactions: Vec<change_event::ValidatedTransaction>,
@@ -35,6 +136,12 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
     let mut admin =
         PgConnection::connect_with(&postgres_env::options(&version, &admin_user, &password))
             .await?;
+    let removed_fixtures = cleanup_stale_type_qualification_fixtures(&mut admin, major).await?;
+    if removed_fixtures > 0 {
+        eprintln!(
+            "PostgreSQL {major} type qualification removed {removed_fixtures} interrupted test fixtures"
+        );
+    }
     let mut created_hstore = false;
     let mut created_postgis = false;
     let result = async {
@@ -158,6 +265,257 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
             ))
             .into());
         }
+
+        // Exercise the mapper against every defined, non-pseudotype catalog
+        // declaration, not only the handful of values used by the recursive
+        // DML fixture. A type missing from the mapping is a real catalog gap.
+        let catalog_type_rows = sqlx::query_as::<_, (i64, String)>(
+            "SELECT t.oid::bigint, pg_catalog.format_type(t.oid, NULL)
+               FROM pg_catalog.pg_type t
+               JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace
+              WHERE t.typisdefined AND t.typtype <> 'p'
+                AND n.nspname NOT LIKE 'pg_toast%'
+                AND n.nspname !~ '^cdc_pg(15|16|17)_recursive_[0-9]+$'
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.pg_class fixture
+                      JOIN pg_catalog.pg_namespace fixture_ns
+                        ON fixture_ns.oid=fixture.relnamespace
+                      JOIN pg_catalog.pg_type fixture_type
+                        ON fixture_type.oid=fixture.reltype
+                     WHERE fixture_ns.nspname='CDC_test'
+                       AND fixture.relname=$1
+                       AND t.oid IN (fixture_type.oid, fixture_type.typarray)
+                )
+              ORDER BY t.oid",
+        )
+        .bind(&table_name)
+        .fetch_all(&mut admin)
+        .await?;
+        let mut mapped_catalog_types = Vec::new();
+        let mut excluded_pseudotype_array_count = 0;
+        let mut catalog_mapping_gaps = Vec::new();
+        for (oid, native_type) in catalog_type_rows {
+            let oid = u32::try_from(oid)?;
+            let Some(definition) = catalog.types.iter().find(|definition| definition.oid == oid)
+            else {
+                catalog_mapping_gaps.push(format!("OID {oid} {native_type}: absent from type snapshot"));
+                continue;
+            };
+            if matches!(definition.kind, postgresql_15::SourceTypeDefinitionKind::Pseudo) {
+                continue;
+            }
+            if let postgresql_15::SourceTypeDefinitionKind::Array { element_oid, .. } = definition.kind
+                && catalog.types.iter().any(|element| {
+                    element.oid == element_oid
+                        && matches!(element.kind, postgresql_15::SourceTypeDefinitionKind::Pseudo)
+                })
+            {
+                excluded_pseudotype_array_count += 1;
+                continue;
+            }
+            let qualified_type = catalog_type_declaration(&catalog, oid, &native_type)?;
+            match postgresql_15::source_type_mapping_with_catalog_for_version(
+                &version,
+                &qualified_type,
+                &catalog,
+            ) {
+                Ok(mapping) => {
+                    mapped_catalog_types.push((
+                        oid,
+                        definition.schema.clone(),
+                        definition.name.clone(),
+                        native_type,
+                        qualified_type,
+                        definition.definition_digest.clone(),
+                        mapping.mapping_id,
+                        mapping.evidence_digest.unwrap_or_default(),
+                        change_event::stable_digest(&mapping.logical_type),
+                        if matches!(
+                            &mapping.logical_type,
+                            change_event::LogicalType::Raw { .. }
+                        ) {
+                            "SOURCE_REPRESENTATION"
+                        } else {
+                            "SEMANTIC_CODEC"
+                        },
+                        serde_json::to_string(&mapping.logical_type)?,
+                    ));
+                }
+                Err(error) => catalog_mapping_gaps.push(format!("OID {oid} {native_type}: {error}")),
+            }
+        }
+        if !catalog_mapping_gaps.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "PostgreSQL {major} has {} unmapped defined catalog types: {}",
+                catalog_mapping_gaps.len(),
+                catalog_mapping_gaps
+                    .iter()
+                    .take(24)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+            .into());
+        }
+        let brin_io_rows = sqlx::query_as::<_, (String, String, String, String, String)>(
+            "SELECT type.typname,
+                    input_proc.proname,
+                    output_proc.proname,
+                    receive_proc.proname,
+                    send_proc.proname
+               FROM pg_catalog.pg_type type
+               JOIN pg_catalog.pg_namespace namespace ON namespace.oid=type.typnamespace
+               JOIN pg_catalog.pg_proc input_proc ON input_proc.oid=type.typinput
+               JOIN pg_catalog.pg_proc output_proc ON output_proc.oid=type.typoutput
+               JOIN pg_catalog.pg_proc receive_proc ON receive_proc.oid=type.typreceive
+               JOIN pg_catalog.pg_proc send_proc ON send_proc.oid=type.typsend
+              WHERE namespace.nspname='pg_catalog'
+                AND type.typname IN ('pg_brin_bloom_summary','pg_brin_minmax_multi_summary')
+              ORDER BY type.typname",
+        )
+        .fetch_all(&mut admin)
+        .await?;
+        let expected_brin_io = BTreeSet::from([
+            (
+                "pg_brin_bloom_summary",
+                "brin_bloom_summary_in",
+                "brin_bloom_summary_out",
+                "brin_bloom_summary_recv",
+                "brin_bloom_summary_send",
+            ),
+            (
+                "pg_brin_minmax_multi_summary",
+                "brin_minmax_multi_summary_in",
+                "brin_minmax_multi_summary_out",
+                "brin_minmax_multi_summary_recv",
+                "brin_minmax_multi_summary_send",
+            ),
+        ]);
+        let actual_brin_io = brin_io_rows
+            .iter()
+            .map(|(name, input, output, receive, send)| {
+                (
+                    name.as_str(),
+                    input.as_str(),
+                    output.as_str(),
+                    receive.as_str(),
+                    send.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if actual_brin_io != expected_brin_io {
+            return Err(std::io::Error::other(format!(
+                "PostgreSQL {major} BRIN internal type I/O catalog differs from the audited non-row-DML contract: {actual_brin_io:?}"
+            ))
+            .into());
+        }
+        let brin_io_evidence = brin_io_rows
+            .into_iter()
+            .map(|(name, input, output, receive, send)| {
+                (
+                    name,
+                    serde_json::json!({
+                        "input_function": input,
+                        "output_function": output,
+                        "receive_function": receive,
+                        "send_function": send,
+                        "row_dml_constructible": false,
+                        "reason": "PostgreSQL core input and receive functions reject construction; BRIN summaries are internal index payloads, not user-row values"
+                    }),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let catalog_type_digest = change_event::stable_digest(&mapped_catalog_types);
+        let non_storable_type_count = mapped_catalog_types
+            .iter()
+            .filter(|(oid, ..)| catalog_non_storable_reason(&catalog, *oid).is_some())
+            .count();
+        let catalog_type_roster = mapped_catalog_types
+            .iter()
+            .map(
+                |(
+                    oid,
+                    schema,
+                    name,
+                    _native_type,
+                    qualified_type,
+                    definition_digest,
+                    mapping_id,
+                    mapping_evidence_digest,
+                    logical_type_digest,
+                    representation_mode,
+                    _logical_type,
+                )| {
+                    let definition = catalog
+                        .types
+                        .iter()
+                        .find(|definition| definition.oid == *oid)
+                        .expect("mapped catalog type must be present in the source snapshot");
+                    let catalog_class_id = match &definition.kind {
+                        postgresql_15::SourceTypeDefinitionKind::Array { .. } => {
+                            "postgresql.arrays"
+                        }
+                        postgresql_15::SourceTypeDefinitionKind::Enum { .. } => {
+                            "postgresql.enums"
+                        }
+                        postgresql_15::SourceTypeDefinitionKind::Domain { .. } => {
+                            "postgresql.domains"
+                        }
+                        postgresql_15::SourceTypeDefinitionKind::Composite { .. } => {
+                            "postgresql.composites"
+                        }
+                        postgresql_15::SourceTypeDefinitionKind::Range { .. }
+                        | postgresql_15::SourceTypeDefinitionKind::MultiRange { .. } => {
+                            "postgresql.ranges"
+                        }
+                        postgresql_15::SourceTypeDefinitionKind::Extension { .. } => {
+                            "postgresql.extensions_and_custom_base_types"
+                        }
+                        postgresql_15::SourceTypeDefinitionKind::Builtin { .. }
+                            if schema == "pg_catalog" =>
+                        {
+                            "postgresql.other_defined_catalog_types"
+                        }
+                        postgresql_15::SourceTypeDefinitionKind::Builtin { .. } => {
+                            "postgresql.user_defined_base_types"
+                        }
+                        postgresql_15::SourceTypeDefinitionKind::Pseudo => unreachable!(
+                            "pseudotypes and arrays of pseudotypes are excluded from the roster"
+                        ),
+                    };
+                    let non_storable_reason = catalog_non_storable_reason(&catalog, *oid);
+                    serde_json::json!({
+                        "type_id": format!("dynamic:postgresql.instance.{schema}.{name}:{definition_digest}"),
+                        "catalog_class_id": catalog_class_id,
+                        "schema": schema,
+                        "name": name,
+                        "type_oid": oid,
+                        "native_declaration": qualified_type,
+                        "definition_digest": definition_digest,
+                        "mapping_id": mapping_id,
+                        "mapping_evidence_digest": mapping_evidence_digest,
+                        "logical_type_digest": logical_type_digest,
+                        "representation_mode": representation_mode,
+                        "user_storable": non_storable_reason.is_none(),
+                        "non_storable_reason": non_storable_reason,
+                        "row_dml_io_evidence": brin_io_evidence.get(name).cloned()
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        type_qualification_evidence::record_exact_catalog_type_mapping_evidence(
+            type_qualification_evidence::ExactCatalogTypeMappingEvidence {
+                connector_id: format!("postgresql_{major}"),
+                suite_id: format!("postgresql_{major}.complete_defined_catalog_type_mapping"),
+                catalog_type_count: mapped_catalog_types.len(),
+                excluded_pseudotype_array_count,
+                catalog_scope: "all mapped defined non-pseudotype PostgreSQL catalog types; pseudotype dependencies and PostgreSQL internal BRIN summary values are explicitly classified outside user-row DML; arrays with real, nullable element types remain in coverage; transient fixture types are counted separately".into(),
+                catalog_digest: catalog_type_digest.clone(),
+                type_roster: catalog_type_roster,
+                non_storable_type_count,
+            },
+        )?;
         let server_version_text: String = sqlx::query_scalar("SELECT version()")
             .fetch_one(&mut admin)
             .await?;
@@ -301,6 +659,75 @@ pub(super) async fn capture_recursive_types(major: u16) -> TestResult<RecursiveC
             assert_eq!(change_event::json(&replay)?, encoded);
             reader.finish()?;
         }
+        let exact_dynamic_names = [
+            "mood",
+            "score",
+            "person",
+            "people",
+            "matrix",
+            "span",
+            "spans",
+            "catalog_internal",
+        ]
+        .into_iter()
+        .chain(hstore_schema.is_some().then_some("attributes"))
+        .chain(postgis_schema.is_some().then_some("location"))
+        .collect::<std::collections::BTreeSet<_>>();
+        let exact_catalog_columns = sqlx::query_as::<_, (String, i64, String)>(
+            "SELECT a.attname, a.atttypid::bigint, pg_catalog.format_type(a.atttypid, a.atttypmod)
+               FROM pg_catalog.pg_attribute a
+               JOIN pg_catalog.pg_class c ON c.oid=a.attrelid
+               JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+              WHERE n.nspname='CDC_test' AND c.relname=$1
+                AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .bind(&table_name)
+        .fetch_all(&mut admin)
+        .await?;
+        let mut exact_source_type_ids = Vec::new();
+        let mut exact_representation_type_ids = Vec::new();
+        for (column_name, oid, native_type) in exact_catalog_columns {
+            if !exact_dynamic_names.contains(column_name.as_str()) {
+                continue;
+            }
+            let oid = u32::try_from(oid)?;
+            let definition = catalog
+                .types
+                .iter()
+                .find(|definition| definition.oid == oid)
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "captured PostgreSQL column {column_name} has unmapped catalog OID {oid}"
+                    ))
+                })?;
+            if !type_qualification_evidence::source_native_type_ids(
+                &format!("postgresql_{major}"),
+                [native_type.clone()],
+            )
+            .is_empty()
+            {
+                continue;
+            }
+            let mapping = postgresql_15::source_type_mapping_with_catalog_for_version(
+                &version,
+                &native_type,
+                &catalog,
+            )?;
+            let type_id = format!(
+                "dynamic:postgresql.instance.{}.{}:{}",
+                definition.schema, definition.name, definition.definition_digest
+            );
+            if matches!(mapping.logical_type, change_event::LogicalType::Raw { .. }) {
+                exact_representation_type_ids.push(type_id.clone());
+            }
+            exact_source_type_ids.push(type_id);
+        }
+        type_qualification_evidence::record_source_type_evidence(
+            &format!("postgresql_{major}"),
+            &format!("postgresql_{major}.recursive_type_fixtures"),
+            exact_source_type_ids,
+            exact_representation_type_ids,
+        )?;
         let mut dynamic_classes = vec![
             "postgresql.other_defined_catalog_types".to_owned(),
             "postgresql.arrays".to_owned(),
@@ -436,6 +863,45 @@ fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+fn catalog_type_declaration(
+    catalog: &postgresql_15::SourceTypeCatalog,
+    oid: u32,
+    formatted_type: &str,
+) -> TestResult<String> {
+    let definition = catalog
+        .types
+        .iter()
+        .find(|definition| definition.oid == oid)
+        .ok_or_else(|| std::io::Error::other(format!("missing PostgreSQL type OID {oid}")))?;
+    if let postgresql_15::SourceTypeDefinitionKind::Array { element_oid, .. } = definition.kind {
+        let element = catalog
+            .types
+            .iter()
+            .find(|definition| definition.oid == element_oid)
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "missing PostgreSQL array element OID {element_oid}"
+                ))
+            })?;
+        if element.schema == "pg_catalog" {
+            return Ok(formatted_type.to_owned());
+        }
+        return Ok(format!(
+            "{}[]",
+            catalog_type_declaration(catalog, element_oid, formatted_type)?
+        ));
+    }
+    if definition.schema == "pg_catalog" {
+        Ok(formatted_type.to_owned())
+    } else {
+        Ok(format!(
+            "{}.{}",
+            quote_ident(&definition.schema),
+            quote_ident(&definition.name)
+        ))
+    }
+}
+
 async fn read_transactions(
     config: Config,
     major: u16,
@@ -466,6 +932,117 @@ async fn execute(connection: &mut PgConnection, sql: String) -> TestResult {
         .execute(connection)
         .await?;
     Ok(())
+}
+
+/// Remove only nonce-named relations, types, and schemas created by this
+/// repository's live qualification fixtures when a prior test was interrupted.
+/// The name patterns intentionally match the fixture constructors in
+/// `web_ui::runtime_tests` and `capture_recursive_types`; ordinary CDC_test
+/// objects and the stable `cdc_web_types_pg{major}_qualification` schema are
+/// outside this cleanup scope.
+async fn cleanup_stale_type_qualification_fixtures(
+    connection: &mut PgConnection,
+    major: u16,
+) -> TestResult<usize> {
+    let mut removed = 0;
+    let relation_pattern = format!(
+        "^(web_carrier|web_pg|web_mysql_types|web_pg_enum|web_pg{major}_types|cap_inv)_[0-9]+$|^(events|catalog_events)_{major}_[0-9]+$"
+    );
+    let relations = sqlx::query_scalar::<_, String>(
+        "SELECT c.relname
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname='CDC_test' AND c.relkind IN ('r','p')
+            AND c.relname ~ $1
+          ORDER BY c.relname",
+    )
+    .bind(&relation_pattern)
+    .fetch_all(&mut *connection)
+    .await?;
+    for relation in relations {
+        execute(
+            connection,
+            format!(
+                "DROP TABLE IF EXISTS {}.{} CASCADE",
+                quote_ident("CDC_test"),
+                quote_ident(&relation)
+            ),
+        )
+        .await?;
+        removed += 1;
+    }
+
+    let enum_types = sqlx::query_scalar::<_, String>(
+        "SELECT t.typname
+           FROM pg_catalog.pg_type t
+           JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace
+          WHERE n.nspname='CDC_test' AND t.typtype='e'
+            AND t.typname ~ '^web_mood_[0-9]+$'
+          ORDER BY t.typname",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    for type_name in enum_types {
+        execute(
+            connection,
+            format!(
+                "DROP TYPE IF EXISTS {}.{} CASCADE",
+                quote_ident("CDC_test"),
+                quote_ident(&type_name)
+            ),
+        )
+        .await?;
+        removed += 1;
+    }
+
+    let recursive_publications = sqlx::query_scalar::<_, String>(
+        "SELECT pubname FROM pg_catalog.pg_publication WHERE pubname ~ $1 ORDER BY pubname",
+    )
+    .bind(format!("^cdc_pg{major}_recursive_pub_[0-9]+$"))
+    .fetch_all(&mut *connection)
+    .await?;
+    for publication in recursive_publications {
+        execute(
+            connection,
+            format!("DROP PUBLICATION IF EXISTS {}", quote_ident(&publication)),
+        )
+        .await?;
+        removed += 1;
+    }
+
+    let stale_slots = sqlx::query_scalar::<_, String>(
+        "SELECT slot_name FROM pg_catalog.pg_replication_slots
+          WHERE database=current_database() AND NOT active AND slot_name ~ $1
+          ORDER BY slot_name",
+    )
+    .bind(format!("^cdcpg{major}recursive[0-9]+$"))
+    .fetch_all(&mut *connection)
+    .await?;
+    for slot in stale_slots {
+        sqlx::query("SELECT pg_catalog.pg_drop_replication_slot($1)")
+            .bind(slot)
+            .execute(&mut *connection)
+            .await?;
+        removed += 1;
+    }
+
+    let schema_pattern =
+        format!("^cdc_web_types_pg{major}_[0-9]+$|^cdc_pg{major}_recursive_[0-9]+$");
+    let schemas = sqlx::query_scalar::<_, String>(
+        "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname ~ $1 ORDER BY nspname",
+    )
+    .bind(&schema_pattern)
+    .fetch_all(&mut *connection)
+    .await?;
+    for schema in schemas {
+        execute(
+            connection,
+            format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(&schema)),
+        )
+        .await?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 macro_rules! live_test {

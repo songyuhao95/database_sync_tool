@@ -1412,15 +1412,15 @@ impl Store {
                 sink_table
                     .columns
                     .iter()
-                    .map(|column| column.name.as_str())
+                    .map(|column| column.name.clone())
                     .collect::<Vec<_>>()
             } else {
-                mapping.columns.iter().map(String::as_str).collect()
+                mapping.columns.clone()
             };
-            for column in columns {
-                let probe = sink.probe_target(&mapping.sink_schema, &mapping.sink_table, column)?;
+            let probes = sink.probe_targets(&mapping.sink_schema, &mapping.sink_table, &columns)?;
+            for (column, probe) in probes {
                 target_probes.insert(
-                    target_probe_key(&mapping.sink_schema, &mapping.sink_table, column),
+                    target_probe_key(&mapping.sink_schema, &mapping.sink_table, &column),
                     probe,
                 );
             }

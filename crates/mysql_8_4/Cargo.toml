@@ -11,5 +11,6 @@ base64.workspace = true
 serde_json.workspace = true
 change_event.workspace = true
 mysql_source_contract.workspace = true
+mysql_sink_contract.workspace = true
 mysql_5_7 = { path = "../mysql_5_7" }
 sha2.workspace = true

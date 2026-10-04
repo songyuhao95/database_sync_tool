@@ -136,6 +136,11 @@ pub const BUILTINS: &[BuiltinCase] = &[
         expression: "'{\"n\":1}'::jsonb",
     },
     BuiltinCase {
+        name: "jsonpath_value",
+        declaration: "jsonpath",
+        expression: "'$.a'::jsonpath",
+    },
+    BuiltinCase {
         name: "xml_value",
         declaration: "xml",
         expression: "XMLPARSE(DOCUMENT '<root/>')",
@@ -209,6 +214,16 @@ pub const BUILTINS: &[BuiltinCase] = &[
         name: "oid_value",
         declaration: "oid",
         expression: "42::oid",
+    },
+    BuiltinCase {
+        name: "refcursor_value",
+        declaration: "refcursor",
+        expression: "'cdc_cursor'::refcursor",
+    },
+    BuiltinCase {
+        name: "aclitem_value",
+        declaration: "aclitem",
+        expression: "(SELECT unnest(relacl) FROM pg_catalog.pg_class WHERE relacl IS NOT NULL LIMIT 1)",
     },
     BuiltinCase {
         name: "oidvector_value",

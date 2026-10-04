@@ -1,0 +1,9 @@
+[package]
+name = "mysql_sink_contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+change_event.workspace = true
+mysql-driver.workspace = true

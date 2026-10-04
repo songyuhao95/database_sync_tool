@@ -45,7 +45,7 @@ versions never borrow PostgreSQL 15 connection settings, and server-version
 assertions reject a misrouted endpoint. Without those settings the live
 component status remains `REQUIRES_LIVE`.
 
-Same-version MySQL Web qualification uses independent source and target
+Actual same-version MySQL Web qualification uses independent source and target
 servers because task start rejects equal MySQL `server_uuid` values to prevent
 replication loops. Keep the normal source ports in `CDC_MYSQL57_PORT`,
 `CDC_MYSQL80_PORT`, and `CDC_MYSQL84_PORT`; configure a second server of each
@@ -54,9 +54,12 @@ version with `CDC_MYSQL57_SINK_PORT`, `CDC_MYSQL80_SINK_PORT`, and
 `CDC_MYSQL80_SINK_HOST`, or `CDC_MYSQL84_SINK_HOST`. The sink endpoint must
 report the same MySQL version as its source port but a different server UUID.
 The test reuses the configured reader/writer usernames and passwords on that
-endpoint. Until the host, port, credentials, and matching independent server
-are configured, the corresponding same-version Web routes remain
-`REQUIRES_LIVE`.
+endpoint. These suites are optional end-to-end evidence. If no independent
+same-version target is configured, the report can qualify that exact self-route
+by composing per-type Source protocol and ChangeEvent evidence, the same Sink's
+offline and live read-back evidence, and the offline 6×6 route result. It labels
+this `COMPONENTS_COMPOSED_MYSQL_SELF_ROUTE`; it never claims a Web end-to-end
+run, and missing actual Web plan receipts remain visible as a separate count.
 
 The console contains only an ordered final matrix, missing-direction count,
 and report location. Cargo output stays in per-suite logs. `summary.json`
@@ -140,10 +143,14 @@ or dynamic catalog class has an implementation gap, `REQUIRES_PER_TYPE_QUALIFICA
 when code exists but exact-type evidence is incomplete, and `PASS` only after
 every source declaration has a `PER_TYPE_QUALIFIED` receipt. Receipts are keyed
 by `<type_id>@<source_connector_id>` in `per_type_qualification.entries` and
-must cite passing source protocol, semantic codec, ChangeEvent, and live
-evidence; all six sinks must record an accepted preservation outcome with
-offline and live evidence; Web must cite explicit selection and risk
-confirmation. Evidence references must resolve uniquely in the versioned
+must cite passing source protocol, ChangeEvent, and live evidence, plus either
+semantic codec receipts or source-representation capture and framing receipts;
+all six sinks must record an accepted preservation outcome with
+offline and live evidence. Routes reported as `LIVE_WEB_E2E` must additionally
+cite explicit selection, risk confirmation, saved plan, and start-gate evidence.
+Exact same-version MySQL routes may use the component-composition mode above;
+their actual Web-plan gaps are reported separately. Evidence references must
+resolve uniquely in the versioned
 evidence registry and match the receipt's type, source connector, selected
 sink, axis, passing status, non-empty run ID, and SHA-256 report digest.
 Each reference must resolve a repository-relative `artifact_path`; the gate
@@ -161,9 +168,18 @@ path. Semantic value preservation does not depend on raw-byte framing. Empty
 evidence references or a missing sink keep the type at `FAMILY_FIXTURE_ONLY`;
 family-level fixtures never qualify a native declaration by themselves.
 Each declaration row also reports `per_type_live_evidence.source`,
-`per_type_live_evidence.all_sinks`, and `per_type_web_status`. The existing
-connector-level live suites do not automatically promote those type-level
-states; absent a resolvable type receipt, the report keeps them pending.
+`per_type_live_evidence.all_sinks`, `per_type_web_status` (actual Web evidence),
+and `per_type_route_qualification_status` (`LIVE_WEB_E2E`,
+`COMPONENTS_COMPOSED_MYSQL_SELF_ROUTE`, or pending). The two positive route
+states are distinct and never imply one another. PostgreSQL catalog types are
+qualified against the exact definition digest in each live source-to-sink
+route's catalog snapshot. Definitions observed in earlier fixture epochs remain
+in `historical_catalog_observations` for diagnosis; they are not combined into
+one impossible cross-route catalog. The route audit checks every type in each
+snapshot and requires all eight dynamic classes on all 18 PostgreSQL routes.
+The report counts actual
+per-type Web plans and component-composed routes separately; absent a valid
+source, sink, or required route receipt, the type remains pending.
 
 The Issue #58 representation-only route is tracked independently. Each
 versioned source declaration points to a protocol framing profile and records
@@ -172,9 +188,10 @@ length/digest, and source cursor. MySQL row events require the versioned
 `Table_map` type metadata, row encoding, NULL/present-column bitmaps, and a
 decoder boundary that exposes validated field bytes. PostgreSQL `pgoutput`
 requires the `Relation` OID/type modifier plus the `TupleData` tag and length;
-NULL and unchanged-TOAST tags stay separate from payload bytes. These profiles
-are currently `MISSING_IMPLEMENTATION`, so this inventory does not claim raw
-capture works. PostgreSQL documents the `pgoutput` tuple framing in its
+NULL and unchanged-TOAST tags stay separate from payload bytes. A representation
+profile passes only with its per-declaration capture and framing receipts;
+the qualified native baseline currently contains 81 such declarations and 411
+semantic-codec declarations. PostgreSQL documents the `pgoutput` tuple framing in its
 [logical replication message format](https://www.postgresql.org/docs/17/protocol-logicalrep-message-formats.html);
 MySQL documents row type metadata and row images in its
 [binary logging options](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html).
@@ -183,8 +200,8 @@ Each sink separately reports native `VALUE_PRESERVED` qualification and
 representation-carrier qualification (`LONGBLOB` or `bytea` candidates only).
 Carrier write/readback plus length and digest checks may establish
 `SOURCE_REPRESENTATION_PRESERVED`; that result never implies value recovery or
-native behavior. The representation-only Web path remains a gap until it
-requires per-field selection and risk confirmation and blocks primary,
+native behavior. The representation-only Web path requires per-field selection
+and risk confirmation and blocks primary,
 unique, and row-locator use without separate equivalence evidence.
 
 ## Adding a version

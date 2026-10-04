@@ -31,6 +31,7 @@ fn postgresql_inventory_catalog() -> postgresql_15::SourceTypeCatalog {
         ("int4", 23),
         ("int8", 20),
         ("numeric", 1700),
+        ("text", 25),
         ("timestamp", 1114),
         ("timestamptz", 1184),
         ("date", 1082),
@@ -66,6 +67,7 @@ fn postgresql_inventory_catalog() -> postgresql_15::SourceTypeCatalog {
     .map(|(name, oid)| Type::builtin(oid, "pg_catalog", name))
     .collect::<Vec<_>>();
     types.extend([
+        Type::array(1009, "pg_catalog", "_text", 25),
         Type::range(3904, "pg_catalog", "int4range", 23),
         Type::range(3926, "pg_catalog", "int8range", 20),
         Type::range(3906, "pg_catalog", "numrange", 1700),
@@ -569,7 +571,7 @@ fn mysql_char_collation_mismatch_exposes_a_configurable_text_rule() {
 }
 
 #[test]
-fn mysql_enum_collation_mismatch_keeps_label_mapping_available() {
+fn mysql_enum_collation_mismatch_requires_confirmation_but_keeps_label_mapping_available() {
     let source_connector = SourceRegistry
         .find("mysql", "5.7")
         .expect("MySQL 5.7 source is registered");
@@ -629,17 +631,251 @@ fn mysql_enum_collation_mismatch_keeps_label_mapping_available() {
     )
     .expect("ENUM label mapping should ignore target collation spelling");
 
-    assert_eq!(result.status, CompatibilityStatus::Compatible);
+    assert_eq!(result.status, CompatibilityStatus::NeedsConfirmation);
+    let plan = result
+        .plan
+        .as_ref()
+        .expect("ENUM label mapping remains available as a risk plan");
     assert_eq!(
-        result
-            .plan
-            .as_ref()
-            .expect("compatible ENUM result includes a plan")
-            .target
+        plan.risk_code.as_deref(),
+        Some("common.collation_semantics_target")
+    );
+    assert_eq!(
+        plan.target
             .parameters
             .get("value_strategy")
             .map(String::as_str),
         Some("enum_label")
+    );
+
+    let confirmation = RiskConfirmation {
+        source_field_lineage: plan.source_field.lineage_id.clone(),
+        target_field_lineage: plan.target_field.lineage_id.clone(),
+        rule: plan.rule.clone(),
+        plan_digest: plan.plan_digest.clone(),
+        actor: "test".into(),
+        confirmed_at: "2026-10-03T00:00:00Z".into(),
+        reason: Some("accepted the target ENUM collation semantics".into()),
+    };
+    let confirmed = field_compatibility_with_parameters(
+        source_connector,
+        sink_connector,
+        &source,
+        &sink,
+        &source.columns[1],
+        &sink.columns[1],
+        "draft-enum-collation",
+        "draft-enum-collation:r1",
+        Some(ServerBuildIdentity::new(
+            "mysql",
+            "oracle",
+            "5.7.44",
+            "mysql-5.7.44",
+        )),
+        Some(ServerBuildIdentity::new(
+            "mysql",
+            "oracle",
+            "8.0.36",
+            "mysql-8.0.36",
+        )),
+        &BTreeMap::new(),
+        &[confirmation],
+    )
+    .expect("explicitly confirmed ENUM mapping should be accepted");
+    assert_eq!(confirmed.status, CompatibilityStatus::Compatible);
+    assert_eq!(
+        confirmed
+            .plan
+            .as_ref()
+            .expect("confirmed ENUM mapping keeps its plan")
+            .plan_digest,
+        plan.plan_digest
+    );
+}
+
+#[test]
+fn postgres_array_collation_difference_is_an_explicit_confirmable_risk() {
+    let source_connector = SourceRegistry
+        .find("postgresql", "15")
+        .expect("PostgreSQL 15 source is registered");
+    let sink_connector = SinkRegistry
+        .find("postgresql", "15")
+        .expect("PostgreSQL 15 sink is registered");
+    let source = CatalogTable {
+        schema: "public".into(),
+        name: "array_source".into(),
+        engine: "PostgreSQL".into(),
+        primary_key: vec!["id".into()],
+        columns: vec![
+            CatalogColumn {
+                name: "id".into(),
+                column_type: "bigint".into(),
+                nullable: false,
+                extra: String::new(),
+                collation: None,
+                default_value: None,
+            },
+            CatalogColumn {
+                name: "value".into(),
+                column_type: "text[]".into(),
+                nullable: true,
+                extra: String::new(),
+                collation: Some("C".into()),
+                default_value: None,
+            },
+        ],
+    };
+    let sink = CatalogTable {
+        schema: "public".into(),
+        name: "array_sink".into(),
+        engine: "PostgreSQL".into(),
+        primary_key: vec!["id".into()],
+        columns: vec![
+            source.columns[0].clone(),
+            CatalogColumn {
+                name: "value".into(),
+                column_type: "text".into(),
+                nullable: true,
+                extra: String::new(),
+                collation: Some("POSIX".into()),
+                default_value: None,
+            },
+        ],
+    };
+    let source_catalog = postgresql_inventory_catalog();
+    let source_build = ServerBuildIdentity::new("postgresql", "community", "15.19", "pg15");
+    let target_build = source_build.clone();
+    let preview = field_compatibility_with_source_evidence_and_target_probe(
+        source_connector,
+        sink_connector,
+        &source,
+        &sink,
+        &source.columns[1],
+        &sink.columns[1],
+        "draft-pg-array-collation",
+        "draft-pg-array-collation:r1",
+        Some(source_build.clone()),
+        Some(target_build.clone()),
+        Some(&source_catalog),
+        None,
+        &BTreeMap::new(),
+        &[],
+        None,
+    )
+    .expect("collation difference should remain configurable");
+    assert_eq!(preview.status, CompatibilityStatus::NeedsConfiguration);
+    let candidate = preview
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .target
+                .parameters
+                .get("conversion_kind")
+                .is_some_and(|kind| kind == "logical_value_json")
+        })
+        .expect("the array should have a logical-value carrier candidate");
+    let parameters = BTreeMap::from([
+        ("__rule_id".into(), candidate.rule.id.clone()),
+        ("__rule_version".into(), candidate.rule.version.clone()),
+    ]);
+    let pending = field_compatibility_with_source_evidence_and_target_probe(
+        source_connector,
+        sink_connector,
+        &source,
+        &sink,
+        &source.columns[1],
+        &sink.columns[1],
+        "draft-pg-array-collation",
+        "draft-pg-array-collation:r1",
+        Some(source_build.clone()),
+        Some(target_build.clone()),
+        Some(&source_catalog),
+        None,
+        &parameters,
+        &[],
+        None,
+    )
+    .expect("selected target carrier should produce a risk plan");
+    assert_eq!(pending.status, CompatibilityStatus::NeedsConfirmation);
+    let plan = pending.plan.as_ref().expect("risk preview includes a plan");
+    assert_eq!(
+        plan.risk_code.as_deref(),
+        Some("common.collation_semantics_target")
+    );
+    assert!(!plan.loss.value);
+    assert!(plan.loss.comparison && plan.loss.ordering && plan.loss.constraints);
+    assert!(
+        plan.loss
+            .explanation
+            .contains("Source values are preserved")
+    );
+
+    let confirmation = RiskConfirmation {
+        source_field_lineage: plan.source_field.lineage_id.clone(),
+        target_field_lineage: plan.target_field.lineage_id.clone(),
+        rule: plan.rule.clone(),
+        plan_digest: plan.plan_digest.clone(),
+        actor: "test".into(),
+        confirmed_at: "2026-10-02T00:00:00Z".into(),
+        reason: Some("accepted target collation comparison semantics".into()),
+    };
+    let confirmed = field_compatibility_with_source_evidence_and_target_probe(
+        source_connector,
+        sink_connector,
+        &source,
+        &sink,
+        &source.columns[1],
+        &sink.columns[1],
+        "draft-pg-array-collation",
+        "draft-pg-array-collation:r1",
+        Some(source_build),
+        Some(target_build),
+        Some(&source_catalog),
+        None,
+        &parameters,
+        &[confirmation],
+        None,
+    )
+    .expect("field-local confirmation should enable the plan");
+    assert_eq!(confirmed.status, CompatibilityStatus::Compatible);
+
+    let mut key_source = source.clone();
+    key_source.primary_key = vec!["value".into()];
+    let mut key_sink = sink.clone();
+    key_sink.primary_key = vec!["value".into()];
+    let key_result = field_compatibility_with_source_evidence_and_target_probe(
+        source_connector,
+        sink_connector,
+        &key_source,
+        &key_sink,
+        &key_source.columns[1],
+        &key_sink.columns[1],
+        "draft-pg-array-collation-key",
+        "draft-pg-array-collation-key:r1",
+        Some(ServerBuildIdentity::new(
+            "postgresql",
+            "community",
+            "15.19",
+            "pg15",
+        )),
+        Some(ServerBuildIdentity::new(
+            "postgresql",
+            "community",
+            "15.19",
+            "pg15",
+        )),
+        Some(&source_catalog),
+        None,
+        &BTreeMap::new(),
+        &[],
+        None,
+    )
+    .expect("key collation mismatch is a compatibility result");
+    assert_eq!(key_result.status, CompatibilityStatus::Blocked);
+    assert_eq!(
+        key_result.reason_code,
+        "target_capability.key_collation_mismatch"
     );
 }
 

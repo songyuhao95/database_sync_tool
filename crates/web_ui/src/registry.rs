@@ -549,6 +549,57 @@ pub(crate) fn field_compatibility_with_source_evidence_and_target_probe(
     confirmations: &[change_event::RiskConfirmation],
     target_probe: Option<&change_event::TargetCapabilityProbe>,
 ) -> Result<CompatibilityResult, CompatibilityError> {
+    let source_mapping = source_connector
+        .source_type_mapping_with_evidence(
+            source_column,
+            source_catalog,
+            source_build.clone(),
+            source_environment_fingerprint,
+        )
+        .map_err(|message| {
+            CompatibilityError::SourceContract(change_event::CompatibilityFailure {
+                class: change_event::FailureClass::SourceContract,
+                code: "source_contract.type_mapping_failed".into(),
+                phase: change_event::FailurePhase::SourceContract,
+                retry: change_event::RetryClassification::NotRetryable,
+                message,
+            })
+        })?;
+    field_compatibility_with_precomputed_source_mapping_and_target_probe(
+        source_connector,
+        sink_connector,
+        source,
+        sink,
+        source_column,
+        sink_column,
+        source_mapping,
+        route_id,
+        configuration_revision,
+        source_build,
+        target_build,
+        parameters,
+        confirmations,
+        target_probe,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn field_compatibility_with_precomputed_source_mapping_and_target_probe(
+    source_connector: &ConnectorDescriptor,
+    sink_connector: &ConnectorDescriptor,
+    source: &CatalogTable,
+    sink: &CatalogTable,
+    source_column: &CatalogColumn,
+    sink_column: &CatalogColumn,
+    source_mapping: change_event::SourceTypeMapping,
+    route_id: &str,
+    configuration_revision: &str,
+    source_build: Option<ServerBuildIdentity>,
+    target_build: Option<ServerBuildIdentity>,
+    parameters: &BTreeMap<String, String>,
+    confirmations: &[change_event::RiskConfirmation],
+    target_probe: Option<&change_event::TargetCapabilityProbe>,
+) -> Result<CompatibilityResult, CompatibilityError> {
     // The task JSON keeps the selected rule beside its user-facing
     // conversion parameters. These reserved keys are consumed here and are
     // never forwarded to the rule option validator as arbitrary parameters.
@@ -577,22 +628,6 @@ pub(crate) fn field_compatibility_with_source_evidence_and_target_probe(
     let mut planner_parameters = parameters.clone();
     planner_parameters.remove("__rule_id");
     planner_parameters.remove("__rule_version");
-    let source_mapping = source_connector
-        .source_type_mapping_with_evidence(
-            source_column,
-            source_catalog,
-            source_build.clone(),
-            source_environment_fingerprint,
-        )
-        .map_err(|message| {
-            CompatibilityError::SourceContract(change_event::CompatibilityFailure {
-                class: change_event::FailureClass::SourceContract,
-                code: "source_contract.type_mapping_failed".into(),
-                phase: change_event::FailurePhase::SourceContract,
-                retry: change_event::RetryClassification::NotRetryable,
-                message,
-            })
-        })?;
     let target_mapping = sink_connector.source_type_mapping(sink_column).ok();
     let source_key = source
         .primary_key

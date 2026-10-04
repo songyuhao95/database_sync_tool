@@ -3,6 +3,12 @@
   "implemented": ["mysql_5_7", "mysql_8_0", "mysql_8_4", "postgresql_15", "postgresql_16", "postgresql_17"],
   "source_only": [],
   "unsupported": [],
+  "same_version_mysql_route_policy": {
+    "verification_mode": "COMPONENTS_COMPOSED_MYSQL_SELF_ROUTE",
+    "required_evidence": ["per-type MySQL Source protocol capture and ChangeEvent", "per-type live Sink readback", "offline 6x6 route qualification"],
+    "web_end_to_end_claim": "not_made_without_a_distinct_same_version_sink_server",
+    "web_end_to_end_suite_ids": ["mysql_5_7.web_same_version_all_types", "mysql_8_0.web_same_version_all_types", "mysql_8_4.web_same_version_all_types"]
+  },
   "live_qualification": {
     "sources": [
       {"database": "mysql_5_7", "suite": "mysql_5_7.capture", "additional_suites": ["mysql_5_7.all_types_capture"]},
@@ -26,9 +32,6 @@
       "postgresql_15.capture_to_mysql",
       "postgresql_15.web_sink",
       "mysql_5_7.web_explicit_carrier",
-      "mysql_5_7.web_same_version_all_types",
-      "mysql_8_0.web_same_version_all_types",
-      "mysql_8_4.web_same_version_all_types",
       "postgresql.dynamic_types_all_sinks",
       "postgresql_15.web_all_builtin_types_self_sink",
       "postgresql_16.web_all_builtin_types_self_sink",

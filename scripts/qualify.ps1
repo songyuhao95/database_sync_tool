@@ -10,6 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
+. (Join-Path $PSScriptRoot 'qualification-route-suites.ps1')
 $root = Split-Path -Parent $PSScriptRoot
 $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'qualification-matrix.json') -Raw | ConvertFrom-Json
 $typeInventory = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'type-inventory.json') -Raw | ConvertFrom-Json
@@ -39,8 +40,10 @@ $sinkPath = Join-Path $out 'live-sink.json'
 $transactionRecoveryPath = Join-Path $out 'transaction-recovery.json'
 $capabilityInvalidationPath = Join-Path $out 'live-capability-invalidation.json'
 $routePath = Join-Path $out 'route-smoke.json'
+$catalogRoutePath = Join-Path $out 'postgresql-catalog-type-routes.json'
+$mysqlRoutePath = Join-Path $out 'mysql-native-type-routes.json'
 $summaryPath = Join-Path $out 'summary.json'
-foreach ($path in @($typePath, $recoveryPath, $sourcePath, $sinkPath, $transactionRecoveryPath, $capabilityInvalidationPath, $routePath, $summaryPath)) {
+foreach ($path in @($typePath, $recoveryPath, $sourcePath, $sinkPath, $transactionRecoveryPath, $capabilityInvalidationPath, $routePath, $catalogRoutePath, $mysqlRoutePath, $summaryPath)) {
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
 }
 
@@ -352,6 +355,18 @@ try {
         Write-Output "Imported additional type evidence artifacts: $additionalTypeEvidenceImported"
     }
 
+    $catalogTypeRouteAudit = Join-Path $PSScriptRoot 'audit-postgresql-type-routes.ps1'
+    $catalogEvidenceDirectories = @((Join-Path $out 'type-evidence')) + @($AdditionalTypeEvidenceDirectory)
+    $passedRouteSuiteIds = @($results | Where-Object {
+        $_.category -eq 'route_smoke' -and $_.status -eq 'PASS'
+    } | ForEach-Object { [string]$_.id })
+    $catalogRouteJson = & $catalogTypeRouteAudit `
+        -EvidenceDirectory $catalogEvidenceDirectories `
+        -PassedSuiteId $passedRouteSuiteIds `
+        -OutputFile $catalogRoutePath
+    $catalogRouteCoverage = $catalogRouteJson | ConvertFrom-Json
+    Set-RunEnvironment 'CDC_PG_CATALOG_ROUTE_AUDIT' $catalogRoutePath
+
     $typeEvidenceReportSuite = [pscustomobject]@{
         id = 'type-inventory.live-evidence-report'
         mode = 'Offline'
@@ -405,10 +420,7 @@ try {
 
             $sourceSpec = $sourceSpecs | Where-Object { $_.database -eq $source } | Select-Object -First 1
             $sinkSpec = $sinkSpecs | Where-Object { $_.database -eq $sink } | Select-Object -First 1
-            $sourceSuiteIds = if ($null -ne $sourceSpec) { @([string]$sourceSpec.suite) } else { @() }
-            if ($null -ne $sourceSpec -and $null -ne $sourceSpec.additional_suites) {
-                $sourceSuiteIds += @($sourceSpec.additional_suites | ForEach-Object { [string]$_ })
-            }
+            $sourceSuiteIds = @(Get-QualificationSourceSuiteIds $sourceSpec)
             $sourceEvidence = @($sourceSuiteIds | ForEach-Object { Get-SuiteResult $_ })
             $sourceEvidenceStatus = if ($sourceEvidence.Count -eq 0) {
                 'REQUIRES_LIVE'
@@ -498,12 +510,20 @@ try {
         }
     })
 
+    $passedOfflineDirections = @($directions | Where-Object offline -eq 'PASS' | ForEach-Object {
+        "$($_.source)>$($_.sink)"
+    })
+    $mysqlTypeRouteAudit = Join-Path $PSScriptRoot 'audit-mysql-type-routes.ps1'
+    $mysqlRouteJson = & $mysqlTypeRouteAudit `
+        -EvidenceDirectory $catalogEvidenceDirectories `
+        -PassedSuiteId $passedRouteSuiteIds `
+        -OfflineDirection $passedOfflineDirections `
+        -OutputFile $mysqlRoutePath
+    $mysqlRouteCoverage = $mysqlRouteJson | ConvertFrom-Json
+
     $sourceQualification = @($sourceSpecs | ForEach-Object {
         $spec = $_
-        $suiteIds = @([string]$spec.suite)
-        if ($null -ne $spec.additional_suites) {
-            $suiteIds += @($spec.additional_suites | ForEach-Object { [string]$_ })
-        }
+        $suiteIds = @(Get-QualificationSourceSuiteIds $spec)
         $suiteEvidence = @($suiteIds | ForEach-Object {
             $suiteId = [string]$_
             $result = Get-SuiteResult $suiteId
@@ -666,8 +686,18 @@ try {
 
     $offlineSuccess = $offlinePassed -and $missing.Count -eq 0
     $suiteFailures = @($results | Where-Object status -eq 'FAIL')
+    $requiredLiveSuiteIds = @($suiteDefinitions | Where-Object { [bool]$_.required_for_live_qualified } | ForEach-Object { [string]$_.id })
+    $requiredLiveSuiteResults = @($requiredLiveSuiteIds | ForEach-Object {
+        $id = $_
+        $result = Get-SuiteResult $id
+        [pscustomobject]@{ id = $id; status = if ($null -ne $result) { [string]$result.status } else { 'REQUIRES_LIVE' } }
+    })
+    $requiredLiveSuitesQualified = $requiredLiveSuiteResults.Count -gt 0 -and
+        @($requiredLiveSuiteResults | Where-Object status -ne 'PASS').Count -eq 0
     $failed = $baselineFailed -or $missing.Count -gt 0 -or $suiteFailures.Count -gt 0 -or $passwordScan.matches_redacted -gt 0
-    $allTypesLiveQualified = $offlineSuccess -and $typeInventoryComplete -and $liveQualified -and $routeSmokeQualified
+    $allTypesLiveQualified = $offlineSuccess -and $typeInventoryComplete -and $liveQualified -and
+        $routeSmokeQualified -and $requiredLiveSuitesQualified -and
+        $catalogRouteCoverage.qualified -and $mysqlRouteCoverage.qualified
     if ($Live -and -not $allTypesLiveQualified) { $failed = $true }
     $success = -not $failed
     $report = [ordered]@{
@@ -675,7 +705,7 @@ try {
         matrix_semantics = [ordered]@{
             offline_direction_matrix = 'six_by_six_planning_and_type_qualification'
             live_qualification = 'six_source_adapters_plus_six_sink_adapters_plus_common_transaction_recovery'
-            route_smoke = 'all 36 source-to-sink Web routes, plus 7 supplemental smoke suites; PostgreSQL catalog-discovered type routes from each source to all six sink versions; MySQL cross-version routes use separate server instances'
+            route_smoke = 'registered representative live Web routes; all PostgreSQL catalog type routes and MySQL cross-version routes have route receipts; identical-version MySQL type routes may be explicitly qualified by separate Source/ChangeEvent/Sink evidence plus the offline direction, without claiming Web end-to-end execution'
             live_database_to_database_links = $false
         }
         databases = @($config.databases)
@@ -692,6 +722,12 @@ try {
         transaction_recovery_qualified = $transactionRecoveryQualified
         capability_invalidation_qualified = $capabilityInvalidationQualified
         route_smoke_qualified = $routeSmokeQualified
+        required_live_suites_qualified = $requiredLiveSuitesQualified
+        required_live_suite_results = $requiredLiveSuiteResults
+        postgresql_catalog_type_routes_qualified = [bool]$catalogRouteCoverage.qualified
+        postgresql_catalog_type_routes = 'postgresql-catalog-type-routes.json'
+        mysql_native_type_routes_qualified = [bool]$mysqlRouteCoverage.qualified
+        mysql_native_type_routes = 'mysql-native-type-routes.json'
         live_evidence_files = [ordered]@{
             source = 'live-source.json'
             sink = 'live-sink.json'
@@ -704,6 +740,8 @@ try {
         transaction_recovery = $transactionRecovery
         capability_invalidation = $capabilityInvalidation
         route_smoke = $routeSmoke
+        postgresql_catalog_type_route_coverage = $catalogRouteCoverage
+        mysql_native_type_route_coverage = $mysqlRouteCoverage
         directions = $directions
         missing_directions = @($missing.ToArray())
         added_directions = $added
@@ -749,7 +787,9 @@ try {
         if ($null -ne $typeInventoryEvidence.per_type_web_sink_total_pairs) {
             $webTotal = [int]$typeInventoryEvidence.per_type_web_sink_total_pairs
             $webGaps = [int]$typeInventoryEvidence.per_type_web_sink_plan_gaps
-            Write-Output "Verified per-type Web plans: $($webTotal - $webGaps)/$webTotal"
+            Write-Output "Per-type live Web plans: $($webTotal - $webGaps)/$webTotal"
+            Write-Output "Per-type same-version MySQL component-composed routes: $($typeInventoryEvidence.per_type_component_composed_route_pairs)"
+            Write-Output "Per-type route qualification gaps: $($typeInventoryEvidence.per_type_route_qualification_gaps)"
         }
     } else {
         Write-Output 'Native type inventory: MISSING_TEST'

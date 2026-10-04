@@ -257,12 +257,19 @@ fn decode_catalog_value(
             })
         }
         SourceTypeDefinitionKind::Composite { fields } => {
-            let values = parse_record(bytes).map_err(|error| {
+            let mut values = parse_record(bytes).map_err(|error| {
                 invalid(format!(
                     "PostgreSQL composite {}.{} could not be decoded: {error}",
                     definition.schema, definition.name
                 ))
             })?;
+            // PostgreSQL's record text output represents a one-field record
+            // containing NULL as "()". The checked type definition supplies
+            // the missing arity, so interpret this spelling as its single
+            // NULL field rather than an empty record.
+            if values.is_empty() && fields.len() == 1 {
+                values.push(None);
+            }
             if values.len() != fields.len() {
                 return Err(invalid(format!(
                     "PostgreSQL composite {}.{} field count mismatch",
@@ -1513,6 +1520,37 @@ mod tests {
         assert_eq!(
             decimal(&format!("1{}", "0".repeat(1_200))).unwrap().0.len(),
             1_201
+        );
+    }
+
+    #[test]
+    fn decodes_single_null_composite_field_from_empty_record_text() {
+        let catalog = SourceTypeCatalog::new([
+            crate::SourceTypeDefinition::builtin(25, "pg_catalog", "text"),
+            crate::SourceTypeDefinition::composite(
+                9_001,
+                "information_schema",
+                "information_schema_catalog_name",
+                [crate::SourceTypeField::new("catalog_name", 25, true)],
+            ),
+        ]);
+        let value = decode_catalog_value(
+            "15",
+            &catalog,
+            9_001,
+            "information_schema.information_schema_catalog_name",
+            b"()",
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            V::Struct {
+                fields: vec![StructuredField {
+                    name: "catalog_name".into(),
+                    value: V::Null,
+                }],
+            }
         );
     }
 

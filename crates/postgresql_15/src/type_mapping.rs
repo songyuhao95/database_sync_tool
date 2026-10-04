@@ -382,13 +382,22 @@ impl SourceTypeDefinition {
         name: impl Into<String>,
         fields: impl IntoIterator<Item = SourceTypeField>,
     ) -> Self {
+        // A table's NOT NULL constraints are not constraints on values of its
+        // automatically-created row type. PostgreSQL composite values can
+        // contain NULL in every field, so table-column nullability must not
+        // narrow the composite LogicalType.
+        let fields = fields
+            .into_iter()
+            .map(|mut field| {
+                field.nullable = true;
+                field
+            })
+            .collect();
         Self {
             oid,
             schema: schema.into(),
             name: name.into(),
-            kind: SourceTypeDefinitionKind::Composite {
-                fields: fields.into_iter().collect(),
-            },
+            kind: SourceTypeDefinitionKind::Composite { fields },
             collation: None,
             definition_digest: String::new(),
         }
@@ -2358,6 +2367,30 @@ mod tests {
                 if fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>()
                     == ["id", "state"]
         ));
+        let item_mapping = source_type_mapping_with_catalog("public.item", &catalog).unwrap();
+        let LogicalType::Struct { fields } = &item_mapping.logical_type else {
+            panic!("composite type should map to a structured LogicalType");
+        };
+        assert!(
+            fields.iter().all(|field| field.nullable),
+            "composite values permit NULL fields even when their backing table columns are NOT NULL"
+        );
+        assert!(
+            item_mapping
+                .logical_type
+                .matches_value(&change_event::LogicalValue::Struct {
+                    fields: vec![
+                        change_event::StructuredField {
+                            name: "id".into(),
+                            value: change_event::LogicalValue::Null,
+                        },
+                        change_event::StructuredField {
+                            name: "state".into(),
+                            value: change_event::LogicalValue::Null,
+                        },
+                    ],
+                })
+        );
         assert!(matches!(
             source_type_mapping_with_catalog("public._item", &catalog)
                 .unwrap()
