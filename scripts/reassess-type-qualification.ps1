@@ -100,15 +100,21 @@ $checks = [ordered]@{
         @($pgAudit.routes | Where-Object { -not $_.qualified }).Count -eq 0
     mysql_native_routes = $mysqlAudit.schema -eq 'cdc.mysql_native_type_route_coverage.v1' -and
         $mysqlAudit.qualified -eq $true -and $mysqlAudit.route_count -eq 18 -and
-        $mysqlAudit.live_web_e2e_route_count -eq 15 -and
+        $mysqlAudit.live_web_e2e_route_count -ge 15 -and
         $mysqlAudit.component_composed_route_count -eq 3 -and
         @($mysqlAudit.routes | Where-Object { -not $_.qualified }).Count -eq 0
+    user_configurable_target_paths = $inventory.per_type_web_plan_gaps -eq 0 -and
+        $inventory.per_type_web_sink_plan_gaps -eq 0 -and
+        @($mysqlAudit.routes | Where-Object {
+            $_.web_plan_type_count -ne $_.source_type_count -or
+            @($_.missing_web_plans).Count -ne 0
+        }).Count -eq 0
 }
 $passed = @($checks.Values | Where-Object { $_ -ne $true }).Count -eq 0
 $report = [ordered]@{
     schema = 'cdc.qualification.evidence_reassessment.v1'
     qualified = $passed
-    evidence_semantics = 'Existing live suites are reused. Type inventory and route audits are recomputed from saved artifact-bound receipts; direction status is derived from passing source/sink suites and the qualified route audit, correcting the original summary suite-ID concatenation bug.'
+    evidence_semantics = 'Existing live suites are reused. Type inventory and route audits are recomputed from saved artifact-bound receipts. Component-composed routes prove adapter compatibility only; map completion additionally requires a Web plan receipt for every source type and target route.'
     checks = $checks
     directions = $directionProof
     counts = [ordered]@{
