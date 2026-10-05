@@ -7657,17 +7657,33 @@ fn spatial_native_semantics_mismatch(source: &FieldDefinition, target: &FieldDef
 }
 
 fn is_geography_native_type(native_type: &str) -> bool {
-    native_type
-        .trim()
-        .split('(')
-        .next()
-        .unwrap_or_default()
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_matches('"')
-        .eq_ignore_ascii_case("geography")
+    let native_type = native_type.trim();
+    let mut quoted = false;
+    let mut type_end = native_type.len();
+    let mut last_dot = None;
+    for (index, character) in native_type.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            '(' if !quoted => {
+                type_end = index;
+                break;
+            }
+            '.' if !quoted => last_dot = Some(index),
+            _ => {}
+        }
+    }
+    if quoted {
+        return false;
+    }
+    let name = native_type[last_dot.map_or(0, |index| index + 1)..type_end].trim();
+    if let Some(name) = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+    {
+        name == "geography"
+    } else {
+        !name.contains('"') && name.eq_ignore_ascii_case("geography")
+    }
 }
 
 fn text_binding_is_exact(source: &FieldDefinition, target: &FieldDefinition) -> bool {

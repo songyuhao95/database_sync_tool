@@ -622,6 +622,29 @@ fn geography_and_geometry_are_not_exactly_equivalent() {
 }
 
 #[test]
+fn quoted_udt_name_ending_in_geography_is_not_postgis_geography() {
+    let logical = LogicalType::spatial("point", Some(4326), 2);
+    let result = change_event::plan_field_compatibility(input(
+        field("geometry(point,4326)", logical.clone(), None),
+        target_field("\"foo.geography\"", logical.clone(), None),
+        SourceTypeMapping::new(
+            ConnectorIdentity::new("postgresql", "15"),
+            "geometry(point,4326)",
+            logical,
+            "postgresql15.source-type.geometry",
+            "postgresql-test.v1",
+        ),
+        &spatial_manifest_for("\"foo.geography\""),
+        "quoted-spatial-udt",
+    ))
+    .unwrap();
+    assert_ne!(
+        result.reason_code, "target_capability.spatial_geodetic_planar_mismatch",
+        "a quoted UDT name with an embedded dot is not PostGIS geography"
+    );
+}
+
+#[test]
 fn recursive_types_fail_closed_without_an_explicit_structure_rule() {
     let logical = LogicalType::Array {
         element: Box::new(LogicalType::integer(true, 32)),
