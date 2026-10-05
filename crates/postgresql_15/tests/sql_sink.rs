@@ -7,7 +7,7 @@ use change_event::{
 use postgresql_15::{SinkAdapter, TargetConfig, execute};
 use sqlx::{Connection, PgConnection, Row};
 use std::{
-    env,
+    env, io,
     time::{SystemTime, UNIX_EPOCH},
 };
 #[path = "../../../tests/support/postgres_env.rs"]
@@ -987,25 +987,46 @@ async fn postgis_native_sink_for_version(
             .execute(&mut setup)
             .await?;
     }
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TABLE public.\"{table}\" (id bigint PRIMARY KEY, planar geometry(Point,4326), geodetic geography(Point,4326))"
-    )))
-    .execute(&mut setup)
-    .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON public.\"{table}\" TO \"{}\"",
-        writer.replace('"', "\"\"")
-    )))
-    .execute(&mut setup)
-    .await?;
-    let result = async {
+    let setup_result = async {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE public.\"{table}\" (id bigint PRIMARY KEY, planar geometry(Point,4326), geodetic geography(Point,4326))"
+        )))
+        .execute(&mut setup)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON public.\"{table}\" TO \"{}\"",
+            writer.replace('"', "\"\"")
+        )))
+        .execute(&mut setup)
+        .await?;
+        Ok::<_, sqlx::Error>(())
+    }.await;
+    if let Err(error) = setup_result {
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS public.\"{table}\""
+        )))
+        .execute(&mut setup)
+        .await;
+        if !installed {
+            let _ = sqlx::query("DROP EXTENSION IF EXISTS postgis")
+                .execute(&mut setup)
+                .await;
+        }
+        return Err(Box::new(error));
+    }
+    let result = tokio::spawn({
+        let table = table.clone();
+        let password = password.clone();
+        let writer = writer.clone();
+        let admin = admin.clone();
+        async move {
         let config = TargetConfig::new(
             postgres_env::setting(target_version, "HOST", "192.168.0.10"),
             "CDC_test",
             writer,
             password,
         )
-        .with_port(postgres_env::setting(target_version, "PORT", "54321").parse().expect("invalid PostgreSQL test port"));
+        .with_port(postgres_env::setting(target_version, "PORT", "54321").parse()?);
         let sink = SinkAdapter::new_for_version(target_version);
         let insert = postgis_transaction(&table, Operation::Insert, 12.5, 45.25);
         assert_eq!(execute(&config, &sink.plan(&insert)?).await?.statements_executed, 1);
@@ -1028,7 +1049,8 @@ async fn postgis_native_sink_for_version(
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM public.\"{table}\""))).fetch_one(&mut verify).await?;
         assert_eq!(count, 0);
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-    }.await;
+        }
+    }).await;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP TABLE IF EXISTS public.\"{table}\""
     )))
@@ -1039,7 +1061,7 @@ async fn postgis_native_sink_for_version(
             .execute(&mut setup)
             .await?;
     }
-    result?;
+    result??;
     Ok(())
 }
 
@@ -1100,7 +1122,7 @@ async fn user_defined_spatial_name_probe_for_version(
             writer,
             password,
         )
-        .with_port(postgres_env::setting(target_version, "PORT", "54321").parse().expect("invalid PostgreSQL test port"));
+        .with_port(postgres_env::setting(target_version, "PORT", "54321").parse()?);
         for column in ["misleading", "same_name"] {
             let probe = postgresql_15::probe_target_for_version(
                 &config,
@@ -1109,9 +1131,14 @@ async fn user_defined_spatial_name_probe_for_version(
                 column,
                 target_version,
             ).await?;
-            assert_eq!(probe.capabilities[0].status, CapabilityProbeStatus::Detected);
-            assert_eq!(probe.column_metadata.extension, None);
-            assert!(probe.session.settings.iter().any(|(name, _)| name == "search_path"));
+            if probe.capabilities[0].status != CapabilityProbeStatus::Detected
+                || probe.column_metadata.extension.is_some()
+                || !probe.session.settings.contains_key("search_path")
+            {
+                return Err(io::Error::other(format!(
+                    "PostgreSQL {target_version} {column} was incorrectly classified as PostGIS: {probe:?}"
+                )).into());
+            }
         }
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     }.await;
