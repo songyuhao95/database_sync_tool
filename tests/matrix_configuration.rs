@@ -331,7 +331,7 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
             .iter()
             .filter(|suite| suite["category"] == "sink")
             .count(),
-        18
+        21
     );
     for suite_id in [
         "mysql_5_7.representation_carriers",
@@ -617,6 +617,20 @@ fn issue_57_registers_live_components_and_capability_invalidation_without_claimi
                         })
                     })
             );
+            let name_probe_suite = format!("{database}.spatial_name_probe");
+            assert!(
+                sink["additional_suites"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry == &serde_json::json!(name_probe_suite))
+            );
+            let name_probe_definition = suites
+                .iter()
+                .find(|entry| entry["id"] == name_probe_suite)
+                .expect("user-defined names resembling PostGIS must be probed live");
+            assert_eq!(name_probe_definition["category"], "sink");
+            assert_eq!(name_probe_definition["required_for_live_qualified"], true);
         }
     }
     for suite_id in config["live_qualification"]["route_smoke"]

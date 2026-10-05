@@ -1297,8 +1297,7 @@ fn parameter_for(value: &LogicalValue, native_type: &str) -> io::Result<Paramete
             srid,
             ..
         } => {
-            let target = native_type.to_ascii_lowercase();
-            if !target.contains("geometry") && !target.contains("geography") {
+            if postgis_native_kind(native_type).is_none() {
                 return Err(capability_failure(
                     "spatial values require a qualified PostGIS geometry/geography target",
                 ));
@@ -1358,7 +1357,11 @@ fn parameter_expression(
             safe_target_type(native_type, "bytea")?
         ),
         Parameter::Spatial { srid, format, .. } => {
-            let target = native_type.to_ascii_lowercase();
+            let target = postgis_native_kind(native_type).ok_or_else(|| {
+                capability_failure(
+                    "spatial values require a qualified PostGIS geometry/geography target",
+                )
+            })?;
             let function = if matches!(format, change_event::SpatialFormat::Ewkb) {
                 "ST_GeomFromEWKB"
             } else {
@@ -1372,7 +1375,7 @@ fn parameter_expression(
                 })?;
                 format!("{function}({placeholder}, {srid})")
             };
-            if target.contains("geography") {
+            if target == PostgisKind::Geography {
                 format!("{expression}::geography")
             } else {
                 expression
@@ -1385,6 +1388,65 @@ fn parameter_expression(
         | Parameter::Text(_)
         | Parameter::Binary(_) => placeholder,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostgisKind {
+    Geometry,
+    Geography,
+}
+
+fn postgis_native_kind(native_type: &str) -> Option<PostgisKind> {
+    let native_type = native_type.trim();
+    let mut quoted = false;
+    let mut type_end = native_type.len();
+    let mut last_dot = None;
+    for (index, character) in native_type.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            '(' if !quoted => {
+                type_end = index;
+                break;
+            }
+            '.' if !quoted => last_dot = Some(index),
+            _ => {}
+        }
+    }
+    if quoted {
+        return None;
+    }
+    let name = native_type[last_dot.map_or(0, |index| index + 1)..type_end].trim();
+    let normalized = if let Some(quoted) = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+    {
+        // Quoted PostgreSQL identifiers are case-sensitive.
+        quoted
+    } else {
+        if name.contains('"') {
+            return None;
+        }
+        return match name.to_ascii_lowercase().as_str() {
+            "geometry" => Some(PostgisKind::Geometry),
+            "geography" => Some(PostgisKind::Geography),
+            _ => None,
+        };
+    };
+    match normalized {
+        "geometry" => Some(PostgisKind::Geometry),
+        "geography" => Some(PostgisKind::Geography),
+        _ => None,
+    }
+}
+
+fn postgis_target_kind(
+    native_type: &str,
+    type_schema: &str,
+    extension_schema: Option<&str>,
+) -> Option<PostgisKind> {
+    (extension_schema == Some(type_schema))
+        .then(|| postgis_native_kind(native_type))
+        .flatten()
 }
 
 fn safe_target_type(native_type: &str, fallback: &str) -> io::Result<String> {
@@ -2215,6 +2277,8 @@ pub async fn probe_targets_on_connection_for_version(
         "SELECT current_setting('server_version') AS server_version, \
                 current_database() AS database_name, \
                 current_setting('server_version_num') AS server_version_num, \
+                current_setting('search_path') AS search_path, \
+                current_schemas(true) AS visible_schemas, \
                 set_config('TimeZone','UTC',false) AS timezone, \
                 set_config('standard_conforming_strings','on',false) AS standard_conforming_strings",
     )
@@ -2242,6 +2306,12 @@ pub async fn probe_targets_on_connection_for_version(
     let timezone: String = environment.try_get("timezone").map_err(io::Error::other)?;
     let standard_conforming_strings: String = environment
         .try_get("standard_conforming_strings")
+        .map_err(io::Error::other)?;
+    let search_path: String = environment
+        .try_get("search_path")
+        .map_err(io::Error::other)?;
+    let visible_schemas: Vec<String> = environment
+        .try_get("visible_schemas")
         .map_err(io::Error::other)?;
     let rows = sqlx::query(
         "SELECT a.attname AS column_name, \
@@ -2277,10 +2347,25 @@ pub async fn probe_targets_on_connection_for_version(
             "target table or column {schema}.{table}.{missing} was not found"
         )));
     }
-    let extensions = sqlx::query("SELECT extname, extversion FROM pg_extension ORDER BY extname")
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(io::Error::other)?
+    let extension_rows = sqlx::query(
+        "SELECT e.extname, e.extversion, n.nspname AS extension_schema \
+         FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace ORDER BY e.extname",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(io::Error::other)?;
+    let postgis_schema = extension_rows.iter().find_map(|row| {
+        let name: String = row.try_get("extname").ok()?;
+        if name.eq_ignore_ascii_case("postgis") {
+            row.try_get::<String, _>("extension_schema").ok()
+        } else {
+            None
+        }
+    });
+    let postgis_visible = postgis_schema
+        .as_ref()
+        .is_some_and(|schema| visible_schemas.contains(schema));
+    let extensions = extension_rows
         .into_iter()
         .map(|row| {
             let name: String = row.try_get("extname").map_err(io::Error::other)?;
@@ -2288,9 +2373,6 @@ pub async fn probe_targets_on_connection_for_version(
             Ok(CapabilityProbeEntry::installed(format!("extension:{name}")).with_version(version))
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let has_postgis = extensions
-        .iter()
-        .any(|entry| entry.identity.eq_ignore_ascii_case("extension:postgis"));
     let target_build = ServerBuildIdentity::new(
         "postgresql",
         "community",
@@ -2307,20 +2389,20 @@ pub async fn probe_targets_on_connection_for_version(
         let type_kind: String = row.try_get("type_kind").map_err(io::Error::other)?;
         let type_schema: String = row.try_get("type_schema").map_err(io::Error::other)?;
         let native_lower = native_type.to_ascii_lowercase();
-        let spatial_target =
-            native_lower.contains("geometry") || native_lower.contains("geography");
-        let type_status = if spatial_target && !has_postgis {
+        let postgis_kind =
+            postgis_target_kind(&native_type, &type_schema, postgis_schema.as_deref());
+        let spatial_target = postgis_kind.is_some();
+        let type_status = if spatial_target && !postgis_visible {
             CapabilityProbeStatus::Missing
-        } else if is_probeable_target_type(&native_lower) {
+        } else if spatial_target || is_probeable_target_type(&native_lower, &type_kind) {
             CapabilityProbeStatus::Qualified
         } else {
             CapabilityProbeStatus::Detected
         };
         let capability_identity = if spatial_target {
-            let spatial_kind = if native_lower.contains("geography") {
-                "geography"
-            } else {
-                "geometry"
+            let spatial_kind = match postgis_kind.expect("spatial target has a PostGIS kind") {
+                PostgisKind::Geometry => "geometry",
+                PostgisKind::Geography => "geography",
             };
             format!("postgresql{target_version}.exact.spatial.{spatial_kind}")
         } else {
@@ -2353,9 +2435,6 @@ pub async fn probe_targets_on_connection_for_version(
                         )))
                 }),
         );
-        if spatial_target && has_postgis {
-            capabilities[0].status = CapabilityProbeStatus::Qualified;
-        }
         let definition_fingerprint = change_event::stable_digest(&(
             schema,
             table,
@@ -2378,6 +2457,7 @@ pub async fn probe_targets_on_connection_for_version(
                     "standard_conforming_strings",
                     standard_conforming_strings.clone(),
                 ),
+                ("search_path", search_path.clone()),
             ],
         );
         probes.insert(
@@ -2397,7 +2477,7 @@ pub async fn probe_targets_on_connection_for_version(
     Ok(probes)
 }
 
-fn is_probeable_target_type(native_type: &str) -> bool {
+fn is_probeable_target_type(native_type: &str, type_kind: &str) -> bool {
     [
         "boolean",
         "smallint",
@@ -2421,14 +2501,15 @@ fn is_probeable_target_type(native_type: &str) -> bool {
         "inet",
         "cidr",
         "macaddr",
-        "geometry",
-        "geography",
     ]
     .iter()
-    .any(|known| native_type.starts_with(known))
-        || native_type.ends_with("[]")
-        || native_type.contains("range")
-        || native_type.contains("multirange")
+    .any(|known| {
+        native_type == *known
+            || native_type
+                .strip_prefix(known)
+                .is_some_and(|suffix| suffix.starts_with('(') || suffix.starts_with(' '))
+    }) || native_type.ends_with("[]")
+        || matches!(type_kind, "r" | "m")
 }
 
 pub(crate) async fn execute_statements(
@@ -2754,7 +2835,10 @@ pub(crate) async fn snapshot_targets(
 
 #[cfg(test)]
 mod tests {
-    use super::structured_text;
+    use super::{
+        PostgisKind, is_probeable_target_type, postgis_native_kind, postgis_target_kind,
+        structured_text,
+    };
     use change_event::LogicalValue;
 
     #[test]
@@ -2789,5 +2873,46 @@ mod tests {
             structured_text(&complete).unwrap(),
             "[0:1][2:3]={{\"1\",\"2\"},{\"3\",\"4\"}}"
         );
+    }
+
+    #[test]
+    fn postgis_probe_requires_the_real_extension_type_and_visible_schema() {
+        assert_eq!(
+            postgis_native_kind("geometry(Point,4326)"),
+            Some(PostgisKind::Geometry)
+        );
+        assert_eq!(
+            postgis_native_kind("spatial.geography(Point,4326)"),
+            Some(PostgisKind::Geography)
+        );
+        assert_eq!(
+            postgis_native_kind("\"spatial.v2\".geometry(Point,4326)"),
+            Some(PostgisKind::Geometry)
+        );
+        for misleading in [
+            "geometry_archive",
+            "mygeography",
+            "\"geometry.cache\"",
+            "\"GEOGRAPHY\"",
+        ] {
+            assert_eq!(postgis_native_kind(misleading), None, "{misleading}");
+            assert!(!is_probeable_target_type(misleading, "e"), "{misleading}");
+        }
+        assert_eq!(
+            postgis_target_kind("geometry(Point,4326)", "public", Some("public")),
+            Some(PostgisKind::Geometry)
+        );
+        assert_eq!(
+            postgis_target_kind("geometry(Point,4326)", "custom", Some("public")),
+            None
+        );
+        assert_eq!(
+            postgis_target_kind("geometry(Point,4326)", "public", None),
+            None
+        );
+        assert!(!is_probeable_target_type("numeric_archive", "e"));
+        assert!(!is_probeable_target_type("rangefinder", "e"));
+        assert!(is_probeable_target_type("int4range", "r"));
+        assert!(is_probeable_target_type("numeric(30,6)", "b"));
     }
 }

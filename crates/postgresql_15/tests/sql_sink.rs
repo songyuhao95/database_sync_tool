@@ -1,7 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use change_event::{
-    ChangeTransaction, ColumnDatum, Datum, JsonEntry, JsonValue, LogicalValue, Operation,
-    RowChange, SinkAdapter as _, Source, SpatialFormat, TargetCapabilityFailure, validate,
+    CapabilityProbeStatus, ChangeTransaction, ColumnDatum, Datum, JsonEntry, JsonValue,
+    LogicalValue, Operation, RowChange, SinkAdapter as _, Source, SpatialFormat,
+    TargetCapabilityFailure, validate,
 };
 use postgresql_15::{SinkAdapter, TargetConfig, execute};
 use sqlx::{Connection, PgConnection, Row};
@@ -938,6 +939,25 @@ fn postgis_geometry_and_geography_use_distinct_parameterized_target_expressions(
     }
 }
 
+#[test]
+fn native_spatial_sink_rejects_type_names_that_only_contain_postgis_words() {
+    for misleading in ["geometry_archive", "mygeography", "\"geometry.cache\""] {
+        let mut transaction =
+            postgis_transaction("postgis_contract", Operation::Insert, 12.5, 45.25)
+                .transaction()
+                .clone();
+        transaction.changes[0].after.as_mut().unwrap()[1].native_type = misleading.into();
+        let transaction = validate(transaction).unwrap();
+        let error = SinkAdapter::new().plan(&transaction).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("PostGIS geometry/geography target"),
+            "{misleading} must not qualify as a native spatial target: {error}"
+        );
+    }
+}
+
 async fn postgis_native_sink_for_version(
     target_version: &'static str,
 ) -> postgresql_15::Result<()> {
@@ -1039,4 +1059,85 @@ async fn postgres16_postgis_native_sink() -> postgresql_15::Result<()> {
 #[ignore = "requires PostgreSQL 17 and PostGIS server package"]
 async fn postgres17_postgis_native_sink() -> postgresql_15::Result<()> {
     postgis_native_sink_for_version("17").await
+}
+
+async fn user_defined_spatial_name_probe_for_version(
+    target_version: &'static str,
+) -> postgresql_15::Result<()> {
+    let password = env::var(postgres_env::env_name(target_version, "TEST_PASSWORD"))?;
+    let writer = postgres_env::setting(target_version, "WRITER_USER", "postgresql_writer");
+    let admin = postgres_env::setting(target_version, "ADMIN_USER", "postgres");
+    let tag = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let schema = format!("cdc_spatial_name_pg{target_version}_{tag}");
+    let mut setup =
+        PgConnection::connect_with(&postgres_env::options(target_version, &admin, &password))
+            .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&mut setup)
+        .await?;
+    let result = async {
+        for name in ["geometry_archive", "geometry"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TYPE {schema}.{name} AS ENUM ('sample')")))
+                .execute(&mut setup).await?;
+        }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {schema}.events (id bigint PRIMARY KEY, misleading {schema}.geometry_archive, same_name {schema}.geometry)"
+        )))
+        .execute(&mut setup).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT USAGE ON SCHEMA {schema} TO \"{}\"",
+            writer.replace('"', "\"\"")
+        )))
+        .execute(&mut setup).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT SELECT ON {schema}.events TO \"{}\"",
+            writer.replace('"', "\"\"")
+        )))
+        .execute(&mut setup).await?;
+        let config = TargetConfig::new(
+            postgres_env::setting(target_version, "HOST", "192.168.0.10"),
+            "CDC_test",
+            writer,
+            password,
+        )
+        .with_port(postgres_env::setting(target_version, "PORT", "54321").parse().expect("invalid PostgreSQL test port"));
+        for column in ["misleading", "same_name"] {
+            let probe = postgresql_15::probe_target_for_version(
+                &config,
+                &schema,
+                "events",
+                column,
+                target_version,
+            ).await?;
+            assert_eq!(probe.capabilities[0].status, CapabilityProbeStatus::Detected);
+            assert_eq!(probe.column_metadata.extension, None);
+            assert!(probe.session.settings.iter().any(|(name, _)| name == "search_path"));
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    }.await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&mut setup)
+    .await?;
+    result?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 15 test database"]
+async fn postgres15_user_defined_spatial_name_probe() -> postgresql_15::Result<()> {
+    user_defined_spatial_name_probe_for_version("15").await
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 16 test database"]
+async fn postgres16_user_defined_spatial_name_probe() -> postgresql_15::Result<()> {
+    user_defined_spatial_name_probe_for_version("16").await
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 17 test database"]
+async fn postgres17_user_defined_spatial_name_probe() -> postgresql_15::Result<()> {
+    user_defined_spatial_name_probe_for_version("17").await
 }
