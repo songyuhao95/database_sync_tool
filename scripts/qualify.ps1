@@ -116,6 +116,12 @@ function Run-Suite([object]$Suite, [string[]]$Required, [bool]$Execute) {
         }
     }
 
+    $blockingPrerequisite = $null
+    if ($status -eq 'FAIL' -and $Suite.id -match '^postgresql_(15|16|17)\.postgis_(spatial|native_sink)$' -and
+        @($lines | Where-Object { $_ -match 'pg_available_extensions has no postgis entry' }).Count -gt 0) {
+        $blockingPrerequisite = 'POSTGIS_SERVER_PACKAGE_MISSING'
+    }
+
     $logName = "$($Suite.id).log"
     $lines | Set-Content -LiteralPath (Join-Path $out $logName) -Encoding UTF8
     $sourceFixtures = @(Get-SourceFixtureList $Suite)
@@ -124,6 +130,7 @@ function Run-Suite([object]$Suite, [string[]]$Required, [bool]$Execute) {
         mode                        = [string]$Suite.mode
         category                    = [string]$Suite.category
         status                      = $status
+        blocking_prerequisite       = $blockingPrerequisite
         exit_code                   = $exitCode
         missing_environment         = $missing
         required_for_live_qualified = [bool]$Suite.required_for_live_qualified

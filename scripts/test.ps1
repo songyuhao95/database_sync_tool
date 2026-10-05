@@ -112,6 +112,7 @@ try {
         $log = Join-Path $out "$($suite.id).log"
         $status = 'PASS'
         $detail = ''
+        $blockingPrerequisite = $null
         $missing = @($suite.required_env | Where-Object { -not [Environment]::GetEnvironmentVariable($_, 'Process') })
         $exitCode = -1
         $lines = [Collections.Generic.List[string]]::new()
@@ -142,6 +143,11 @@ try {
             $status = 'FAIL'
             $detail = $_.Exception.Message
             foreach ($secret in $secrets) { $detail = $detail.Replace($secret, '[REDACTED]') }
+            if ($suite.id -match '^postgresql_(15|16|17)\.postgis_(spatial|native_sink)$' -and
+                @($lines | Where-Object { $_ -match 'pg_available_extensions has no postgis entry' }).Count -gt 0) {
+                $blockingPrerequisite = 'POSTGIS_SERVER_PACKAGE_MISSING'
+                $detail = 'PostGIS server package is missing from this PostgreSQL instance; native spatial qualification remains unverified.'
+            }
             $lines.Add($detail)
         } finally {
             $timer.Stop()
@@ -149,7 +155,8 @@ try {
             $results.Add([pscustomobject]@{
             suite=$suite.id; mode=$suite.mode; databases=@($suite.databases | Where-Object { $_ -in $databases })
             stages=@($suite.stages | Where-Object { $_ -in $stages }); status=$status
-            seconds=[math]::Round($timer.Elapsed.TotalSeconds,2); exit_code=$exitCode; detail=$detail; log=$log
+            seconds=[math]::Round($timer.Elapsed.TotalSeconds,2); exit_code=$exitCode; detail=$detail
+            blocking_prerequisite=$blockingPrerequisite; log=$log
             })
         }
     }
