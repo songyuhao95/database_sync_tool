@@ -757,10 +757,13 @@ impl LogicalType {
             )),
             Self::Spatial {
                 subtype,
+                srid,
                 dimensions,
-                ..
             } => {
-                if subtype.trim().is_empty() || !(2..=4).contains(dimensions) {
+                let open_spatial_shape = subtype == "*" && srid.is_none() && *dimensions == 0;
+                if subtype.trim().is_empty()
+                    || (!(2..=4).contains(dimensions) && !open_spatial_shape)
+                {
                     Err(LogicalTypeValidationError(
                         "spatial declaration is invalid".into(),
                     ))

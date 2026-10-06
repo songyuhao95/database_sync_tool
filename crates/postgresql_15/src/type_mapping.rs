@@ -2624,6 +2624,35 @@ mod tests {
     }
 
     #[test]
+    fn unconstrained_postgis_geometry_mapping_accepts_open_spatial_shape() {
+        let geometry = SourceTypeDefinition::extension(
+            9_101,
+            "public",
+            "geometry",
+            "postgis",
+            "postgis-3.6.geometry-ewkb",
+            "hex-EWKB",
+            Some(LogicalType::spatial("*", None, 0)),
+        );
+        let catalog = SourceTypeCatalog::with_extensions(
+            [geometry],
+            [SourceExtension {
+                name: "postgis".into(),
+                version: "3.6.4".into(),
+                schema: "public".into(),
+                installed: true,
+                available: true,
+                target_compatible: None,
+            }],
+        );
+
+        let mapping = source_type_mapping_with_catalog("public.geometry", &catalog)
+            .expect("unconstrained PostGIS geometry is a valid open spatial type");
+
+        assert_eq!(mapping.logical_type, LogicalType::spatial("*", None, 0));
+    }
+
+    #[test]
     fn recursive_type_definition_closure_is_complete_canonical_and_extension_bound() {
         let catalog = SourceTypeCatalog::with_extensions(
             [

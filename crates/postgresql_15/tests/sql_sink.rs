@@ -837,6 +837,98 @@ async fn checkpoint_and_dml_for_version(target_version: &'static str) -> postgre
     Ok(())
 }
 
+async fn checkpoint_open_with_composite_row_type_dependency(
+    target_version: &'static str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let password = env::var(postgres_env::env_name(target_version, "TEST_PASSWORD"))?;
+    let writer_name = postgres_env::setting(target_version, "WRITER_USER", "postgresql_writer");
+    let admin_name = postgres_env::setting(target_version, "ADMIN_USER", "postgres");
+    let tag = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let table = format!("checkpoint_log_info_rowtype_dependency_{tag}");
+    let first_task = format!("checkpoint_type_dependency_first_{tag}");
+    let second_task = format!("checkpoint_type_dependency_second_{tag}");
+    let source_uuid = "postgresql:123456:1:16384:Q0RDX3Rlc3Q";
+    let binding = "b".repeat(64);
+    let config = TargetConfig::new(
+        postgres_env::setting(target_version, "HOST", "192.168.0.10"),
+        "CDC_test",
+        writer_name,
+        password.clone(),
+    )
+    .with_port(
+        postgres_env::setting(target_version, "PORT", "54321")
+            .parse()
+            .expect("invalid PostgreSQL test port"),
+    );
+    let mut admin = PgConnection::connect_with(&postgres_env::options(
+        target_version,
+        &admin_name,
+        &password,
+    ))
+    .await?;
+
+    let open_checkpoint = |task_id: String| {
+        let config = config.clone();
+        let binding = binding.clone();
+        std::thread::spawn(move || -> postgresql_15::Result<()> {
+            let checkpoint = postgresql_15::CheckpointWriter::open_for_version(
+                &config,
+                &task_id,
+                source_uuid,
+                &binding,
+                target_version,
+            )?;
+            drop(checkpoint);
+            Ok(())
+        })
+        .join()
+        .map_err(|_| io::Error::other("checkpoint worker panicked"))?
+    };
+
+    open_checkpoint(first_task.clone())?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE public.\"{table}\" (checkpoint_row cdc.log_info[])"
+    )))
+    .execute(&mut admin)
+    .await?;
+
+    let reopened = open_checkpoint(second_task.clone());
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS public.\"{table}\""
+    )))
+    .execute(&mut admin)
+    .await?;
+    sqlx::query("DELETE FROM cdc.log_info WHERE task_id = ANY($1)")
+        .bind(vec![first_task, second_task])
+        .execute(&mut admin)
+        .await?;
+
+    reopened?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 15 test database"]
+async fn postgres15_checkpoint_open_preserves_referenced_log_info_row_type()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    checkpoint_open_with_composite_row_type_dependency("15").await
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 16 test database"]
+async fn postgres16_checkpoint_open_preserves_referenced_log_info_row_type()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    checkpoint_open_with_composite_row_type_dependency("16").await
+}
+
+#[tokio::test]
+#[ignore = "requires the configured PostgreSQL 17 test database"]
+async fn postgres17_checkpoint_open_preserves_referenced_log_info_row_type()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    checkpoint_open_with_composite_row_type_dependency("17").await
+}
+
 #[tokio::test]
 #[ignore = "requires the configured PostgreSQL 15 test database"]
 async fn postgres15_checkpoint_and_dml_commit_atomically_across_restart()

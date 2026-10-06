@@ -119,9 +119,29 @@ impl CheckpointWriter {
                 .execute(&mut *tx).await.map_err(io::Error::other)?;
             sqlx::query(DDL).execute(&mut *tx).await.map_err(io::Error::other)?;
             // Existing installations may still have the pre-Web source UUID
-            // width; widen the columns before loading or writing a checkpoint.
-            sqlx::query("ALTER TABLE cdc.log_info ALTER COLUMN source_uuid TYPE varchar(255), ALTER COLUMN mode TYPE varchar(32)")
-                .execute(&mut *tx).await.map_err(io::Error::other)?;
+            // width; widen only when the catalog shows the legacy types.
+            // PostgreSQL blocks even a no-op ALTER on a table whose composite
+            // row type is referenced by another table (including an array
+            // column), which can happen when qualifying user-defined types.
+            let legacy_columns_need_widening: bool = sqlx::query_scalar(
+                "SELECT
+                    (SELECT format_type(atttypid,atttypmod) FROM pg_catalog.pg_attribute
+                      WHERE attrelid='cdc.log_info'::regclass AND attname='source_uuid' AND NOT attisdropped)
+                        IS DISTINCT FROM 'character varying(255)'
+                    OR
+                    (SELECT format_type(atttypid,atttypmod) FROM pg_catalog.pg_attribute
+                      WHERE attrelid='cdc.log_info'::regclass AND attname='mode' AND NOT attisdropped)
+                        IS DISTINCT FROM 'character varying(32)'",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(io::Error::other)?;
+            if legacy_columns_need_widening {
+                sqlx::query("ALTER TABLE cdc.log_info ALTER COLUMN source_uuid TYPE varchar(255), ALTER COLUMN mode TYPE varchar(32)")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(io::Error::other)?;
+            }
             let sink_uuid: String =
                 sqlx::query_scalar("SELECT sink_uuid::text FROM cdc.sink_identity WHERE singleton=true")
                     .fetch_one(&mut *tx)
